@@ -7,14 +7,16 @@ import importlib.util
 import io
 import json
 import math
+import os
 from pathlib import Path
 import struct
+from types import SimpleNamespace
 import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import requests
 from websockets.asyncio.server import serve
@@ -204,6 +206,103 @@ def notebook_function(namespace, filename="ollama_colab.ipynb"):
     module = ast.Module(body=functions, type_ignores=[])
     exec(compile(module, "notebook-decision-cell", "exec"), namespace)
     return namespace["process_decisions"]
+
+
+class VllmStartupTest(unittest.TestCase):
+    def setUp(self):
+        notebook = json.loads((ROOT / "examples/vllm_tpu_colab.ipynb").read_text())
+        sources = ["".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code"]
+        self.probe_source = next(source for source in sources if "server_environment =" in source)
+        self.server_source = next(source for source in sources if "def stop_vllm():" in source)
+        self.backends = {
+            "tpu": [SimpleNamespace(platform="tpu", device_kind="TPU v5e")],
+            "cpu": [SimpleNamespace(platform="cpu", device_kind="cpu")],
+        }
+        self.environment = {}
+        self.device_queries = []
+
+    def devices(self, platform=None):
+        # Simulate JAX's backend restriction and default order from JAX_PLATFORMS.
+        enabled = self.environment["JAX_PLATFORMS"].split(",")
+        platform = platform or enabled[0]
+        self.device_queries.append(platform)
+        if platform not in enabled or platform not in self.backends:
+            raise RuntimeError(f"Unknown backend {platform}. Available backends are {enabled}")
+        return self.backends[platform]
+
+    def run_probe(self, command, *, env, check, timeout):
+        self.environment = env
+        jax = SimpleNamespace(devices=self.devices,
+                              default_backend=lambda: self.environment["JAX_PLATFORMS"].split(",")[0])
+        with patch.dict("sys.modules", {"jax": jax}), contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(command[2], "notebook-tpu-probe", "exec"), {})
+
+    def execute_probe(self):
+        namespace = {"os": os, "subprocess": SimpleNamespace(run=self.run_probe),
+                     "VENV_PYTHON": Path("/fixture/bin/python")}
+        with patch.dict(os.environ, {"JAX_PLATFORMS": "cpu"}):
+            exec(compile(self.probe_source, "notebook-tpu-setup", "exec"), namespace)
+        return namespace
+
+    def test_probe_enables_cpu_weight_loading_and_keeps_tpu_default(self):
+        self.execute_probe()
+        self.assertIn("cpu", self.device_queries)
+        self.assertEqual(self.devices()[0].platform, "tpu")
+        # Reproduce the loader's jax.devices('cpu') call from the uploaded traceback.
+        self.assertTrue(self.devices("cpu"))
+
+    def test_probe_rejects_missing_cpu_before_model_start(self):
+        for cpu_devices in (None, []):
+            with self.subTest(cpu_devices=cpu_devices):
+                if cpu_devices is None:
+                    self.backends.pop("cpu")
+                else:
+                    self.backends["cpu"] = cpu_devices
+                with self.assertRaisesRegex(RuntimeError, "cpu|CPU"):
+                    self.execute_probe()
+
+    def test_probe_rejects_unavailable_or_multiple_tpus(self):
+        for tpu_devices in (None, [], self.backends["cpu"], self.backends["tpu"] * 2):
+            with self.subTest(tpu_devices=tpu_devices):
+                if tpu_devices is None:
+                    self.backends.pop("tpu")
+                else:
+                    self.backends["tpu"] = tpu_devices
+                with self.assertRaises(RuntimeError):
+                    self.execute_probe()
+
+    def test_server_receives_checked_backends_and_disables_chunked_images(self):
+        namespace = self.execute_probe()
+        check_session = MagicMock()
+        check_session.__enter__.return_value = check_session
+        check_session.get.side_effect = requests.ConnectionError("no existing server")
+        model_session = MagicMock()
+        model_session.get.return_value = SimpleNamespace(
+            ok=True, json=lambda: {"data": [{"id": "google/gemma-4-E2B-it"}]})
+        sessions = MagicMock(side_effect=[check_session, model_session])
+        process = MagicMock()
+        process.poll.return_value = None
+
+        def start_server(command, **kwargs):
+            self.environment = kwargs["env"]
+            self.assertTrue(self.devices("cpu"))  # CPU staging must also work in the server.
+            self.assertEqual(self.devices()[0].platform, "tpu")
+            self.assertIn("--disable-chunked-mm-input", command)
+            return process
+
+        popen = MagicMock(side_effect=start_server)
+        namespace.update({"VENV": Path("/fixture"), "Path": Path, "json": json, "time": time,
+                          "requests": SimpleNamespace(Session=sessions, RequestException=requests.RequestException),
+                          "subprocess": SimpleNamespace(Popen=popen, STDOUT=-2)})
+        log = io.BytesIO()
+        try:
+            with patch.object(Path, "open", return_value=log), contextlib.redirect_stdout(io.StringIO()):
+                exec(compile(self.server_source, "notebook-vllm-startup", "exec"), namespace)
+            self.assertEqual(popen.call_count, 1)
+            self.assertIs(popen.call_args.kwargs["env"], namespace["server_environment"])
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        finally:
+            log.close()
 
 
 class VllmAdapterTest(unittest.TestCase):
