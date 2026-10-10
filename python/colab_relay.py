@@ -1,4 +1,4 @@
-"""Authenticated, single-job relay for interactive Ollama inference in Colab."""
+"""Authenticated, single-job relay for interactive model inference in Colab."""
 from __future__ import annotations
 
 import json
