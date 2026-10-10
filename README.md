@@ -14,7 +14,7 @@
 
 [Пошаговый гайд для Windows](docs/OLLAMA_COLAB_RU.md) включает готовый [Colab notebook](examples/ollama_colab.ipynb), локальный контроллер, HTTPS-подключение, первый запуск без выполнения, управление и RGB-зрение. Minecraft и Python-контроллер работают на компьютере; Ollama и модель — в Colab.
 
-Этот вариант использует GPU. Для **TPU v5e-1** выбран другой вариант: [Gemma 4 E2B IT через JAX](docs/TPU_MODEL_RU.md). В документе указаны требования к памяти и изменения, необходимые в Colab notebook.
+Этот вариант использует GPU. Для **TPU v5e-1** выбрана [Gemma 4 E2B IT](docs/TPU_MODEL_RU.md). Замена Ollama с HTTP API — **vLLM TPU**; также возможна прямая генерация через Gemma/JAX. В документе указаны требования к памяти и изменения, необходимые в Colab notebook.
 
 ## Сборка и запуск
 
