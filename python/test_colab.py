@@ -447,6 +447,16 @@ class VllmAdapterTest(unittest.TestCase):
         self.assertNotIn("options", posted)
         self.assertNotIn("format", posted)
 
+    def test_jump_count_must_be_an_integer_within_bounds(self):
+        payload = controller.model_payload("Прыгни десять раз", snapshot(), ["move.jump"], [], compact=True)
+        for count in ("10", True, 0, 31, 1.5):
+            self.model.content = json.dumps({"action":"move.jump","parameters":{"count":count},"reason":"jump"})
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "count"):
+                self.namespace["infer_decision"](payload)
+        decision = {"action":"move.jump","parameters":{"count":10},"reason":"jump"}
+        self.model.content = json.dumps(decision)
+        self.assertEqual(self.namespace["infer_decision"](payload), decision)
+
     def test_disabled_vision_is_rejected_before_request(self):
         png = (ROOT / "docs/media/native-frame.png").read_bytes()
         payload = controller.model_payload("look east", snapshot(), ["look.at"], [], png, compact=True)
@@ -519,9 +529,9 @@ class VllmAdapterTest(unittest.TestCase):
 
 
 class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
-    async def integration(self, execute=False, vision=False, vllm=False, model_error=False):
+    async def integration(self, execute=False, vision=False, vllm=False, model_error=False, decision=DECISION):
         submitted = []
-        capabilities = {"actions": ["look.at"], "actor_id": "test-actor", "armed": True}
+        capabilities = {"actions": [decision["action"]], "actor_id": "test-actor", "armed": True}
 
         async def bridge_handler(socket):
             async for raw in socket:
@@ -572,6 +582,7 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     return relay
 
                 model = FakeVllm(error=model_error) if vllm else FakeOllama()
+                if vllm:model.content=json.dumps(decision)
                 session = requests.Session()
                 session.trust_env = False
                 try:
@@ -600,13 +611,13 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(len(model.token_requests), 1)
                         self.assertNotIn("Authorization", model.headers[0])
                         self.assertNotIn(holder["token"], json.dumps(model.payloads[0]))
-                        self.assertIn('"look.at","wait","finish"', model.payloads[0]["messages"][0]["content"])
+                        self.assertIn(json.dumps([decision["action"],"wait","finish"],separators=(",",":")), model.payloads[0]["messages"][0]["content"])
                     else:
                         self.assertEqual(model.payloads[0]["format"]["properties"]["action"]["enum"], ["look.at", "wait", "finish"])
                     self.assertEqual(len(submitted), 1 if execute and not model_error else 0)
                     if execute and not model_error:
-                        self.assertEqual(submitted[0]["action"], "look.at")
-                        self.assertEqual(submitted[0]["parameters"], DECISION["parameters"])
+                        self.assertEqual(submitted[0]["action"], decision["action"])
+                        self.assertEqual(submitted[0]["parameters"], decision["parameters"])
                     if vision:
                         if vllm:
                             image = model.payloads[0]["messages"][1]["content"][0]
@@ -633,6 +644,10 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_vllm_execution_submits_decision_and_reads_result(self):
         await self.integration(execute=True, vllm=True)
+
+    async def test_vllm_jump_count_is_submitted_as_one_task(self):
+        await self.integration(execute=True,vllm=True,decision={
+            "action":"move.jump","parameters":{"count":10},"reason":"Jump ten times"})
 
     async def test_vllm_vision_preserves_png_in_openai_image_message(self):
         await self.integration(vision=True, vllm=True)

@@ -26,7 +26,7 @@ flowchart LR
 ## 1. Подготовь Windows
 
 1. Установи **Java 25**, **Minecraft 26.1.2**, **NeoForge 26.1.2.97**.
-2. Открой [готовый JAR](https://github.com/Cloudeah/minebridge/blob/main/releases/minebridge-0.2.0.jar), нажми **Download raw file** и положи его в `mods` своей игровой папки. Для стандартного launcher это `%APPDATA%\.minecraft\mods`.
+2. Открой [готовый JAR](https://github.com/Cloudeah/minebridge/blob/main/releases/minebridge-0.2.1.jar), нажми **Download raw file** и положи его в `mods` своей игровой папки. Для стандартного launcher это `%APPDATA%\.minecraft\mods`.
 3. Запусти профиль NeoForge и открой одиночный мир. Проверь сообщение о готовности AI Bridge. Нажми **F3+P**, чтобы отключить паузу при потере фокуса, и оставь мир без меню Escape.
 4. Установи [Python 3.12](https://www.python.org/downloads/) с Python launcher `py`.
 5. Скачай свежий **Code → Download ZIP** из [репозитория](https://github.com/Cloudeah/minebridge), распакуй в `C:\minebridge`. Здесь должны быть папки `examples`, `python` и `releases`.

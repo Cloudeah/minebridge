@@ -30,6 +30,7 @@ final class MinecraftWorld implements WorldAccess {
     private final CompletableFuture<RecipeCatalog> catalogFuture;
     private final Map<String,CompletableFuture<JsonObject>> confirmations=new HashMap<>();
     private final Map<String,List<Pathfinder.Cell>> routes=new HashMap<>();
+    private final Map<String,JumpSequence> jumps=new HashMap<>();
     private final Map<String,CraftPlanner.Plan> crafts=new HashMap<>();
     private final Map<String,BuildPlanner.Plan> builds=new HashMap<>();
     private final Map<String,CompletableFuture<Integer>> buildChecks=new HashMap<>();
@@ -52,16 +53,17 @@ final class MinecraftWorld implements WorldAccess {
     @Override public long tick(){if(mc.level!=null)lastTick=mc.level.getGameTime();return lastTick;}
     @Override public boolean visionAvailable(){return mc.hasSingleplayerServer() && mc.getMainRenderTarget().getColorTexture() instanceof com.mojang.blaze3d.opengl.GlTexture && mc.getMainRenderTarget().getDepthTexture() instanceof com.mojang.blaze3d.opengl.GlTexture;}
     @Override public List<String> movementModes(){return mc.hasSingleplayerServer()?List.of("walk","sprint","jump"):List.of();}
-    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);}
+    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);}
     @Override public Set<String> capabilities() {
         if(!mc.hasSingleplayerServer())return Set.of("inventory.inspect");
-        return Set.of("move.to","move.follow","route.plan","look.at","combat.attack","item.use","world.interact","block.break","block.place",
+        return Set.of("move.to","move.follow","move.jump","route.plan","look.at","combat.attack","item.use","world.interact","block.break","block.place",
                 "inventory.inspect","inventory.select","inventory.transfer","inventory.equip","container.open","container.close","craft.plan","craft.execute","build.plan","build.execute");
     }
     @Override public void validate(String action,JsonObject p) {
         switch(action) {
             case "move.to", "look.at"->{if(p.has("entity_id"))UUID.fromString(string(p,"entity_id"));else point(child(p,"target"));}
             case "move.follow", "combat.attack"->UUID.fromString(string(p,"entity_id"));
+            case "move.jump"->JumpSequence.count(p);
             case "block.break", "block.place"->{block(child(p,"position"));if(action.equals("block.place"))Identifier.parse(string(p,"block"));}
             case "container.open", "world.interact"->{if(p.has("entity_id"))UUID.fromString(string(p,"entity_id"));else block(child(p,"position"));}
             case "inventory.select"->integer(p,"slot",0,0,8);
@@ -97,7 +99,7 @@ final class MinecraftWorld implements WorldAccess {
             JsonObject b=position(p);b.addProperty("dimension",dimension());b.addProperty("type",blockId(state));b.add("properties",properties(state));
             b.addProperty("solid",!state.getCollisionShape(mc.level,p).isEmpty());b.addProperty("fluid",!state.getFluidState().isEmpty());b.addProperty("source",telemetry?"owner_telemetry":"ray_observation");blocks.add(b);
         }
-        return object("actor",object("position",vector(mc.player.position()),"velocity",vector(mc.player.getDeltaMovement()),"yaw",mc.player.getYRot(),"pitch",mc.player.getXRot(),"health",mc.player.getHealth(),"food",mc.player.getFoodData().getFoodLevel(),"armor",mc.player.getArmorValue(),"effects",mc.player.getActiveEffects().stream().map(e->e.toString()).toList(),"selected_slot",mc.player.getInventory().getSelectedSlot(),"using_item",mc.player.isUsingItem()),
+        return object("actor",object("position",vector(mc.player.position()),"velocity",vector(mc.player.getDeltaMovement()),"yaw",mc.player.getYRot(),"pitch",mc.player.getXRot(),"health",mc.player.getHealth(),"food",mc.player.getFoodData().getFoodLevel(),"armor",mc.player.getArmorValue(),"effects",mc.player.getActiveEffects().stream().map(e->e.toString()).toList(),"selected_slot",mc.player.getInventory().getSelectedSlot(),"using_item",mc.player.isUsingItem(),"on_ground",mc.player.onGround(),"flying",mc.player.getAbilities().flying,"in_water",mc.player.isInWater(),"in_lava",mc.player.isInLava(),"riding",mc.player.isPassenger()),
                 "inventory",inventory,"entities",entities,"blocks",blocks,"context",object("raining",mc.level.isRaining(),"day_time",mc.level.getDefaultClockTime(),"menu_id",mc.player.containerMenu.containerId,"menu_revision",mc.player.containerMenu.getStateId(),"menu_slots",menu,"cursor",stack(mc.player.containerMenu.getCarried()),"source","client_engine","coordinate_system","world_xyz_blocks","telemetry",telemetry));
     }
     boolean visible(Entity entity){return mc.level.clip(new ClipContext(mc.player.getEyePosition(),entity.getBoundingBox().getCenter(),ClipContext.Block.COLLIDER,ClipContext.Fluid.NONE,mc.player)).getType()==HitResult.Type.MISS;}
@@ -119,6 +121,7 @@ final class MinecraftWorld implements WorldAccess {
                 var level=server.getLevel(dim);var actor=server.getPlayerList().getPlayer(player);
                 if(level==null || actor==null)throw new BridgeException("disconnected","Actor unavailable");
                 JsonObject view=object("source","integrated_server","tick",level.getGameTime(),"health",actor.getHealth(),"menu_id",actor.containerMenu.containerId,"cursor",stack(actor.containerMenu.getCarried()));
+                view.add("position",vector(actor.position()));view.addProperty("on_ground",actor.onGround());
                 view.addProperty("selected_slot",actor.getInventory().getSelectedSlot());
                 JsonArray slots=new JsonArray();for(Slot s:actor.containerMenu.slots){JsonObject item=stack(s.getItem());item.addProperty("slot",s.index);slots.add(item);}view.add("slots",slots);
                 Map<String,Integer> counts=new HashMap<>();for(int i=0;i<actor.getInventory().getContainerSize();i++){ItemStack s=actor.getInventory().getItem(i);if(!s.isEmpty())counts.merge(itemId(s),s.getCount(),Integer::sum);}view.add("inventory_counts",GSON.toJsonTree(counts));
@@ -138,6 +141,7 @@ final class MinecraftWorld implements WorldAccess {
         return switch(t.action) {
             case "move.to" -> move(t,point(child(t.parameters,"target")),number(t.parameters,"tolerance",0.7),false);
             case "move.follow" -> move(t,entity(t.parameters).position(),number(t.parameters,"distance",3),true);
+            case "move.jump" -> jump(t);
             case "look.at" -> {Vec3 target=t.parameters.has("entity_id")?entity(t.parameters).getBoundingBox().getCenter():point(child(t.parameters,"target"));look(target);t.actions++;yield Step.success(object("yaw",mc.player.getYRot(),"pitch",mc.player.getXRot()));}
             case "combat.attack" -> attack(t);
             case "block.break" -> breakBlock(t,block(child(t.parameters,"position")));
@@ -186,6 +190,27 @@ final class MinecraftWorld implements WorldAccess {
         if(mc.player.position().distanceTo(point(child(t.context,"last_position")))>0.25){t.context.add("last_position",vector(mc.player.position()));t.context.addProperty("last_moved",tick());}
         if(tick()-number(t.context,"last_moved",tick())>40){int retries=integer(t.context,"replans",0,0,3);if(retries>=3)return Step.failure("path_unreachable","Actor is stuck",object("position",vector(mc.player.position()),"remaining_distance",distance));t.context.addProperty("replans",retries+1);t.context.addProperty("last_moved",tick());routes.remove(t.id);}
         return Step.waiting(object("stage","walking","position",vector(mc.player.position()),"remaining_distance",distance,"waypoint",idx,"route_length",route.size()));
+    }
+    private Step jump(Task t) {
+        // A pulse lasts one client tick. Holding jump through a server poll can start an extra jump.
+        hold(mc.options.keyJump,false);
+        hold(mc.options.keyUp,false);hold(mc.options.keySprint,false);
+        if(mc.player.getAbilities().flying || mc.player.isPassenger() || mc.player.isInWater() || mc.player.isInLava() || mc.player.isFallFlying())
+            return Step.failure("jump_unavailable","Jumping in place requires a standing player outside water, lava, vehicles and flight",t.result);
+        checkArea(mc.player.position());
+        JumpSequence sequence=jumps.computeIfAbsent(t.id,key->new JumpSequence(JumpSequence.count(t.parameters)));
+        JsonObject view=serverView(t,null,null);
+        JumpSequence.Sample sample=view==null?null:new JumpSequence.Sample((long)number(view,"tick",0),bool(view,"on_ground",false),number(child(view,"position"),"y",0));
+        var update=sequence.observe(tick(),sample,mc.screen==null && mc.player.onGround());
+        // The final landing can complete a task whose action budget equals its jump count.
+        // Only one unconfirmed pulse is possible, so this never permits an extra jump.
+        t.actions=sequence.completed();
+        t.confirmed.addProperty("jumps",sequence.completed());
+        if(view!=null)update.progress().add("position",view.get("position"));
+        if(update.pressJump()) {hold(mc.options.keyJump,true);t.context.addProperty("jump_requests",integer(t.context,"jump_requests",0,0,30)+1);}
+        update.progress().addProperty("jump_requests",integer(t.context,"jump_requests",0,0,30));
+        if(update.error()!=null)return Step.failure(update.error(),"Server did not confirm takeoff; the jump was not counted",update.progress());
+        return update.done()?Step.success(update.progress()):Step.waiting(update.progress());
     }
     private Step attack(Task t) {
         String id=string(t.parameters,"entity_id");JsonObject view=serverView(t,null,id);

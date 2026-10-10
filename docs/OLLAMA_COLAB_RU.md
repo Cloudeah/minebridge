@@ -8,7 +8,7 @@
 
 - [Notebook Colab](../examples/ollama_colab.ipynb)
 - [Контроллер для Windows](../examples/ollama_colab.py)
-- [JAR мода](../releases/minebridge-0.2.0.jar)
+- [JAR мода](../releases/minebridge-0.2.1.jar)
 
 ## 1. Как это связано
 
@@ -36,7 +36,7 @@ Colab подходит для интерактивного эксперимен�
 ## 2. Установи мод и открой мир
 
 1. Установи **Java 25**, **Minecraft 26.1.2** и **NeoForge 26.1.2.97**.
-2. Открой [файл JAR](https://github.com/Cloudeah/minebridge/blob/main/releases/minebridge-0.2.0.jar) на GitHub и нажми **Download raw file**.
+2. Открой [файл JAR](https://github.com/Cloudeah/minebridge/blob/main/releases/minebridge-0.2.1.jar) на GitHub и нажми **Download raw file**.
 3. Положи JAR в `mods` своей игровой папки. Для стандартного launcher это `%APPDATA%\.minecraft\mods`. У отдельной сборки/Prism Launcher папку можно открыть из настроек её экземпляра.
 4. Запусти именно профиль NeoForge. Для первого опыта создай отдельный плоский одиночный мир.
 5. В чате должно появиться `AI Bridge: локальный WebSocket готов; F8 — разрешить управление`.
