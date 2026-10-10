@@ -8,3 +8,4 @@ __pycache__/
 *.log
 bridge-owner.json
 bridge-memory/
+.minebridge-colab*.json
