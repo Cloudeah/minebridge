@@ -148,11 +148,14 @@ class BridgeClient:
                     return task
                 await asyncio.sleep(0.25)
 
-    async def capture(self, width=640, height=360):
+    async def capture(self, width=640, height=360, *, observation_profile=None):
         # Drop a prior stream frame before requesting a specific new capture.
         while not self.frames.empty():
             self.frames.get_nowait()
-        response = await self.request("vision.capture", {"width": width, "height": height})
+        profile = {"width": width, "height": height}
+        if observation_profile is not None:
+            profile["observation_profile"] = observation_profile
+        response = await self.request("vision.capture", profile)
         async with asyncio.timeout(10):
             while True:
                 frame = await self.frames.get()

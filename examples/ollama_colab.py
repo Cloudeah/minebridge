@@ -48,7 +48,9 @@ def compact_snapshot(snapshot, block_limit=64, entity_limit=24, compact_menu=Fal
         "revision": snapshot["revision"], "game_tick": snapshot["game_tick"],
         "actor": actor,
         "inventory": [{k: item[k] for k in ("slot", "type", "count")} for item in snapshot["inventory"] if item["count"]],
-        "entities": snapshot.get("entities", [])[:entity_limit], "blocks": blocks,
+        "entities": sorted(snapshot.get("entities", []), key=lambda e: sum(
+            (e["position"][k] - origin[k]) ** 2 for k in ("x", "y", "z")
+        ))[:entity_limit], "blocks": blocks,
         "context": {k: context.get(k) for k in ("menu_id", "menu_revision", "cursor")},
         "menu_slots": [{k: slot[k] for k in ("slot", "type", "count", "player_inventory") if k in slot} for slot in slots],
         "observation_limits": f"Only {block_limit} nearest observed blocks and {entity_limit} observed entities are included. "
@@ -116,7 +118,133 @@ async def wait_task(bridge, task_id, stop, timeout):
             await asyncio.sleep(.25)
 
 
+async def observe(bridge, capabilities, compact, vision=False):
+    profile = "compact" if compact and "compact" in capabilities.get("observation_profiles", []) else None
+    if vision:
+        metadata, png, _ = await bridge.capture(320, 180, observation_profile=profile)
+        return metadata["observation"], png
+    return await bridge.request("observe.snapshot", {"profile": profile} if profile else {}), None
+
+
+def decision_context(snapshot, current):
+    if current["actor_id"] != snapshot["actor_id"] or current["dimension"] != snapshot["dimension"]:
+        raise RuntimeError("Actor/dimension changed while the model was thinking")
+    if "control_epoch" in snapshot:
+        if current.get("control_epoch") != snapshot["control_epoch"]:
+            raise RuntimeError("Owner control changed while the model was thinking")
+        return {"expected_control_epoch": snapshot["control_epoch"]}
+    return {}
+
+
+async def run_interactive(args):
+    bridge = BridgeClient.from_owner_file(args.config, args.url)
+    relay_config = load_relay_config(args.relay_config)
+    relay = RelayServer(relay_config["token"], args.relay_port)
+    relay.start()
+    stopped = asyncio.Event()
+    consumer = None
+    active_task = None
+    goal_id = None
+    print(f"Контроллер из игры готов: 127.0.0.1:{relay.port}. Токен в {args.relay_config}.", flush=True)
+    try:
+        await bridge.open()
+        capabilities = await bridge.request("session.capabilities")
+        if not capabilities.get("model_control"):
+            raise RuntimeError("Для окна целей установи minebridge 0.2.0 или новее.")
+        allowed = sorted(set(capabilities["actions"]) & ACTION_HELP.keys())
+        if not allowed:
+            raise RuntimeError("This session has no supported controllable actions")
+
+        async def consume_events():
+            while True:
+                event = await bridge.events.get()
+                if event["type"] in ("control.stopped", "control.manual_override", "actor.death"):
+                    stopped.set()
+                    relay.broker.cancel_pending()
+
+        consumer = asyncio.create_task(consume_events())
+        print("Подключи Colab; F7 — окно цели, F8 — разрешить, F9 — остановить. Ctrl+C завершает контроллер.", flush=True)
+        while True:
+            if bridge._reader.done():
+                raise ConnectionError("Мир или соединение закрыты; перезапусти контроллер после входа в мир.")
+            status = await bridge.request("model.status")
+            if status["state"] != "queued":
+                await asyncio.sleep(1)
+                continue
+            stopped.clear()
+            goal_id = status["goal_id"]
+            active_task = None
+            history = []
+
+            async def report(state, step, detail):
+                return await bridge.request("model.report", {"goal_id": goal_id, "state": state,
+                                                              "step": step, "detail": (detail or state)[:1000]})
+
+            try:
+                goal = await bridge.request("model.claim", {"goal_id": goal_id})
+                for step in range(1, goal["steps"] + 1):
+                    if stopped.is_set():
+                        break
+                    await report("thinking", step, "Ожидаем решение Colab; первая компиляция может занять несколько минут.")
+                    snapshot, png = await observe(bridge, capabilities, args.compact_observations, goal["vision"])
+                    if stopped.is_set():
+                        break
+                    decision = await asyncio.to_thread(relay.broker.infer,
+                        model_payload(goal["goal"], snapshot, allowed, history, png, args.compact_observations), args.model_timeout)
+                    if stopped.is_set():
+                        break
+                    decision = validate_decision(decision, allowed)
+                    print(f"Цель {goal_id}, шаг {step}: " + json.dumps(decision, ensure_ascii=False), flush=True)
+                    if decision["action"] in ("wait", "finish"):
+                        await report("waiting" if decision["action"] == "wait" else "completed", step, decision["reason"])
+                        break
+                    current, _ = await observe(bridge, capabilities, args.compact_observations)
+                    context = decision_context(snapshot, current)
+                    await report("executing", step, decision["reason"])
+                    accepted = await bridge.submit(decision["action"], decision["parameters"], **context,
+                                                  model_goal_id=goal_id, timeout_ticks=args.task_ticks, max_actions=4096)
+                    active_task = accepted["task_id"]
+                    result = await wait_task(bridge, active_task, stopped, args.task_ticks / 20 + 15)
+                    history.append({"decision": decision, "result": result})
+                    if result["state"] != "succeeded":
+                        if not stopped.is_set():
+                            await report("failed", step, result.get("detail") or result.get("error") or result["state"])
+                        break
+                    active_task = None
+                else:
+                    await report("waiting", goal["steps"], "Лимит шагов исчерпан. Проверь результат и задай следующую цель.")
+            except (BridgeError, ValueError, RuntimeError, TimeoutError) as error:
+                if not stopped.is_set():
+                    try:
+                        await report("failed", 0, str(error))
+                    except BridgeError:
+                        pass  # An owner stop or a newer goal also rejects late reports.
+                print("Цель завершена: " + str(error), flush=True)
+            finally:
+                if active_task is not None:
+                    await bridge.request("task.cancel", {"task_id": active_task})
+                    active_task = None
+                goal_id = None
+    finally:
+        relay.broker.close()
+        if bridge._socket:
+            try:
+                await bridge.request("control.stop", timeout=2)
+            except (Exception, asyncio.CancelledError):
+                pass
+        if consumer:
+            consumer.cancel()
+            try:
+                await consumer
+            except asyncio.CancelledError:
+                pass
+        await bridge.close()
+        await asyncio.to_thread(relay.close)
+
+
 async def run(args):
+    if args.interactive:
+        return await run_interactive(args)
     bridge = BridgeClient.from_owner_file(args.config, args.url)
     relay_config = load_relay_config(args.relay_config)
     relay = RelayServer(relay_config["token"], args.relay_port)
@@ -137,6 +265,7 @@ async def run(args):
                 event = await bridge.events.get()
                 if event["type"] in ("control.stopped", "control.manual_override", "actor.death"):
                     stop.set()
+                    relay.broker.cancel_pending()
 
         consumer = asyncio.create_task(consume_events())
         capabilities = await bridge.request("session.capabilities")
@@ -150,12 +279,7 @@ async def run(args):
             if stop.is_set():
                 print("Управление остановлено или передано владельцу; контроллер завершён.")
                 break
-            if args.vision:
-                metadata, png, _ = await bridge.capture(320, 180)
-                snapshot = metadata["observation"]
-            else:
-                snapshot = await bridge.request("observe.snapshot")
-                png = None
+            snapshot, png = await observe(bridge, capabilities, args.compact_observations, args.vision)
             decision = await asyncio.to_thread(
                 relay.broker.infer, model_payload(args.goal, snapshot, allowed, history, png, args.compact_observations), args.model_timeout
             )
@@ -163,11 +287,10 @@ async def run(args):
             print(f"Шаг {step + 1}: " + json.dumps(decision, ensure_ascii=False), flush=True)
             if stop.is_set() or not args.execute or decision["action"] in ("wait", "finish"):
                 break
-            current = await bridge.request("observe.snapshot")
-            if current["actor_id"] != snapshot["actor_id"] or current["dimension"] != snapshot["dimension"]:
-                raise RuntimeError("Actor/dimension changed while the model was thinking")
+            current, _ = await observe(bridge, capabilities, args.compact_observations)
+            context = decision_context(snapshot, current)
             accepted = await bridge.submit(decision["action"], decision["parameters"],
-                                          timeout_ticks=args.task_ticks, max_actions=4096)
+                                          timeout_ticks=args.task_ticks, max_actions=4096, **context)
             active_task = accepted["task_id"]
             result = await wait_task(bridge, active_task, stop, args.task_ticks / 20 + 15)
             print("Результат: " + json.dumps(result, ensure_ascii=False), flush=True)
@@ -199,10 +322,12 @@ def parser():
     p.add_argument("--url", default=None, help="Override loopback bridge WebSocket URL")
     p.add_argument("--relay-config", default=".minebridge-colab.json")
     p.add_argument("--relay-port", type=int, default=8766)
-    p.add_argument("--goal", required=True)
-    p.add_argument("--steps", type=int, choices=range(1, 31), default=1, metavar="1..30")
-    p.add_argument("--execute", action="store_true", help="Execute model decisions; otherwise print one proposal")
-    p.add_argument("--vision", action="store_true", help="Send PNG; choose a vision-capable model in Colab")
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--goal")
+    mode.add_argument("--interactive", action="store_true", help="Run owner goals from the Minecraft F7 window; execution requires in-game permission")
+    p.add_argument("--steps", type=int, choices=range(1, 31), default=1, metavar="1..30", help="Step limit for --goal; interactive goals use the game window")
+    p.add_argument("--execute", action="store_true", help="Execute --goal decisions; --interactive executes owner goals after in-game permission")
+    p.add_argument("--vision", action="store_true", help="Send PNG for --goal; --interactive uses the game window setting")
     p.add_argument("--compact-observations", action="store_true", help="Send six nearest blocks, four entities and one recent result for small model contexts")
     p.add_argument("--model-timeout", type=int, default=300)
     p.add_argument("--task-ticks", type=int, choices=range(20, 1201), default=200, metavar="20..1200")

@@ -24,6 +24,8 @@ public final class BridgeClient {
     private final KeyMapping.Category category=new KeyMapping.Category(Identifier.fromNamespaceAndPath("minebridge","control"));
     private final KeyMapping arm=new KeyMapping("key.minebridge.arm",GLFW.GLFW_KEY_F8,category);
     private final KeyMapping stop=new KeyMapping("key.minebridge.stop",GLFW.GLFW_KEY_F9,category);
+    private final KeyMapping panelKey=new KeyMapping("key.minebridge.panel",GLFW.GLFW_KEY_F7,category);
+    private ModelScreen panel;
     private BridgeEngine engine;
     private BridgeSocket socket;
     private MinecraftWorld world;
@@ -34,6 +36,8 @@ public final class BridgeClient {
     private Path auditFile;
     private float expectedYaw,expectedPitch;
     private boolean haveLook;
+    private boolean panelWasOpen;
+    private int lookResetTicks;
     public BridgeClient(IEventBus bus) {
         bus.addListener(this::keys);
         NeoForge.EVENT_BUS.addListener(this::tick);
@@ -42,7 +46,7 @@ public final class BridgeClient {
         NeoForge.EVENT_BUS.addListener(this::extract);
         NeoForge.EVENT_BUS.addListener(this::render);
     }
-    private void keys(RegisterKeyMappingsEvent event){event.registerCategory(category);event.register(arm);event.register(stop);}
+    private void keys(RegisterKeyMappingsEvent event){event.registerCategory(category);event.register(arm);event.register(stop);event.register(panelKey);}
     private void tick(ClientTickEvent.Post event) {
         if(mc==null)mc=Minecraft.getInstance();
         if(mc==null)return;
@@ -51,13 +55,23 @@ public final class BridgeClient {
         if(identity!=null && !identity.equals(current)) {close();failed=false;}
         if(engine==null && !failed) open(current);
         if(engine==null) return;
-        while(stop.consumeClick()){engine.ownerStop();message("AI Bridge: управление остановлено");}
+        boolean stopRequested=false;
+        while(stop.consumeClick())stopRequested=true;
+        if(stopRequested){engine.ownerStop();message("AI Bridge: управление остановлено");}
         while(arm.consumeClick()) {
+            if(stopRequested)continue;
             if(!mc.hasSingleplayerServer() && !policy.allowMultiplayer){message("AI Bridge: разрешена только одиночная игра");continue;}
             engine.ownerArm();message("AI Bridge: управление разрешено; F9 — остановка");
         }
+        while(panelKey.consumeClick()){if(panel==null)panel=new ModelScreen(engine,arm,stop,panelKey);mc.setScreen(mc.screen==panel?null:panel);}
         if(mc.isPaused()) {engine.manualInput();return;}
-        if(haveLook && (Math.abs(mc.player.getYRot()-expectedYaw)>0.01 || Math.abs(mc.player.getXRot()-expectedPitch)>0.01))engine.manualInput();
+        boolean panelOpen=mc.screen instanceof ModelScreen;
+        // GLFW recentres the cursor when the owner panel changes mouse capture.
+        // Discard those transition samples; actual key/button presses and F9 still interrupt.
+        if(panelOpen!=panelWasOpen)lookResetTicks=4;
+        panelWasOpen=panelOpen;
+        if(haveLook && !panelOpen && lookResetTicks==0 && (Math.abs(mc.player.getYRot()-expectedYaw)>0.01 || Math.abs(mc.player.getXRot()-expectedPitch)>0.01))engine.manualInput();
+        if(lookResetTicks>0)lookResetTicks--;
         engine.tick();
         expectedYaw=mc.player.getYRot();expectedPitch=mc.player.getXRot();haveLook=true;
     }
@@ -81,10 +95,10 @@ public final class BridgeClient {
             Files.writeString(auditFile,e+"\n",StandardOpenOption.CREATE,StandardOpenOption.APPEND);
         } catch(IOException error){LOG.warn("AI Bridge audit persistence failed: {}",error.getClass().getSimpleName());}
     }
-    private void keyInput(InputEvent.Key event){if(engine!=null && event.getAction()==GLFW.GLFW_PRESS && event.getKey()!=arm.getKey().getValue() && event.getKey()!=stop.getKey().getValue())engine.manualInput();}
-    private void mouseInput(InputEvent.MouseButton.Pre event){if(engine!=null && event.getAction()==GLFW.GLFW_PRESS)engine.manualInput();}
+    private void keyInput(InputEvent.Key event){if(engine!=null && !(mc.screen instanceof ModelScreen) && event.getAction()==GLFW.GLFW_PRESS && event.getKey()!=arm.getKey().getValue() && event.getKey()!=stop.getKey().getValue() && event.getKey()!=panelKey.getKey().getValue())engine.manualInput();}
+    private void mouseInput(InputEvent.MouseButton.Pre event){if(engine!=null && !(mc.screen instanceof ModelScreen) && event.getAction()==GLFW.GLFW_PRESS)engine.manualInput();}
     private void extract(ExtractLevelRenderStateEvent event){if(vision!=null)vision.extract(event);}
     private void render(RenderLevelStageEvent.AfterLevel event){if(vision!=null)vision.capture(event);}
     private void message(String text){if(mc.player!=null)mc.player.sendSystemMessage(Component.literal(text));}
-    private void close(){if(vision!=null)vision.close();if(engine!=null)engine.close();if(socket!=null)socket.close();engine=null;socket=null;world=null;vision=null;identity=null;haveLook=false;}
+    private void close(){if(mc!=null && mc.screen instanceof ModelScreen)mc.setScreen(null);panel=null;if(vision!=null)vision.close();if(engine!=null)engine.close();if(socket!=null)socket.close();engine=null;socket=null;world=null;vision=null;identity=null;haveLook=false;panelWasOpen=false;lookResetTicks=0;}
 }

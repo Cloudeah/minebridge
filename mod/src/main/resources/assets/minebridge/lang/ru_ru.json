@@ -1,5 +1,26 @@
 {
   "key.category.minebridge.control": "Minecraft AI Bridge",
   "key.minebridge.arm": "Разрешить управление ИИ",
-  "key.minebridge.stop": "Аварийная остановка ИИ"
+  "key.minebridge.stop": "Аварийная остановка ИИ",
+  "key.minebridge.panel": "Окно целей нейронки",
+  "screen.minebridge.title": "Minecraft AI Bridge · цели",
+  "screen.minebridge.goal": "Цель для нейронки",
+  "screen.minebridge.steps": "Шаги",
+  "screen.minebridge.vision": "Передавать PNG",
+  "screen.minebridge.start": "Запустить цель",
+  "screen.minebridge.stop": "Остановить · F9",
+  "screen.minebridge.arm": "Разрешить · F8",
+  "screen.minebridge.close": "Закрыть",
+  "screen.minebridge.invalid_steps": "Число шагов должно быть от 1 до 30.",
+  "screen.minebridge.connected": "Windows-контроллер подключён",
+  "screen.minebridge.disconnected": "Подключи Windows-контроллер с --interactive",
+  "screen.minebridge.state": "Статус: %s · шаг %s",
+  "screen.minebridge.state.idle": "нет цели",
+  "screen.minebridge.state.queued": "ожидание контроллера",
+  "screen.minebridge.state.thinking": "модель думает",
+  "screen.minebridge.state.executing": "действие выполняется",
+  "screen.minebridge.state.completed": "модель завершила цель",
+  "screen.minebridge.state.waiting": "нужна новая цель",
+  "screen.minebridge.state.failed": "ошибка",
+  "screen.minebridge.state.cancelled": "остановлено"
 }

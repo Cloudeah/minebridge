@@ -41,7 +41,10 @@ public final class BridgeEngine {
     private JsonObject observation=new JsonObject();
     private long lastObservation=-100;
     private long observationTime;
+    private long controlEpoch,lastManualTick=-1,lastManualEpoch=-1;
+    private final ModelControl model=new ModelControl();
     private int subscriptionTicks;
+    private String subscriptionProfile="full";
     private long lastSent=-100;
     private boolean eventSubscription;
     private JsonObject visionRequest;
@@ -61,10 +64,17 @@ public final class BridgeEngine {
     public void disconnected(Peer peer) { incoming.add(new Incoming(peer,"",true)); }
     public long revision() { return revision; }
     public boolean armed() { return armed; }
-    public void ownerArm() { armed=true; stopped=false; event("control.armed",object()); }
-    public void ownerStop() { armed=false; stopped=true; stopAll("owner_stop"); event("control.stopped",object("source","owner")); }
+    public void ownerArm() { controlEpoch++;armed=true; stopped=false; event("control.armed",object()); }
+    public void ownerStop() { controlEpoch++;armed=false; stopped=true;model.cancel("Остановлено владельцем.");stopAll("owner_stop"); event("control.stopped",object("source","owner")); }
+    public JsonObject modelStatus(){JsonObject status=model.status();status.addProperty("controller_connected",controller!=null);status.addProperty("armed",armed);return status;}
+    public void ownerModelStart(String goal,int steps,boolean vision) {
+        requireArmed();if(vision && !world.visionAvailable())throw new BridgeException("unsupported_capability","Зрение недоступно.");
+        if(tasks.values().stream().anyMatch(t->!t.terminal()))throw new BridgeException("busy","Сначала останови текущие задачи клавишей F9.");
+        model.start(goal,steps,vision);controlEpoch++;event("model.updated",modelStatus());
+    }
     public void manualInput() {
-        if (active!=null) { transition(active,Task.State.paused); world.releaseControls(); active=null; event("control.manual_override",object()); }
+        if (active!=null) { transition(active,Task.State.paused); world.releaseControls(); active=null; }
+        if(armed && (world.tick()!=lastManualTick || controlEpoch!=lastManualEpoch)){lastManualTick=world.tick();controlEpoch++;lastManualEpoch=controlEpoch;model.cancel("Ручной ввод: цель остановлена.");event("control.manual_override",object());}
     }
     public void tick() {
         if (!world.actorId().equals(actorId) || !world.dimension().equals(dimension)) {
@@ -76,12 +86,12 @@ public final class BridgeEngine {
         for(int i=0;i<128;i++) { Incoming in=incoming.poll(); if(in==null) break; batch.add(in); }
         batch.sort(Comparator.comparingInt(in->in.disconnect || in.text.contains("\"control.stop\"") || in.text.contains("\"task.cancel\"") ? 0 : 1));
         for(Incoming in:batch) {
-            if(in.disconnect) { if(in.peer==controller) { world.releaseControls(); for(Task t:tasks.values()) if(!t.terminal() && t.state!=Task.State.paused) transition(t,Task.State.paused); active=null; controller=null; subscriptionTicks=0; visionPeriod=0; visionRequest=null; } }
+            if(in.disconnect) { if(in.peer==controller) { controlEpoch++;model.cancel("Windows-контроллер отключился.");world.releaseControls(); for(Task t:tasks.values()) if(!t.terminal() && t.state!=Task.State.paused) transition(t,Task.State.paused); active=null; controller=null; subscriptionTicks=0;subscriptionProfile="full"; visionPeriod=0; visionRequest=null; } }
             else handle(in.peer,in.text);
         }
         dedup.entrySet().removeIf(e->System.currentTimeMillis()-e.getValue().time>DEDUP_MS);
         if(armed && !stopped && controller!=null) runTask();
-        if(subscriptionTicks>0 && controller!=null && world.tick()-lastSent>=subscriptionTicks) { controller.text(envelope("observe.snapshot",null,snapshot())); lastSent=world.tick(); }
+        if(subscriptionTicks>0 && controller!=null && world.tick()-lastSent>=subscriptionTicks) { controller.text(envelope("observe.snapshot",null,ObservationProfiles.apply(snapshot(),subscriptionProfile))); lastSent=world.tick(); }
         if(visionRequest!=null && world.tick()>visionDeadline) { event("vision.error",object("request_id",visionRequest.get("request_id"),"code","timeout")); visionRequest=null; }
         if(visionPeriod>0 && visionRequest==null && world.tick()-lastVision>=visionPeriod) { visionRequest=visionProfile.deepCopy(); visionRequest.addProperty("stream",true); visionDeadline=world.tick()+40; }
         if(world.tick()%100==0) { try { memory.flush(); } catch(IOException e) { event("memory.error",object("code","persistence_failed")); } }
@@ -97,11 +107,13 @@ public final class BridgeEngine {
         JsonObject s=observation.deepCopy();
         s.addProperty("observation_id",id()); s.addProperty("world_id",world.worldId()); s.addProperty("dimension",world.dimension());
         s.addProperty("actor_id",world.actorId()); s.addProperty("game_tick",lastObservation); s.addProperty("capture_time",observationTime); s.addProperty("age_ms",System.currentTimeMillis()-observationTime); s.addProperty("revision",revision);
+        s.addProperty("control_epoch",controlEpoch);
         s.add("active_task",active==null ? JsonNull.INSTANCE : active.json()); return s;
     }
     private void detectChanges(JsonObject before,JsonObject after) {
         if(before.has("actor") && after.has("actor")) {
             JsonObject a=child(before,"actor"),b=child(after,"actor");
+            if(a.has("health") && b.has("health") && a.get("health").getAsDouble()>0 && b.get("health").getAsDouble()<=0){controlEpoch++;model.cancel("Игрок погиб: цель остановлена.");}
             for(String field:List.of("health","food","effects","selected_slot"))if(a.has(field)&&b.has(field)&&!a.get(field).equals(b.get(field)))
                 event(field.equals("health") && b.get(field).getAsDouble()<=0?"actor.death":"actor."+field,object("before",a.get(field),"after",b.get(field)));
         }
@@ -163,8 +175,8 @@ public final class BridgeEngine {
             case "session.capabilities" -> capabilities();
             case "session.ping" -> object("game_tick",world.tick(),"time",System.currentTimeMillis());
             case "session.resume" -> replay(d);
-            case "observe.snapshot" -> { refresh(); yield snapshot(); }
-            case "observe.subscribe" -> { subscriptionTicks=integer(d,"interval_ticks",10,4,1200); eventSubscription=bool(d,"events",true); yield object("interval_ticks",subscriptionTicks,"events",eventSubscription); }
+            case "observe.snapshot" -> {String profile=ObservationProfiles.validate(string(d,"profile","full"));refresh(); yield ObservationProfiles.apply(snapshot(),profile); }
+            case "observe.subscribe" -> {String profile=ObservationProfiles.validate(string(d,"profile","full"));subscriptionTicks=integer(d,"interval_ticks",10,4,1200);subscriptionProfile=profile;eventSubscription=bool(d,"events",true); yield object("interval_ticks",subscriptionTicks,"events",eventSubscription,"profile",profile); }
             case "observe.unsubscribe" -> { subscriptionTicks=0; eventSubscription=false; yield object("status","unsubscribed"); }
             case "map.query", "memory.query" -> memory.query(d,world.dimension(),world.tick());
             case "memory.annotate" -> memory.annotate(d,world.dimension());
@@ -174,10 +186,14 @@ public final class BridgeEngine {
             case "task.cancel" -> { Task t=task(d); if(!t.terminal()) finish(t,Task.State.cancelled,"cancelled","Cancelled by controller",t.result); yield t.json(); }
             case "task.pause" -> { Task t=task(d); if(t.terminal()) throw new BridgeException("invalid_transition","Terminal task cannot pause"); transition(t,Task.State.paused); if(t==active) { active=null;world.releaseControls(); } yield t.json(); }
             case "task.resume" -> { requireArmed(); Task t=task(d); if(t.state!=Task.State.paused) throw new BridgeException("invalid_transition","Only paused tasks can resume"); t.context.addProperty("revalidate",true); transition(t,Task.State.queued); yield t.json(); }
-            case "control.stop" -> { stopped=true;armed=false;stopAll("control.stop"); event("control.stopped",object("source","controller")); yield object("status","stopped","owner_rearm_required",true); }
+            case "control.stop" -> { controlEpoch++;stopped=true;armed=false;model.cancel("Остановлено контроллером.");stopAll("control.stop"); event("control.stopped",object("source","controller")); yield object("status","stopped","owner_rearm_required",true); }
+            case "model.status" -> modelStatus();
+            case "model.claim" -> {requireArmed();model.requireGoal(d);yield model.claim(d);}
+            case "model.report" -> model.report(d);
             case "vision.capture", "vision.subscribe" -> {
                 if(!world.visionAvailable()) throw new BridgeException("unsupported_capability","Vision requires a rendering client");
                 JsonObject profile=object("width",integer(d,"width",640,64,640),"height",integer(d,"height",360,64,360),"request_id",request);
+                profile.addProperty("observation_profile",ObservationProfiles.validate(string(d,"observation_profile","full")));
                 if(d.has("crop"))profile.add("crop",child(d,"crop").deepCopy());
                 if(visionRequest!=null) throw new BridgeException("busy","Capture already pending",true);
                 if(type.equals("vision.subscribe")) {visionPeriod=integer(d,"interval_ticks",10,4,1200);visionProfile=profile.deepCopy();visionProfile.remove("request_id");}
@@ -185,14 +201,16 @@ public final class BridgeEngine {
             }
             case "vision.unsubscribe" -> { visionPeriod=0;visionRequest=null;yield object("status","unsubscribed"); }
             case "route.plan", "craft.plan", "build.plan", "inventory.inspect" -> { requireCapability(type);yield world.query(type,d); }
-            default -> { requireActor(message); yield submit(type,d,object()); }
+            default -> { requireActor(message);requireControlEpoch(d); yield submit(type,d,object()); }
         };
     }
     private void requireActor(JsonObject m) { if(!actorId.equals(string(m,"actor_id"))) throw new BridgeException("actor_mismatch","actor_id required for actions"); }
     private void requireArmed() { if(!armed || stopped) throw new BridgeException("permission_denied","Owner must arm control in game (F8)"); }
     private void requireCapability(String action) { if(!world.capabilities().contains(action)) throw new BridgeException("unsupported_capability",action); }
     private JsonObject submit(String action,JsonObject parameters,JsonObject options) {
-        requireArmed();requireCapability(action);world.validate(action,parameters);policy.check(action,parameters,world.dimension());
+        requireArmed();requireControlEpoch(options);
+        if(options.has("model_goal_id"))model.requireActive(string(options,"model_goal_id"));
+        requireCapability(action);world.validate(action,parameters);policy.check(action,parameters,world.dimension());
         if(tasks.size()>=256) {
             Set<String> required=new HashSet<>();for(Task waiting:tasks.values())if(!waiting.terminal())required.addAll(waiting.dependencies);
             tasks.entrySet().removeIf(e->e.getValue().terminal()&&!required.contains(e.getKey()));
@@ -237,13 +255,21 @@ public final class BridgeEngine {
     private void stopAll(String reason) { world.releaseControls();for(Task t:tasks.values()) if(!t.terminal()) finish(t,Task.State.cancelled,reason,"Control stopped",t.result);active=null; }
     public JsonObject capabilities() {
         return object("actions",world.capabilities(),"vision",world.visionAvailable(),"formats",List.of("MBV1/png/float32-le"),"actor_id",world.actorId(),"profile",policy.publicProfile(),"armed",armed,
-                "deduplication_window_ms",DEDUP_MS,"deduplication_capacity",4096,"event_history",512,"max_tasks",256,"vision_max_fps",5,"vision_max_resolution",List.of(640,360),"movement_modes",world.movementModes());
+                "deduplication_window_ms",DEDUP_MS,"deduplication_capacity",4096,"event_history",512,"max_tasks",256,"vision_max_fps",5,"vision_max_resolution",List.of(640,360),"movement_modes",world.movementModes(),
+                "observation_profiles",ObservationProfiles.NAMES,"decision_guards",List.of("control_epoch","model_goal_id"),"model_control",true);
+    }
+    private void requireControlEpoch(JsonObject data) {
+        if(!data.has("expected_control_epoch"))return;
+        double expected=number(data,"expected_control_epoch",-1);
+        if(expected<0 || expected!=Math.rint(expected) || expected>9_007_199_254_740_991L)
+            throw new BridgeException("invalid_request","Invalid expected_control_epoch");
+        if(expected!=controlEpoch)throw new BridgeException("stale_control","Owner control changed while the model was thinking; refresh the observation",true);
     }
     private JsonObject envelope(String type,String request,JsonObject data) { return object("protocol_version",VERSION,"session_id",sessionId,"message_id",id(),"type",type,"request_id",request,"data",data); }
     public void event(String type,JsonObject data) {
         JsonObject e=envelope(type,null,data); e.addProperty("event_id",id());e.addProperty("sequence",++sequence);e.addProperty("game_tick",world.tick());e.addProperty("revision",revision);
         journal.addLast(e);while(journal.size()>512) journal.removeFirst();audit.accept(e.deepCopy());
-        if(controller!=null && (eventSubscription || type.startsWith("task.") || type.startsWith("control.") || type.equals("vision.error") || type.equals("actor.health") || type.equals("actor.death"))) controller.text(e);
+        if(controller!=null && (eventSubscription || type.startsWith("task.") || type.startsWith("control.") || type.equals("model.updated") || type.equals("vision.error") || type.equals("actor.health") || type.equals("actor.death"))) controller.text(e);
     }
     private JsonObject replay(JsonObject d) {
         long after=(long)number(d,"after_sequence",0);

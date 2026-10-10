@@ -1,5 +1,26 @@
 {
   "key.category.minebridge.control": "Minecraft AI Bridge",
   "key.minebridge.arm": "Arm AI control",
-  "key.minebridge.stop": "Emergency stop AI control"
+  "key.minebridge.stop": "Emergency stop AI control",
+  "key.minebridge.panel": "AI goal window",
+  "screen.minebridge.title": "Minecraft AI Bridge · goals",
+  "screen.minebridge.goal": "Goal for the model",
+  "screen.minebridge.steps": "Steps",
+  "screen.minebridge.vision": "Send PNG",
+  "screen.minebridge.start": "Start goal",
+  "screen.minebridge.stop": "Stop · F9",
+  "screen.minebridge.arm": "Allow · F8",
+  "screen.minebridge.close": "Close",
+  "screen.minebridge.invalid_steps": "Steps must be between 1 and 30.",
+  "screen.minebridge.connected": "Windows controller connected",
+  "screen.minebridge.disconnected": "Connect the Windows controller with --interactive",
+  "screen.minebridge.state": "Status: %s · step %s",
+  "screen.minebridge.state.idle": "no goal",
+  "screen.minebridge.state.queued": "waiting for controller",
+  "screen.minebridge.state.thinking": "model is thinking",
+  "screen.minebridge.state.executing": "executing action",
+  "screen.minebridge.state.completed": "model finished goal",
+  "screen.minebridge.state.waiting": "new goal needed",
+  "screen.minebridge.state.failed": "error",
+  "screen.minebridge.state.cancelled": "stopped"
 }

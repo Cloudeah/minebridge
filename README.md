@@ -6,7 +6,7 @@
 
 ## Скачать готовый мод
 
-[Скачать minebridge-0.1.0.jar](https://github.com/Cloudeah/minebridge/raw/refs/heads/main/releases/minebridge-0.1.0.jar). Это проверенная сборка из репозитория; файл и [SHA-256](releases/minebridge-0.1.0.jar.sha256) находятся в `releases/`.
+[Скачать minebridge-0.2.0.jar](https://github.com/Cloudeah/minebridge/raw/refs/heads/main/releases/minebridge-0.2.0.jar). Это проверенная сборка из репозитория; файл и [SHA-256](releases/minebridge-0.2.0.jar.sha256) находятся в `releases/`.
 
 Нужны **Minecraft 26.1.2**, **NeoForge 26.1.2.97** и **Java 25**. Скопируйте JAR в папку `mods` клиента, откройте одиночный мир и используйте F8 для разрешения управления, F9 для остановки. Настройка внешнего контроллера описана ниже.
 
@@ -22,6 +22,10 @@
 
 Локальные тесты проверяют код адаптера и передачу решений. Реальный запуск модели на TPU Colab требует проверки в пользовательском runtime.
 
+## Управление нейронкой из игры
+
+В версии **0.2.0** клавиша **F7** открывает окно целей: текст, число шагов, PNG-зрение, запуск, остановка и статус. [Гайд для Windows](docs/INGAME_VLLM_RU.md) показывает подключение через `examples/vllm_colab.py --interactive` и настройку блокнота для нескольких целей подряд. F8 разрешает управление, F9 останавливает его. Компактный профиль наблюдений рассчитан на небольшой контекст модели; мод отклоняет запоздалые действия после ручного вмешательства.
+
 ## Сборка и запуск
 
 Нужны JDK 25 и доступ к Maven Central, Maven NeoForge и официальным ресурсам Minecraft. Gradle 9.2.1 включён; дистрибутив проверяется по SHA-256.
@@ -31,7 +35,7 @@
 ./gradlew :mod:runClient
 ```
 
-Мод: `mod/build/libs/minebridge-0.1.0.jar`. Установите его в `mods` клиента с указанной версией NeoForge. Java-WebSocket вложен в JAR; Gson предоставляется Minecraft.
+Мод: `mod/build/libs/minebridge-0.2.0.jar`. Установите его в `mods` клиента с указанной версией NeoForge. Java-WebSocket вложен в JAR; Gson предоставляется Minecraft.
 
 В облачной среде: `python scripts/dev.py :core:test :mod:build`. Помощник находит JDK 25 в `/workspace/toolchains`, использует штатный прокси и системное хранилище доверенных сертификатов. Графическому клиенту нужен дисплей OpenGL; звуковое устройство не требуется.
 

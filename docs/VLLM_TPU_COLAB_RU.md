@@ -2,6 +2,8 @@
 
 Готовый [notebook](../examples/vllm_tpu_colab.ipynb) запускает **Gemma 4 E2B IT** через **vLLM TPU**. Minecraft и [Python-контроллер](../examples/vllm_colab.py) работают на Windows. Colab получает наблюдение через HTTPS и возвращает JSON-решение; контроллер проверяет его, выполняет действие и читает результат мода.
 
+Для ввода целей через **F7 в Minecraft** используй [гайд управления из игры](INGAME_VLLM_RU.md). Ниже описан запуск отдельной цели из PowerShell и проверка без выполнения.
+
 ```mermaid
 flowchart LR
     subgraph Windows
@@ -24,7 +26,7 @@ flowchart LR
 ## 1. Подготовь Windows
 
 1. Установи **Java 25**, **Minecraft 26.1.2**, **NeoForge 26.1.2.97**.
-2. Открой [готовый JAR](https://github.com/Cloudeah/minebridge/blob/main/releases/minebridge-0.1.0.jar), нажми **Download raw file** и положи его в `mods` своей игровой папки. Для стандартного launcher это `%APPDATA%\.minecraft\mods`.
+2. Открой [готовый JAR](https://github.com/Cloudeah/minebridge/blob/main/releases/minebridge-0.2.0.jar), нажми **Download raw file** и положи его в `mods` своей игровой папки. Для стандартного launcher это `%APPDATA%\.minecraft\mods`.
 3. Запусти профиль NeoForge и открой одиночный мир. Проверь сообщение о готовности AI Bridge. Нажми **F3+P**, чтобы отключить паузу при потере фокуса, и оставь мир без меню Escape.
 4. Установи [Python 3.12](https://www.python.org/downloads/) с Python launcher `py`.
 5. Скачай свежий **Code → Download ZIP** из [репозитория](https://github.com/Cloudeah/minebridge), распакуй в `C:\minebridge`. Здесь должны быть папки `examples`, `python` и `releases`.

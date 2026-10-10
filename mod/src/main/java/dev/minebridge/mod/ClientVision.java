@@ -80,6 +80,7 @@ final class ClientVision implements AutoCloseable {
             JsonObject packet=metadata.deepCopy();packet.add("request_id",request.has("request_id")?request.get("request_id"):JsonNull.INSTANCE);
             packet.add("crop",object("x",x,"y",y,"width",rw,"height",rh,"source_width",sourceWidth,"source_height",sourceHeight));
             packet.add("objects",objects(width,height,x,y,rw,rh,sourceWidth,sourceHeight,distances));
+            packet.add("observation",ObservationProfiles.apply(packet.getAsJsonObject("observation"),string(request,"observation_profile","full")));
             long captured=packet.get("capture_time").getAsLong();
             encoding.execute(()->{
                 try {

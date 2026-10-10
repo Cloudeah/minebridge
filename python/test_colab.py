@@ -78,8 +78,28 @@ class RelayTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "model unavailable"):
                 future.result(timeout=2)
 
+    def test_owner_cancellation_rejects_late_reply_and_relay_accepts_next_goal(self):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(self.relay.broker.infer, {}, 5)
+            old = self.session.get(self.url + "/job", timeout=2).json()
+            self.relay.broker.cancel_pending()
+            with self.assertRaisesRegex(RuntimeError, "cancelled by owner"):
+                first.result(timeout=1)
+            self.assertEqual(self.session.post(self.url + "/result", json={"job_id": old["job_id"], "decision": DECISION}, timeout=2).status_code, 409)
+            second = pool.submit(self.relay.broker.infer, {}, 5)
+            new = self.session.get(self.url + "/job", timeout=2).json()
+            self.assertNotEqual(old["job_id"], new["job_id"])
+            self.assertEqual(self.session.post(self.url + "/result", json={"job_id": new["job_id"], "decision": DECISION}, timeout=2).status_code, 200)
+            self.assertEqual(second.result(timeout=1), DECISION)
+
 
 class DecisionTest(unittest.TestCase):
+    def test_owner_epoch_is_checked_and_passed_to_mod_without_requiring_stable_world_revision(self):
+        observed = {**snapshot(), "control_epoch": 7}
+        current = {**observed, "revision": 99, "game_tick": 999}
+        self.assertEqual(controller.decision_context(observed, current), {"expected_control_epoch": 7})
+        with self.assertRaisesRegex(RuntimeError, "Owner control changed"):
+            controller.decision_context(observed, {**current, "control_epoch": 8})
     def test_unavailable_action_and_nonfinite_coordinates_are_rejected(self):
         with self.assertRaises(ValueError):
             controller.validate_decision({**DECISION, "action": "arbitrary.command"}, ["look.at"])
@@ -97,7 +117,7 @@ class DecisionTest(unittest.TestCase):
     def test_compact_observation_preserves_inventory_and_menu_slot_ids(self):
         state = snapshot()
         state["blocks"] = [{"x": i, "y": 64, "z": 0, "type": "minecraft:stone"} for i in range(20, 0, -1)]
-        state["entities"] = [{"id": str(i)} for i in range(10)]
+        state["entities"] = [{"id": str(i), "position": {"x": i, "y": 64, "z": 0}} for i in range(9, -1, -1)]
         state["inventory"] = [{"slot": 17, "type": "minecraft:stick", "count": 2}]
         state["context"].update(menu_id=7, menu_revision=42)
         state["context"]["menu_slots"] = [
@@ -109,6 +129,7 @@ class DecisionTest(unittest.TestCase):
         observed = user["observation"]
         self.assertEqual([b["x"] for b in observed["blocks"]], [1, 2, 3, 4, 5, 6])
         self.assertEqual(len(observed["entities"]), 4)
+        self.assertEqual([e["id"] for e in observed["entities"]], ["0", "1", "2", "3"])
         self.assertEqual([s["slot"] for s in observed["menu_slots"]], [0, 1, 2, 3, 8, 50])
         self.assertEqual(observed["inventory"][0]["slot"], 17)
         self.assertEqual(observed["context"]["menu_id"], 7)

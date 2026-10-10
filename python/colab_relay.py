@@ -30,6 +30,7 @@ class JobBroker:
         self.result = None
         self.completed = None
         self.closed = False
+        self.cancelled_job = None
 
     def infer(self, payload, timeout=180):
         with self.condition:
@@ -42,19 +43,21 @@ class JobBroker:
             self.condition.notify_all()
             try:
                 ready = self.condition.wait_for(
-                    lambda: self.result is not None or self.closed, timeout
+                    lambda: self.result is not None or self.closed or self.cancelled_job == self.pending["job_id"], timeout
                 )
                 if not ready:
                     raise TimeoutError("No answer from Colab; run the notebook decision cell")
                 if self.closed:
                     raise RuntimeError("Relay closed")
+                if self.cancelled_job == self.pending["job_id"]:
+                    raise RuntimeError("Model request cancelled by owner")
                 result = self.result
                 self.completed = (self.pending["job_id"], result)
                 if "error" in result:
                     raise RuntimeError("Colab: " + str(result["error"])[:500])
                 return result["decision"]
             finally:
-                self.pending = self.result = None
+                self.pending = self.result = self.cancelled_job = None
                 self.condition.notify_all()
 
     def next_job(self, timeout=10):
@@ -75,7 +78,7 @@ class JobBroker:
         with self.condition:
             if self.completed and value["job_id"] == self.completed[0]:
                 return self.completed[1] == result
-            if self.pending is None or value["job_id"] != self.pending["job_id"]:
+            if self.pending is None or value["job_id"] != self.pending["job_id"] or self.cancelled_job == value["job_id"]:
                 return False
             if self.result is not None:
                 return self.result == result
@@ -88,6 +91,12 @@ class JobBroker:
             self.closed = True
             self.worker_ready.set()  # Release startup waiters when the controller is interrupted.
             self.condition.notify_all()
+
+    def cancel_pending(self):
+        with self.condition:
+            if self.pending is not None:
+                self.cancelled_job = self.pending["job_id"]
+                self.condition.notify_all()
 
 
 class RelayServer:

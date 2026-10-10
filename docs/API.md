@@ -29,20 +29,29 @@ WebSocket `/bridge`, управляющие сообщения JSON. Снача�
 | session.authenticate | token |
 | session.capabilities / ping | {} |
 | session.resume | after_sequence |
-| observe.snapshot | {} |
-| observe.subscribe | interval_ticks: 4..1200, events: true |
+| observe.snapshot | опционально profile: full / compact |
+| observe.subscribe | interval_ticks: 4..1200, events: true, опционально profile: full / compact |
 | observe.unsubscribe | {} |
-| task.submit | action, parameters, priority: -100..100, timeout_ticks: 1..12000, max_actions: 1..100000, depends_on: [task_id] |
+| task.submit | action, parameters, priority: -100..100, timeout_ticks: 1..12000, max_actions: 1..100000, depends_on: [task_id], опционально expected_control_epoch и model_goal_id |
 | task.status / pause / resume / cancel | task_id |
 | task.list / control.stop | {} |
 | map.query / memory.query | x,y,z, radius: 1..64, limit: 1..2048, опционально block |
 | memory.annotate | text, опционально position |
-| vision.capture / subscribe | width: 64..640, height: 64..360, interval_ticks: 4..1200, опционально crop |
+| vision.capture / subscribe | width: 64..640, height: 64..360, interval_ticks: 4..1200, опционально crop и observation_profile: full / compact |
 | vision.unsubscribe | {} |
+| model.status | {} — текущая цель, статус и подключение контроллера |
+| model.claim | goal_id — принять цель, созданную владельцем в окне F7 |
+| model.report | goal_id, state: thinking / executing / completed / waiting / failed, step, detail |
+
+Дополнения версии мода 0.2.0 сохраняют протокол 1.0. Capabilities объявляет `observation_profiles`, `decision_guards` и `model_control`. Профиль `full` по умолчанию сохраняет прежний снимок. `compact` возвращает шесть ближайших наблюдённых блоков, четыре ближайшие сущности, занятые слоты инвентаря и занятые слоты меню с первыми четырьмя пустыми; номера слотов, UUID, свойства блоков и menu revision сохраняются. Пропущенные данные остаются неизвестными.
+
+Снимок содержит `control_epoch`. Контроллер сохраняет его до обращения к модели и передаёт как `task.submit.data.expected_control_epoch`. Мод проверяет значение при принятии задачи; ручной ввод, остановка, повторное разрешение управления или разрыв сессии делают старое решение недействительным (`stale_control`). Обычные игровые тики не меняют этот счётчик. Старые клиенты могут продолжать отправлять задачи без этого поля.
+
+Цель создаётся только локальным владельцем; операции `model.start` по сети нет. Для её действий передаётся `model_goal_id`. Отменённая или сменившаяся цель отклоняет поздние задачи/отчёты с `stale_goal`. Статус `completed` означает сообщение модели о завершении цели; фактические игровые изменения подтверждаются обычными результатами задач.
 
 Зависимости ссылаются на ранее принятые задачи; неуспех зависимости даёт dependency_failed. В каждый момент выполняется одна задача. Пауза освобождает управление; отмена не откатывает мир. После control.stop нужен F8 владельцем.
 
-События содержат event_id, sequence, game_tick, revision. Типы: task.*, actor.health/death, inventory.changed, entity.observed/observation_lost, interface.changed, observe.changed, control.*, vision.error. Потеря наблюдения не равна смерти. Критические события здоровья, смерти и задач доставляются без обычной подписки.
+События содержат event_id, sequence, game_tick, revision. Типы: task.*, actor.health/death, inventory.changed, entity.observed/observation_lost, interface.changed, observe.changed, control.*, model.updated, vision.error. Потеря наблюдения не равна смерти. Критические события здоровья, смерти, задач и новых целей доставляются без обычной подписки.
 
 История — 512 событий. session.resume возвращает history_gap, events, snapshot, tasks, last_sequence, require_plan_revalidation. При разрыве/переполнении обновите снимок и задачи; движение не возобновляется автоматически. task.resume нужен для конкретной paused задачи. Результаты живут в текущей сессии; при лимите 256 задач терминальные записи могут освобождаться.
 
