@@ -1,0 +1,10 @@
+.gradle/
+**/build/
+**/run/
+.idea/
+*.iml
+__pycache__/
+.venv/
+*.log
+bridge-owner.json
+bridge-memory/

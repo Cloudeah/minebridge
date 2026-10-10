@@ -1,0 +1,5 @@
+allprojects {
+    group = 'dev.minebridge'
+    version = '0.1.0'
+    repositories { mavenCentral() }
+}

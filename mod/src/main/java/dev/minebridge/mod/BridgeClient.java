@@ -1,0 +1,90 @@
+package dev.minebridge.mod;
+
+import dev.minebridge.core.*;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.KeyMapping;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.neoforged.api.distmarker.Dist;
+import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.fml.loading.FMLPaths;
+import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.client.event.*;
+import org.lwjgl.glfw.GLFW;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import java.nio.file.*;
+import java.io.IOException;
+
+@Mod(value="minebridge",dist=Dist.CLIENT)
+public final class BridgeClient {
+    private static final Logger LOG=LoggerFactory.getLogger("minebridge");
+    private Minecraft mc;
+    private final KeyMapping.Category category=new KeyMapping.Category(Identifier.fromNamespaceAndPath("minebridge","control"));
+    private final KeyMapping arm=new KeyMapping("key.minebridge.arm",GLFW.GLFW_KEY_F8,category);
+    private final KeyMapping stop=new KeyMapping("key.minebridge.stop",GLFW.GLFW_KEY_F9,category);
+    private BridgeEngine engine;
+    private BridgeSocket socket;
+    private MinecraftWorld world;
+    private ClientVision vision;
+    private OwnerPolicy policy;
+    private String identity;
+    private boolean failed;
+    private Path auditFile;
+    private float expectedYaw,expectedPitch;
+    private boolean haveLook;
+    public BridgeClient(IEventBus bus) {
+        bus.addListener(this::keys);
+        NeoForge.EVENT_BUS.addListener(this::tick);
+        NeoForge.EVENT_BUS.addListener(this::keyInput);
+        NeoForge.EVENT_BUS.addListener(this::mouseInput);
+        NeoForge.EVENT_BUS.addListener(this::extract);
+        NeoForge.EVENT_BUS.addListener(this::render);
+    }
+    private void keys(RegisterKeyMappingsEvent event){event.registerCategory(category);event.register(arm);event.register(stop);}
+    private void tick(ClientTickEvent.Post event) {
+        if(mc==null)mc=Minecraft.getInstance();
+        if(mc==null)return;
+        if(mc.player==null || mc.level==null || mc.gameMode==null) { close();failed=false;return; }
+        String current=mc.player.getUUID()+"/"+mc.level.dimension().identifier();
+        if(identity!=null && !identity.equals(current)) {close();failed=false;}
+        if(engine==null && !failed) open(current);
+        if(engine==null) return;
+        while(stop.consumeClick()){engine.ownerStop();message("AI Bridge: управление остановлено");}
+        while(arm.consumeClick()) {
+            if(!mc.hasSingleplayerServer() && !policy.allowMultiplayer){message("AI Bridge: разрешена только одиночная игра");continue;}
+            engine.ownerArm();message("AI Bridge: управление разрешено; F9 — остановка");
+        }
+        if(mc.isPaused()) {engine.manualInput();return;}
+        if(haveLook && (Math.abs(mc.player.getYRot()-expectedYaw)>0.01 || Math.abs(mc.player.getXRot()-expectedPitch)>0.01))engine.manualInput();
+        engine.tick();
+        expectedYaw=mc.player.getYRot();expectedPitch=mc.player.getXRot();haveLook=true;
+    }
+    private void open(String current) {
+        try {
+            Path dir=FMLPaths.CONFIGDIR.get().resolve("minebridge");
+            policy=OwnerPolicy.load(dir.resolve("bridge-owner.json"));
+            world=new MinecraftWorld(mc,policy);
+            WorldMemory memory=new WorldMemory(dir.resolve("bridge-memory"),world.worldId());
+            Path logs=mc.gameDirectory.toPath().resolve("logs");Files.createDirectories(logs);auditFile=logs.resolve("minebridge-events.jsonl");
+            engine=new BridgeEngine(world,policy,memory,this::audit);
+            vision=new ClientVision(mc,world,engine);
+            socket=new BridgeSocket(policy.port,engine,s->LOG.warn("{}",s));socket.start();identity=current;
+            message("AI Bridge: локальный WebSocket готов; F8 — разрешить управление");
+        } catch(Exception e) {failed=true;LOG.error("AI Bridge startup failed",e);close();message("AI Bridge: ошибка запуска; см. журнал");}
+    }
+    private void audit(com.google.gson.JsonObject e) {
+        try {
+            // Rotate instead of allowing a long-running world to fill the disk.
+            if(Files.exists(auditFile) && Files.size(auditFile)>8*1024*1024)Files.move(auditFile,auditFile.resolveSibling("minebridge-events.previous.jsonl"),StandardCopyOption.REPLACE_EXISTING);
+            Files.writeString(auditFile,e+"\n",StandardOpenOption.CREATE,StandardOpenOption.APPEND);
+        } catch(IOException error){LOG.warn("AI Bridge audit persistence failed: {}",error.getClass().getSimpleName());}
+    }
+    private void keyInput(InputEvent.Key event){if(engine!=null && event.getAction()==GLFW.GLFW_PRESS && event.getKey()!=arm.getKey().getValue() && event.getKey()!=stop.getKey().getValue())engine.manualInput();}
+    private void mouseInput(InputEvent.MouseButton.Pre event){if(engine!=null && event.getAction()==GLFW.GLFW_PRESS)engine.manualInput();}
+    private void extract(ExtractLevelRenderStateEvent event){if(vision!=null)vision.extract(event);}
+    private void render(RenderLevelStageEvent.AfterLevel event){if(vision!=null)vision.capture(event);}
+    private void message(String text){if(mc.player!=null)mc.player.sendSystemMessage(Component.literal(text));}
+    private void close(){if(vision!=null)vision.close();if(engine!=null)engine.close();if(socket!=null)socket.close();engine=null;socket=null;world=null;vision=null;identity=null;haveLook=false;}
+}

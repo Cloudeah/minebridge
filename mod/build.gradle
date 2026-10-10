@@ -1,0 +1,29 @@
+plugins {
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.148'
+}
+java { toolchain.languageVersion = JavaLanguageVersion.of(25) }
+base { archivesName = 'minebridge' }
+neoForge {
+    version = project.neo_version
+    runs {
+        client {
+            client()
+            if (providers.gradleProperty('quickPlayWorld').isPresent()) {
+                programArgument '--quickPlaySingleplayer'
+                programArgument providers.gradleProperty('quickPlayWorld').get()
+            }
+        }
+        server { server(); programArgument '--nogui' }
+    }
+    mods { minebridge { sourceSet sourceSets.main; sourceSet project(':core').sourceSets.main } }
+}
+dependencies {
+    implementation project(':core')
+    jarJar('org.java-websocket:Java-WebSocket:1.6.0') {
+        version { strictly '[1.6.0,1.7.0)'; prefer '1.6.0' }
+    }
+}
+tasks.named('jar', Jar) {
+    from project(':core').sourceSets.main.output
+}
