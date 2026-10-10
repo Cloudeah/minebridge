@@ -28,6 +28,7 @@ controller = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(controller)
 TOKEN = "test-relay-token-" + "x" * 32
 DECISION = {"action": "look.at", "parameters": {"target": {"x": 3, "y": 65, "z": 0}}, "reason": "test fixture"}
+EXPRESSION_REPLY = '{"action":"look.at","parameters":{"target":{"x":0 + 3,"y":65,"z":0}},"reason":"east"}'
 
 
 class RelayTest(unittest.TestCase):
@@ -359,12 +360,82 @@ class VllmAdapterTest(unittest.TestCase):
             (json.dumps({**DECISION, "extra": "unexpected"}), "stop"),
             (json.dumps(DECISION), "length"),
             ("not JSON", "stop"),
+            (EXPRESSION_REPLY, "stop"),
+            (json.dumps({**DECISION, "parameters": {"target": {"x": "0 + 3", "y": 65, "z": 0}}}), "stop"),
+            (json.dumps({**DECISION, "parameters": {"target": {"x": True, "y": 65, "z": 0}}}), "stop"),
         ]
         for content, finish in cases:
             with self.subTest(content=content, finish=finish):
                 self.model.content, self.model.finish_reason = content, finish
-                with self.assertRaises(ValueError):
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ValueError):
                     self.namespace["infer_decision"](self.payload)
+
+    def test_expression_reply_is_retried_with_same_observation_and_numeric_coordinates(self):
+        self.payload = controller.model_payload(
+            "Посмотри на точку на три блока восточнее текущей позиции игрока",
+            snapshot(), ["look.at"], [], compact=True)
+        original = json.dumps(self.payload, ensure_ascii=False)
+
+        def reply():
+            self.model.content = EXPRESSION_REPLY if len(self.model.payloads) == 1 else json.dumps(DECISION)
+
+        self.model.before_reply = reply
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.namespace["infer_decision"](self.payload), DECISION)
+        self.assertEqual(len(self.model.payloads), 2)
+        self.assertEqual(len(self.model.token_requests), 2)
+        first, second = self.model.payloads
+        self.assertEqual(first["messages"][1], second["messages"][1])
+        self.assertNotEqual(first["messages"][0], second["messages"][0])
+        self.assertIn("Expecting ',' delimiter", output.getvalue())
+        self.assertIn(EXPRESSION_REPLY, output.getvalue())
+        self.assertEqual(self.namespace["LAST_MODEL_REPLY"], json.dumps(DECISION))
+        self.assertEqual(json.dumps(self.payload, ensure_ascii=False), original)
+
+    def test_repair_context_is_checked_before_second_generation(self):
+        self.model.content = EXPRESSION_REPLY
+
+        def increase_context_count():
+            self.model.count = 1793
+
+        self.model.before_reply = increase_context_count
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "Контекст слишком длинный"):
+            self.namespace["infer_decision"](self.payload)
+        self.assertEqual(len(self.model.payloads), 1)
+        self.assertEqual(len(self.model.token_requests), 2)
+
+    def test_retry_uses_remaining_time_and_stops_when_budget_is_exhausted(self):
+        self.model.content = EXPRESSION_REPLY
+        clock = MagicMock(side_effect=[100, 100, 101, 102, 106])
+        self.namespace["time"] = SimpleNamespace(monotonic=clock)
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(self.session, "post", wraps=self.session.post) as post, \
+                self.assertRaisesRegex(ValueError, "Истекло время"):
+            self.namespace["infer_decision"](self.payload)
+        self.assertEqual([call.kwargs["timeout"] for call in post.call_args_list], [5, 4])
+        self.assertEqual(len(self.model.payloads), 1)
+        self.assertEqual(len(self.model.token_requests), 1)
+
+    def test_persistent_invalid_json_delivers_error_without_a_decision(self):
+        relay = RelayServer(TOKEN, 0)
+        relay.start()
+        self.model.content = EXPRESSION_REPLY
+        session = requests.Session()
+        session.trust_env = False
+        session.headers["Authorization"] = "Bearer " + TOKEN
+        self.namespace.update(RELAY_URL=f"http://127.0.0.1:{relay.port}", relay_session=session)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool, contextlib.redirect_stdout(io.StringIO()):
+                future = pool.submit(relay.broker.infer, self.payload, 5)
+                self.worker(1)
+                with self.assertRaisesRegex(RuntimeError, "2 попытки"):
+                    future.result(timeout=2)
+            self.assertEqual(len(self.model.payloads), 2)
+            self.assertEqual(len(self.model.token_requests), 2)
+            self.assertNotIn("decision", relay.broker.completed[1])
+            self.assertIn("error", relay.broker.completed[1])
+        finally:
+            session.close()
+            relay.close()
 
     def test_optional_structured_output_uses_openai_schema_format(self):
         self.namespace["USE_STRUCTURED_OUTPUTS"] = True

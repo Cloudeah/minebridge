@@ -14,15 +14,20 @@ from unittest.mock import patch
 
 import requests
 from websockets.asyncio.server import serve
-from test_colab import ROOT, DECISION, FakeVllm, controller, notebook_function, snapshot
+from test_colab import ROOT, DECISION, EXPRESSION_REPLY, FakeVllm, controller, notebook_function, snapshot
 
 
 class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
-    async def integration(self, vision=False, cancel_first=False):
+    async def integration(self, vision=False, cancel_first=False, malformed_first=False):
         submitted, observed_profiles, reports = [], [], []
         terminal = asyncio.Event()
         holder = {}
         model = FakeVllm()
+        if malformed_first:
+            def reply():
+                model.content = EXPRESSION_REPLY if len(model.payloads) == 1 else json.dumps(DECISION)
+
+            model.before_reply = reply
         reached_model, release_model = threading.Event(), threading.Event()
         release_model.set()
         if cancel_first:
@@ -153,7 +158,7 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                         task.cancel()
                         with self.assertRaises(asyncio.CancelledError):
                             await task
-            self.assertEqual(len(model.payloads), 2)
+            self.assertEqual(len(model.payloads), 3 if malformed_first else 2)
             self.assertEqual([item["model_goal_id"] for item in submitted], ["second"] if cancel_first else ["first", "second"])
             self.assertIn("compact", observed_profiles)
             if vision:
@@ -173,6 +178,9 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_two_owner_goals_share_controller_and_notebook_session(self):
         await self.integration()
+
+    async def test_invalid_json_is_regenerated_before_one_task_per_owner_goal(self):
+        await self.integration(malformed_first=True)
 
     async def test_game_window_vision_option_requests_compact_snapshot_and_preserves_png(self):
         await self.integration(vision=True)
