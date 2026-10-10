@@ -14,6 +14,8 @@
 
 [Пошаговый гайд для Windows](docs/OLLAMA_COLAB_RU.md) включает готовый [Colab notebook](examples/ollama_colab.ipynb), локальный контроллер, HTTPS-подключение, первый запуск без выполнения, управление и RGB-зрение. Minecraft и Python-контроллер работают на компьютере; Ollama и модель — в Colab.
 
+Этот вариант использует GPU. Для **TPU v5e-1** выбран другой вариант: [Gemma 4 E2B IT через JAX](docs/TPU_MODEL_RU.md). В документе указаны требования к памяти и изменения, необходимые в Colab notebook.
+
 ## Сборка и запуск
 
 Нужны JDK 25 и доступ к Maven Central, Maven NeoForge и официальным ресурсам Minecraft. Gradle 9.2.1 включён; дистрибутив проверяется по SHA-256.
