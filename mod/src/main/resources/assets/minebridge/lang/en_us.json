@@ -75,9 +75,16 @@
   "screen.minebridge.companion_hide": "Hide and save",
   "screen.minebridge.companion_show": "Return to world",
   "screen.minebridge.companion_respawn": "Respawn after death",
-  "screen.minebridge.companion_auto_on": "Without a goal: explore and survive · ON",
-  "screen.minebridge.companion_auto_off": "Without a goal: explore and survive · OFF",
+  "screen.minebridge.companion_auto_on": "Autonomous goals: ON",
+  "screen.minebridge.companion_auto_off": "Autonomous goals: OFF",
   "screen.minebridge.companion_target": "F7 / F8 control: companion",
   "screen.minebridge.player_target": "F7 / F8 control: your player",
-  "screen.minebridge.companion_status": "%s · HP %s · food %s · permission %s"
+  "screen.minebridge.companion_status": "%s · HP %s · food %s · permission %s",
+  "screen.minebridge.companion_defend_on": "Immediate defence: ON",
+  "screen.minebridge.companion_defend_off": "Immediate defence: OFF",
+  "screen.minebridge.reflex.eat": "Eating from own inventory",
+  "screen.minebridge.reflex.surface": "Trying to surface",
+  "screen.minebridge.reflex.retreat": "Retreating from danger",
+  "screen.minebridge.reflex.defend_owner": "Defending owner against a mob",
+  "screen.minebridge.reflex.defend_self": "Defending against a mob"
 }

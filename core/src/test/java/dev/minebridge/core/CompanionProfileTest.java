@@ -29,6 +29,18 @@ class CompanionProfileTest {
   }
 
   @Test
+  void defenceSettingMigratesAndSurvivesHidingAndDimensionChanges() {
+    var profile = CompanionProfile.create(UUID.randomUUID(), "Buddy", "minecraft:overworld");
+    var legacy = profile.json();
+    legacy.remove("defending");
+    assertTrue(CompanionProfile.read(legacy).defending());
+    var disabled = profile.defence(false).state("minecraft:the_nether", false, false);
+    assertFalse(disabled.defending());
+    assertEquals(profile.id(), disabled.id());
+    assertEquals(disabled, CompanionProfile.read(disabled.json()));
+  }
+
+  @Test
   void corruptedIdentityAndInvalidNamesCannotCreateAnotherActor() {
     var profile = CompanionProfile.create(UUID.randomUUID(), "Buddy", "minecraft:overworld");
     var json = profile.json();

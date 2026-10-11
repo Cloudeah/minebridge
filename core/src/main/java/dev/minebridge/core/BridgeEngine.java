@@ -90,6 +90,18 @@ public final class BridgeEngine implements OwnerControls {
     public boolean hasPendingTasks(){return tasks.values().stream().anyMatch(t->!t.terminal());}
     /** Server-side survival reflexes interrupt plans while retaining the owner's permission. */
     public void actorInterrupt(String reason){controlEpoch++;model.cancel(reason);stopAll("actor_interrupt");event("actor.interrupted",object("reason",reason));}
+    /** Queue an owner-authorized reaction through the same validation, budgets and cancellation path. */
+    public Task ownerReaction(String action,JsonObject parameters,int timeoutTicks,int maxActions,String reason) {
+        requireArmed();
+        if(controller==null)throw new BridgeException("permission_denied","A connected controller is required");
+        requireCapability(action);world.validate(action,parameters);policy.check(action,parameters,world.dimension());
+        JsonObject limits=object("priority",100,"timeout_ticks",timeoutTicks,"max_actions",maxActions);
+        integer(limits,"timeout_ticks",200,1,12000);integer(limits,"max_actions",16,1,100000);
+        actorInterrupt(reason);
+        Task reaction=task(submit(action,parameters,limits));
+        reaction.context.addProperty("reaction","defence");
+        return reaction;
+    }
     public void manualInput() {
         if (active!=null) { transition(active,Task.State.paused); world.releaseControls(); active=null; }
         if(armed && (world.tick()!=lastManualTick || controlEpoch!=lastManualEpoch)){lastManualTick=world.tick();controlEpoch++;lastManualEpoch=controlEpoch;model.cancel("Ручной ввод: цель остановлена.");event("control.manual_override",object());}

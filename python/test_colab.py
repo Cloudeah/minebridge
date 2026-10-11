@@ -96,6 +96,24 @@ class RelayTest(unittest.TestCase):
 
 
 class DecisionTest(unittest.TestCase):
+    def test_companion_defence_facts_reach_model_without_internal_ids(self):
+        observation = snapshot()
+        observation["actor_mode"] = "companion"
+        observation["context"]["defending"] = False
+        observation["context"]["owner"] = {"position": {"x": 2.12345678, "y": 64, "z": 0.5}}
+        observation["context"]["defence"] = {"task_id": "internal-task", "entity_id": "internal-target",
+            "type": "minecraft:zombie", "reason": "owner_hurt", "state": "cancelled", "hits": 2, "damage": 12, "defeated": False}
+        payload = controller.model_payload("Help owner", observation, ["combat.attack"], [], compact=True)
+        context = json.loads(payload["messages"][1]["content"])["observation"]["context"]
+        facts = context["defence"]
+        self.assertEqual(facts, {"type": "minecraft:zombie", "reason": "owner_hurt", "state": "cancelled", "hits": 2, "damage": 12, "defeated": False})
+        self.assertIn("task_id", observation["context"]["defence"])
+        self.assertFalse(context["defending"])
+        self.assertEqual(context["owner"]["position"]["x"], 2.1235)
+        self.assertEqual(observation["context"]["owner"]["position"]["x"], 2.12345678)
+        self.assertNotIn("actor_id", json.loads(payload["messages"][1]["content"])["observation"])
+        self.assertEqual(observation["actor_id"], "test-actor")
+
     def test_companion_build_count_reaches_next_model_step(self):
         result = {"action": "build.execute", "state": "succeeded", "result": {"blocks": 2, "placed": 2},
                   "confirmed_changes": {"placed_blocks": 2}}

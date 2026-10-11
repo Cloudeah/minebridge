@@ -190,6 +190,19 @@ final class CompanionManager {
         });
   }
 
+  void defending(UUID owner, boolean enabled) {
+    request(
+        owner,
+        m -> {
+          m.requireProfile();
+          if (m.engine != null) m.engine.actorInterrupt("Режим защиты изменён владельцем.");
+          m.profile = m.profile.defence(enabled);
+          if (m.world != null) m.world.setDefending(enabled);
+          m.nextGoal = 0;
+          m.save();
+        });
+  }
+
   void show(UUID owner) {
     request(
         owner,
@@ -334,6 +347,7 @@ final class CompanionManager {
           "Для компаньона нужен свободный порт port+2; измени port в bridge-owner.json.");
     policy.port += 2;
     world = new CompanionWorld(player, policy, this::owner);
+    world.setDefending(profile.defending());
     dimension = world.dimension();
     engine =
         new BridgeEngine(
@@ -377,6 +391,7 @@ final class CompanionManager {
           engine.ownerStop();
           world.releaseControls();
         }
+        world.prepareDefence(engine);
         engine.tick();
         if (!player.isAlive()) {
           if (deadAt < 0) {
@@ -389,7 +404,7 @@ final class CompanionManager {
           JsonObject state = engine.modelStatus();
           boolean connected = bool(state, "controller_connected", false);
           if (engine.armed() && connected) {
-            if (world.survivalReflex(engine)) {
+            if (world.survivalReflex(engine, profile.defending())) {
               nextGoal = world.tick() + 40;
             } else if (profile.autonomous()
                 && !engine.hasPendingTasks()
@@ -467,6 +482,7 @@ final class CompanionManager {
     out.addProperty("exists", profile != null);
     out.addProperty("present", player != null);
     out.addProperty("autonomous", profile == null || profile.autonomous());
+    out.addProperty("defending", profile == null || profile.defending());
     if (profile != null) {
       out.addProperty("name", profile.name());
       out.addProperty("actor_id", profile.id().toString());
@@ -477,6 +493,7 @@ final class CompanionManager {
       out.add("position", CompanionWorld.vector(player.position()));
       out.addProperty("dimension", player.level().dimension().identifier().toString());
       out.addProperty("reflex", world == null ? "" : world.reflex());
+      if (world != null) out.add("defence", world.defenceStatus());
     }
     if (!error.isEmpty()) out.addProperty("detail", error);
     status = out;

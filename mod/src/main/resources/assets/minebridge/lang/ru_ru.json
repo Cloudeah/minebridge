@@ -75,9 +75,16 @@
   "screen.minebridge.companion_hide": "Убрать и сохранить",
   "screen.minebridge.companion_show": "Вернуть в мир",
   "screen.minebridge.companion_respawn": "Возродить после смерти",
-  "screen.minebridge.companion_auto_on": "Без цели: исследовать и выживать · ВКЛ",
-  "screen.minebridge.companion_auto_off": "Без цели: исследовать и выживать · ВЫКЛ",
+  "screen.minebridge.companion_auto_on": "Самостоятельные цели: ВКЛ",
+  "screen.minebridge.companion_auto_off": "Самостоятельные цели: ВЫКЛ",
   "screen.minebridge.companion_target": "F7 / F8 управляют: компаньоном",
   "screen.minebridge.player_target": "F7 / F8 управляют: твоим игроком",
-  "screen.minebridge.companion_status": "%s · HP %s · еда %s · разрешение %s"
+  "screen.minebridge.companion_status": "%s · HP %s · еда %s · разрешение %s",
+  "screen.minebridge.companion_defend_on": "Быстрая защита: ВКЛ",
+  "screen.minebridge.companion_defend_off": "Быстрая защита: ВЫКЛ",
+  "screen.minebridge.reflex.eat": "Ест из собственного инвентаря",
+  "screen.minebridge.reflex.surface": "Пытается всплыть",
+  "screen.minebridge.reflex.retreat": "Отходит от угрозы",
+  "screen.minebridge.reflex.defend_owner": "Защищает владельца от моба",
+  "screen.minebridge.reflex.defend_self": "Защищается от моба"
 }

@@ -47,6 +47,11 @@ final class CompanionWorld implements WorldAccess {
   private final Map<String, ItemStack> materials = new HashMap<>();
   private final Map<String, JsonArray> placeEvents = new HashMap<>();
   private final Map<String, Boolean> canceledPlaces = new HashMap<>();
+  private final CompanionThreats threats = new CompanionThreats();
+  private boolean defendingEnabled = true;
+  private Task defenceTask;
+  private JsonObject lastDefence;
+  private long lastDefenceTick;
 
   private record Route(long tick, Vec3 target, List<Pathfinder.Cell> cells) {}
 
@@ -134,7 +139,7 @@ final class CompanionWorld implements WorldAccess {
 
   public Set<String> actionFeatures(String action) {
     return switch (action) {
-      case "combat.attack" -> Set.of("confirmed_melee_v1");
+      case "combat.attack" -> Set.of("confirmed_melee_v1", "local_defence_v1");
       case "craft.execute" -> Set.of("craft_station_v1");
       case "block.place" -> Set.of("confirmed_placement_v1");
       case "build.execute" -> Set.of("confirmed_placement_v1", "multiblock_blueprint_v1");
@@ -302,6 +307,9 @@ final class CompanionWorld implements WorldAccess {
             "reflex",
             reflex);
     if (lastTask != null) context.add("last_task", lastTask.deepCopy());
+    context.addProperty("defending", defendingEnabled);
+    JsonObject defending = defenceStatus();
+    if (!defending.isEmpty()) context.add("defence", defending);
     if (human != null)
       context.add(
           "owner",
@@ -697,7 +705,7 @@ final class CompanionWorld implements WorldAccess {
 
   public Step step(Task task) {
     current = task;
-    if (!reflex.isEmpty())
+    if (!reflex.isEmpty() && task != defenceTask)
       return Step.waiting(object("stage", "survival_reflex", "reflex", reflex));
     if (!player.isAlive()) throw new BridgeException("actor_dead", "Companion is dead");
     area(player.position());
@@ -855,10 +863,7 @@ final class CompanionWorld implements WorldAccess {
 
   private Step selectItem(Task t, String item) {
     menuReady();
-    int
-        target =
-            integer(t.parameters, "hotbar_slot", player.getInventory().getSelectedSlot(), 0, 8),
-        found = -1;
+    int found = -1;
     for (int i = 0; i < 36; i++)
       if (itemId(player.getInventory().getItem(i)).equals(item)) {
         found = i;
@@ -866,6 +871,13 @@ final class CompanionWorld implements WorldAccess {
       }
     if (found < 0)
       throw new BridgeException("missing_materials", "Item is not in companion inventory");
+    return selectInventorySlot(t, found);
+  }
+
+  private Step selectInventorySlot(Task t, int found) {
+    menuReady();
+    int target =
+        integer(t.parameters, "hotbar_slot", player.getInventory().getSelectedSlot(), 0, 8);
     if (found < 9) return select(t, found);
     ActionBudget.require(t, 2);
     ItemStack before = player.getInventory().getItem(found).copy();
@@ -1150,6 +1162,16 @@ final class CompanionWorld implements WorldAccess {
   }
 
   void damage(net.neoforged.neoforge.event.entity.living.LivingDamageEvent.Post event) {
+    ServerPlayer human = owner.get();
+    if ((event.getEntity() == player || event.getEntity() == human)
+        && event.getSource().getEntity() instanceof Mob attacker
+        && safeThreat(attacker, human)) {
+      threats.record(
+          attacker.getUUID().toString(),
+          event.getEntity() == human,
+          event.getHealthDamage(),
+          tick());
+    }
     if (event.getSource().getEntity() != player) return;
     Entity direct = event.getSource().getDirectEntity();
     if (direct == null) return;
@@ -1184,6 +1206,48 @@ final class CompanionWorld implements WorldAccess {
       throw new BridgeException("permission_denied", "Companion never attacks players");
     if (player.getHealth() <= number(t.parameters, "stop_health", 4))
       throw new BridgeException("low_health", "Melee stopped at low health");
+    if (isDefence(t)) {
+      if (!defendingEnabled)
+        throw new BridgeException("defence_disabled", "Immediate defence is disabled");
+      if (!(target instanceof Mob mob)
+          || !safeThreat(mob, owner.get())
+          || threats
+              .select(tick(), List.of(threatCandidate(mob)), mob.getUUID().toString())
+              .isEmpty())
+        throw new BridgeException("threat_lost", "Mob is no longer a nearby threat");
+      if (player.isInLava() || player.isInWater() && player.getAirSupply() < 100)
+        throw new BridgeException("survival_priority", "Escape dangerous liquid before fighting");
+      if (player.containerMenu != player.inventoryMenu) {
+        policy.check("container.close", object(), dimension());
+        ActionBudget.require(t, 1);
+        player.closeContainer();
+        t.actions++;
+        return Step.waiting(object("stage", "closing_menu_for_defence"));
+      }
+      if (!t.context.has("weapon_prepared")) {
+        t.context.addProperty("weapon_prepared", true);
+        int best = player.getInventory().getSelectedSlot();
+        double score = weaponScore(player.getInventory().getItem(best));
+        for (int i = 0; i < 36; i++) {
+          double candidate = weaponScore(player.getInventory().getItem(i));
+          if (candidate > score + .01) {
+            best = i;
+            score = candidate;
+          }
+        }
+        if (best != player.getInventory().getSelectedSlot()) {
+          try {
+            policy.check("inventory.select_item", object(), dimension());
+          } catch (BridgeException denied) {
+            best = player.getInventory().getSelectedSlot();
+          }
+          if (best != player.getInventory().getSelectedSlot()) {
+            selectInventorySlot(t, best);
+            return Step.waiting(object("stage", "weapon_prepared"));
+          }
+        }
+      }
+    }
     var seq =
         melee.computeIfAbsent(
             t.id,
@@ -1216,6 +1280,8 @@ final class CompanionWorld implements WorldAccess {
       if (!MeleeSequence.withinChase(
           start.distanceTo(player.position()), start.distanceTo(target.position()), max))
         throw new BridgeException("chase_limit", "Target escaped local chase");
+      if (isDefence(t))
+        policy.check("move.to", object("target", vector(target.position())), dimension());
       Step chase = move(t, target.position(), 2);
       return chase.done() ? Step.waiting(object("stage", "approaching_target")) : chase;
     }
@@ -2032,6 +2098,15 @@ final class CompanionWorld implements WorldAccess {
   }
 
   public void taskFinished(Task t) {
+    if (isDefence(t)) {
+      lastDefence = defenceSummary(t);
+      lastDefenceTick = tick();
+      threats.cooldown(string(t.parameters, "entity_id"), tick());
+      if (defenceTask == t) {
+        defenceTask = null;
+        reflex = "";
+      }
+    }
     routes.remove(t.id);
     builds.remove(t.id);
     lastTask =
@@ -2080,10 +2155,12 @@ final class CompanionWorld implements WorldAccess {
       if (retreat != null) routes.remove(retreat.id);
       retreat = null;
       retreatTarget = null;
+      defenceTask = null;
     }
   }
 
-  boolean survivalReflex(BridgeEngine engine) {
+  boolean survivalReflex(BridgeEngine engine, boolean defend) {
+    if (defenceTask != null) return true;
     if (reflex.equals("eat")) {
       player.stopInputs();
       if (!player.isUsingItem() || tick() >= reflexEnd) {
@@ -2133,6 +2210,9 @@ final class CompanionWorld implements WorldAccess {
     }
     ServerPlayer human = owner.get();
     LivingEntity threat = player.getLastHurtByMob();
+    Optional<CompanionThreats.Threat> selected = selectedThreat(null);
+    if ((threat == null || !threat.isAlive()) && selected.isPresent())
+      threat = (LivingEntity) player.level().getEntity(UUID.fromString(selected.get().id()));
     if (player.getHealth() <= 6
         && threat != null
         && !(threat instanceof Player)
@@ -2140,25 +2220,12 @@ final class CompanionWorld implements WorldAccess {
         && player.distanceTo(threat) < 8
         && human != null
         && human.level() == player.level()
-        && human.distanceTo(player) > 3
         && !player.isInWater()
         && !player.isInLava()) {
       try {
         policy.check("move.to", object("target", vector(human.position())), dimension());
         area(player.position());
-        Vec3 target = null;
-        for (int dx = -2; dx <= 2 && target == null; dx++)
-          for (int dz = -2; dz <= 2 && target == null; dz++) {
-            BlockPos cell = human.blockPosition().offset(dx, 0, dz);
-            if (!safeCell(player.level(), player, cell)) continue;
-            Vec3 candidate = new Vec3(cell.getX() + .5, cell.getY(), cell.getZ() + .5);
-            if (candidate.distanceTo(threat.position()) <= player.distanceTo(threat)) continue;
-            try {
-              path(candidate);
-              target = candidate;
-            } catch (BridgeException ignored) {
-            }
-          }
+        Vec3 target = retreatPosition(threat, human);
         if (target != null) {
           engine.actorInterrupt("Низкое здоровье: компаньон отходит от угрозы к владельцу.");
           reflex = "retreat";
@@ -2169,6 +2236,37 @@ final class CompanionWorld implements WorldAccess {
         }
       } catch (BridgeException denied) {
         reflexRetry = tick() + 100;
+      }
+    }
+    if (defend && player.getHealth() > 6 && selected.isPresent()) {
+      var danger = selected.get();
+      Entity target = player.level().getEntity(UUID.fromString(danger.id()));
+      try {
+        defenceTask =
+            engine.ownerReaction(
+                "combat.attack",
+                object(
+                    "entity_id",
+                    danger.id(),
+                    "chase",
+                    true,
+                    "max_chase_distance",
+                    12,
+                    "stop_health",
+                    6),
+                200,
+                16,
+                danger.reason().startsWith("owner_")
+                    ? "Моб атакует владельца: компаньон помогает."
+                    : "Компаньон защищается от моба.");
+        defenceTask.context.addProperty("threat_reason", danger.reason());
+        defenceTask.context.addProperty(
+            "threat_type", BuiltInRegistries.ENTITY_TYPE.getKey(target.getType()).toString());
+        defenceTask.context.addProperty("threat_priority", danger.priority());
+        reflex = danger.reason().startsWith("owner_") ? "defend_owner" : "defend_self";
+        return true;
+      } catch (BridgeException denied) {
+        threats.cooldown(danger.id(), tick());
       }
     }
     if (player.getFoodData().getFoodLevel() <= 14
@@ -2218,5 +2316,141 @@ final class CompanionWorld implements WorldAccess {
       }
     }
     return false;
+  }
+
+  private static boolean isDefence(Task task) {
+    return task.context.has("reaction")
+        && task.context.get("reaction").getAsString().equals("defence");
+  }
+
+  void prepareDefence(BridgeEngine engine) {
+    if (defenceTask == null || defenceTask.terminal()) return;
+    var receipt = combat.peek(defenceTask.id);
+    if (receipt != null && receipt.defeated()) return;
+    String active = string(defenceTask.parameters, "entity_id");
+    selectedThreat(active)
+        .ifPresent(
+            next -> {
+              if (next.id().equals(active)) {
+                defenceTask.context.addProperty("threat_reason", next.reason());
+                defenceTask.context.addProperty("threat_priority", next.priority());
+                reflex = next.reason().startsWith("owner_") ? "defend_owner" : "defend_self";
+              } else if (next.priority()
+                  < integer(defenceTask.context, "threat_priority", 4, 0, 4)) {
+                engine.actorInterrupt("Новая угроза владельцу: компаньон меняет цель защиты.");
+              }
+            });
+  }
+
+  void setDefending(boolean enabled) {
+    defendingEnabled = enabled;
+  }
+
+  private boolean safeThreat(Mob mob, ServerPlayer human) {
+    return mob.isAlive()
+        && mob.level() == player.level()
+        && !mob.isAlliedTo(player)
+        && !player.isAlliedTo(mob)
+        && (human == null || !human.isAlliedTo(mob))
+        && !(mob instanceof TamableAnimal pet
+            && (pet.isOwnedBy(player) || human != null && pet.isOwnedBy(human)));
+  }
+
+  private CompanionThreats.Candidate threatCandidate(Mob mob) {
+    ServerPlayer human = owner.get();
+    return new CompanionThreats.Candidate(
+        mob.getUUID().toString(),
+        false,
+        !safeThreat(mob, human),
+        mob.isAlive(),
+        !mob.isInvisibleTo(player) && player.hasLineOfSight(mob),
+        mob.distanceTo(player),
+        human != null && human.level() == player.level()
+            ? mob.distanceTo(human)
+            : Double.POSITIVE_INFINITY,
+        human != null && mob.getTarget() == human,
+        mob.getTarget() == player);
+  }
+
+  private Optional<CompanionThreats.Threat> selectedThreat(String preferred) {
+    return threats.select(
+        tick(),
+        player.level().getEntitiesOfClass(Mob.class, player.getBoundingBox().inflate(12)).stream()
+            .map(this::threatCandidate)
+            .toList(),
+        preferred);
+  }
+
+  private static double weaponScore(ItemStack stack) {
+    var modifiers =
+        stack.getOrDefault(
+            DataComponents.ATTRIBUTE_MODIFIERS,
+            net.minecraft.world.item.component.ItemAttributeModifiers.EMPTY);
+    double damage =
+        modifiers.compute(
+            net.minecraft.world.entity.ai.attributes.Attributes.ATTACK_DAMAGE,
+            1,
+            EquipmentSlot.MAINHAND);
+    double speed =
+        modifiers.compute(
+            net.minecraft.world.entity.ai.attributes.Attributes.ATTACK_SPEED,
+            4,
+            EquipmentSlot.MAINHAND);
+    return Double.isFinite(damage) && Double.isFinite(speed)
+        ? Math.max(0, damage) * Math.max(.1, speed)
+        : 0;
+  }
+
+  private Vec3 retreatPosition(LivingEntity threat, ServerPlayer human) {
+    List<Vec3> choices = new ArrayList<>();
+    for (int dx = -2; dx <= 2; dx += 2)
+      for (int dz = -2; dz <= 2; dz += 2) {
+        BlockPos p = human.blockPosition().offset(dx, 0, dz);
+        choices.add(new Vec3(p.getX() + .5, p.getY(), p.getZ() + .5));
+      }
+    for (int dx = -6; dx <= 6; dx += 6)
+      for (int dz = -6; dz <= 6; dz += 6) {
+        BlockPos p = player.blockPosition().offset(dx, 0, dz);
+        choices.add(new Vec3(p.getX() + .5, p.getY(), p.getZ() + .5));
+      }
+    choices.sort(Comparator.comparingDouble((Vec3 p) -> p.distanceTo(human.position())));
+    for (Vec3 candidate : choices) {
+      if (candidate.distanceTo(threat.position()) < player.distanceTo(threat) + 2
+          || candidate.distanceTo(human.position()) > 64
+          || !safeCell(player.level(), player, BlockPos.containing(candidate))) continue;
+      try {
+        path(candidate);
+        return candidate;
+      } catch (BridgeException ignored) {
+      }
+    }
+    return null;
+  }
+
+  private JsonObject defenceSummary(Task task) {
+    return object(
+        "task_id",
+        task.id,
+        "entity_id",
+        string(task.parameters, "entity_id"),
+        "type",
+        string(task.context, "threat_type", "unknown"),
+        "reason",
+        string(task.context, "threat_reason", "unknown"),
+        "state",
+        task.state.name(),
+        "hits",
+        integer(task.confirmed, "hits", 0, 0, Integer.MAX_VALUE),
+        "damage",
+        number(task.confirmed, "damage", 0),
+        "defeated",
+        bool(task.confirmed, "defeated", false));
+  }
+
+  JsonObject defenceStatus() {
+    if (defenceTask != null) return defenceSummary(defenceTask);
+    return lastDefence != null && tick() - lastDefenceTick <= 200
+        ? lastDefence.deepCopy()
+        : object();
   }
 }

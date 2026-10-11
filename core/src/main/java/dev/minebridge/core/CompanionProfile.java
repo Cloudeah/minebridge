@@ -7,7 +7,13 @@ import java.util.UUID;
 
 /** World-local identity, never derived from an online account name. */
 public record CompanionProfile(
-    UUID id, UUID owner, String name, String dimension, boolean present, boolean autonomous) {
+    UUID id,
+    UUID owner,
+    String name,
+    String dimension,
+    boolean present,
+    boolean autonomous,
+    boolean defending) {
   public CompanionProfile {
     java.util.Objects.requireNonNull(id);
     java.util.Objects.requireNonNull(owner);
@@ -20,7 +26,7 @@ public record CompanionProfile(
 
   public static CompanionProfile create(UUID owner, String name, String dimension) {
     validateName(name);
-    return new CompanionProfile(UUID.randomUUID(), owner, name, dimension, true, true);
+    return new CompanionProfile(UUID.randomUUID(), owner, name, dimension, true, true, true);
   }
 
   public static void validateName(String name) {
@@ -38,11 +44,16 @@ public record CompanionProfile(
         name,
         string(data, "dimension"),
         bool(data, "present", true),
-        bool(data, "autonomous", true));
+        bool(data, "autonomous", true),
+        bool(data, "defending", true));
   }
 
   public CompanionProfile state(String dimension, boolean present, boolean autonomous) {
-    return new CompanionProfile(id, owner, name, dimension, present, autonomous);
+    return new CompanionProfile(id, owner, name, dimension, present, autonomous, defending);
+  }
+
+  public CompanionProfile defence(boolean enabled) {
+    return new CompanionProfile(id, owner, name, dimension, present, autonomous, enabled);
   }
 
   public JsonObject json() {
@@ -58,7 +69,9 @@ public record CompanionProfile(
         "present",
         present,
         "autonomous",
-        autonomous);
+        autonomous,
+        "defending",
+        defending);
   }
 
   public static final String GOAL =

@@ -20,8 +20,8 @@ final class CompanionScreen extends Screen {
   private final Consumer<Boolean> select;
   private final Runnable stop, arm;
   private final KeyMapping armKey, stopKey, panelKey;
-  private int left, top;
-  private Button create, show, respawn, autonomy, target;
+  private int left, top, panelWidth, half;
+  private Button create, show, respawn, autonomy, defence, target;
   private EditBox name;
 
   CompanionScreen(
@@ -45,7 +45,9 @@ final class CompanionScreen extends Screen {
   }
 
   protected void init() {
-    left = (width - 380) / 2;
+    panelWidth = Math.min(380, width - 24);
+    half = (panelWidth - 10) / 2;
+    left = (width - panelWidth) / 2;
     top = Math.max(8, (height - 228) / 2);
     name =
         addRenderableWidget(
@@ -53,7 +55,7 @@ final class CompanionScreen extends Screen {
                 font,
                 left,
                 top + 30,
-                180,
+                half,
                 20,
                 Component.translatable("screen.minebridge.companion_name")));
     name.setMaxLength(16);
@@ -66,7 +68,7 @@ final class CompanionScreen extends Screen {
                       manager.create(owner, name.getValue());
                       select.accept(true);
                     })
-                .bounds(left + 190, top + 30, 190, 20)
+                .bounds(left + half + 10, top + 30, half, 20)
                 .build());
     show =
         addRenderableWidget(
@@ -76,34 +78,41 @@ final class CompanionScreen extends Screen {
                       if (bool(manager.status(), "present", false)) manager.hide(owner);
                       else manager.show(owner);
                     })
-                .bounds(left, top + 58, 180, 20)
+                .bounds(left, top + 58, half, 20)
                 .build());
     respawn =
         addRenderableWidget(
             Button.builder(
                     Component.translatable("screen.minebridge.companion_respawn"),
                     b -> manager.respawn(owner))
-                .bounds(left + 190, top + 58, 190, 20)
+                .bounds(left + half + 10, top + 58, half, 20)
                 .build());
     autonomy =
         addRenderableWidget(
             Button.builder(
                     Component.literal(""),
                     b -> manager.autonomous(owner, !bool(manager.status(), "autonomous", true)))
-                .bounds(left, top + 86, 380, 20)
+                .bounds(left, top + 86, half, 20)
+                .build());
+    defence =
+        addRenderableWidget(
+            Button.builder(
+                    Component.literal(""),
+                    b -> manager.defending(owner, !bool(manager.status(), "defending", true)))
+                .bounds(left + half + 10, top + 86, half, 20)
                 .build());
     target =
         addRenderableWidget(
             Button.builder(Component.literal(""), b -> select.accept(!selected.getAsBoolean()))
-                .bounds(left, top + 114, 380, 20)
+                .bounds(left, top + 114, panelWidth, 20)
                 .build());
     addRenderableWidget(
         Button.builder(Component.translatable("screen.minebridge.stop"), b -> stop.run())
-            .bounds(left, top + 142, 180, 20)
+            .bounds(left, top + 142, half, 20)
             .build());
     addRenderableWidget(
         Button.builder(Component.translatable("screen.minebridge.close"), b -> onClose())
-            .bounds(left + 190, top + 142, 190, 20)
+            .bounds(left + half + 10, top + 142, half, 20)
             .build());
     tick();
   }
@@ -119,6 +128,12 @@ final class CompanionScreen extends Screen {
             present ? "screen.minebridge.companion_hide" : "screen.minebridge.companion_show"));
     respawn.active = present && number(s, "health", 0) <= 0;
     autonomy.active = exists;
+    defence.active = exists;
+    defence.setMessage(
+        Component.translatable(
+            bool(s, "defending", true)
+                ? "screen.minebridge.companion_defend_on"
+                : "screen.minebridge.companion_defend_off"));
     autonomy.setMessage(
         Component.translatable(
             bool(s, "autonomous", true)
@@ -168,9 +183,11 @@ final class CompanionScreen extends Screen {
         0xffdddddd);
     String detail = s.has("detail") ? s.get("detail").getAsString() : "";
     if (s.has("reflex") && !s.get("reflex").getAsString().isEmpty())
-      detail = s.get("reflex").getAsString();
+      detail =
+          Component.translatable("screen.minebridge.reflex." + s.get("reflex").getAsString())
+              .getString();
     int line = top + 188;
-    for (var text : font.split(Component.literal(detail), 380)) {
+    for (var text : font.split(Component.literal(detail), panelWidth)) {
       if (line > top + 216) break;
       g.text(font, text, left, line, 0xffcccccc);
       line += 10;
