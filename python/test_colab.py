@@ -1093,6 +1093,67 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
 
 class InventoryDecisionTest(unittest.TestCase):
+    def test_full_inventory_keeps_equipment_through_controller_and_notebook_compaction(self):
+        state = snapshot()
+        inventory_gear = [{"slot": 36, "type": "minecraft:diamond_boots", "count": 1},
+                          {"slot": 39, "type": "minecraft:iron_helmet", "count": 1}]
+        menu_gear = [{"slot": 5 + i, "inventory_slot": 39 - i,
+                      "role": "armor", "equipment_slot": name, "player_inventory": True,
+                      "type": ("minecraft:iron_helmet" if i == 0 else
+                               "minecraft:diamond_boots" if i == 3 else "minecraft:air"),
+                      "count": 1 if i in (0, 3) else 0}
+                     for i, name in enumerate(("head", "chest", "legs", "feet"))]
+        menu_gear.append({"slot": 45, "inventory_slot": 40, "role": "offhand",
+                          "equipment_slot": "offhand", "player_inventory": True,
+                          "type": "minecraft:air", "count": 0})
+        state["inventory"] = [{"slot": i, "type": "minecraft:stone", "count": 64}
+                              for i in range(36)] + inventory_gear
+        # Equipment can occur after a full main inventory in the source menu.
+        state["context"]["menu_slots"] = [
+            {"slot": 9 + i, "inventory_slot": i, "role": "main",
+             "player_inventory": True, "type": "minecraft:stone", "count": 64}
+            for i in range(36)] + menu_gear
+        original = deepcopy(state)
+        payload = controller.model_payload("equip helmet", state, ["inventory.equip"], [], compact=True)
+        data = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(state, original)
+        for field in ("inventory", "menu_slots"):
+            self.assertLessEqual(len(data["observation"][field]), 10)
+            self.assertTrue(data["observation"][field + "_truncated"])
+        notebook = json.loads((ROOT / 'examples/vllm_tpu_colab.ipynb').read_text())
+        source = next(''.join(c['source']) for c in notebook['cells']
+                      if 'def shrink_observation(' in ''.join(c['source']))
+        function = next(n for n in ast.parse(source).body
+                        if isinstance(n, ast.FunctionDef) and n.name == 'shrink_observation')
+        namespace = {"json": json}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), '<equipment shrinking>', 'exec'), namespace)
+        body = {"messages": [{"role": "user", "content": json.dumps(data)}]}
+        for _ in range(20):
+            fitted = json.loads(body['messages'][0]['content'])
+            observed = fitted['observation']
+            # Matching equipment facts stay in the menu and need not be duplicated.
+            self.assertEqual([s for s in observed['inventory'] if s['slot'] >= 36], [])
+            self.assertEqual([s for s in observed['menu_slots'] if s['role'] in ('armor', 'offhand')], menu_gear)
+            self.assertEqual(fitted['goal'], data['goal'])
+            self.assertEqual(fitted['goal_progress'], data['goal_progress'])
+            if not namespace['shrink_observation'](body):
+                break
+        else:
+            self.fail("Equipment compaction did not converge")
+        self.assertEqual(payload['messages'][1]['content'], json.dumps(data, ensure_ascii=False, separators=(',', ':')))
+
+        # If no menu cell supplies the facts, inventory equipment remains mandatory.
+        state['context'].pop('menu_slots')
+        payload = controller.model_payload("equip helmet", state, ["inventory.equip"], [], compact=True)
+        body = {"messages": [deepcopy(payload['messages'][1])]}
+        for _ in range(20):
+            observed = json.loads(body['messages'][0]['content'])['observation']
+            self.assertEqual([s for s in observed['inventory'] if s['slot'] >= 36], inventory_gear)
+            if not namespace['shrink_observation'](body):
+                break
+        else:
+            self.fail("Inventory equipment compaction did not converge")
+
     def test_context_shrinking_keeps_recent_plan_and_station_intact(self):
         notebook = json.loads((ROOT / 'examples/vllm_tpu_colab.ipynb').read_text())
         source = next(''.join(c['source']) for c in notebook['cells'] if 'def shrink_observation(' in ''.join(c['source']))

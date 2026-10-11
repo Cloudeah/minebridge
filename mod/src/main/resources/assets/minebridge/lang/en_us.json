@@ -86,5 +86,7 @@
   "screen.minebridge.reflex.surface": "Trying to surface",
   "screen.minebridge.reflex.retreat": "Retreating from danger",
   "screen.minebridge.reflex.defend_owner": "Defending owner against a mob",
-  "screen.minebridge.reflex.defend_self": "Defending against a mob"
+  "screen.minebridge.reflex.defend_self": "Defending against a mob",
+  "screen.minebridge.reflex.equip": "Equipping available armor",
+  "screen.minebridge.reflex.regroup": "Returning closer to owner"
 }

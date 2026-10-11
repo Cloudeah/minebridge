@@ -92,6 +92,10 @@ public final class BridgeEngine implements OwnerControls {
     public void actorInterrupt(String reason){controlEpoch++;model.cancel(reason);stopAll("actor_interrupt");event("actor.interrupted",object("reason",reason));}
     /** Queue an owner-authorized reaction through the same validation, budgets and cancellation path. */
     public Task ownerReaction(String action,JsonObject parameters,int timeoutTicks,int maxActions,String reason) {
+        return ownerReaction("defence",action,parameters,timeoutTicks,maxActions,reason);
+    }
+    public Task ownerReaction(String kind,String action,JsonObject parameters,int timeoutTicks,int maxActions,String reason) {
+        if(!Set.of("defence","equip","regroup").contains(kind))throw new BridgeException("invalid_request","Unknown local reaction");
         requireArmed();
         if(controller==null)throw new BridgeException("permission_denied","A connected controller is required");
         requireCapability(action);world.validate(action,parameters);policy.check(action,parameters,world.dimension());
@@ -99,7 +103,7 @@ public final class BridgeEngine implements OwnerControls {
         integer(limits,"timeout_ticks",200,1,12000);integer(limits,"max_actions",16,1,100000);
         actorInterrupt(reason);
         Task reaction=task(submit(action,parameters,limits));
-        reaction.context.addProperty("reaction","defence");
+        reaction.context.addProperty("reaction",kind);
         return reaction;
     }
     public void manualInput() {

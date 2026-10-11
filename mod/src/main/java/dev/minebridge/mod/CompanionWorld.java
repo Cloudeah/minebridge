@@ -50,6 +50,9 @@ final class CompanionWorld implements WorldAccess {
   private final CompanionThreats threats = new CompanionThreats();
   private boolean defendingEnabled = true;
   private Task defenceTask;
+  private Task careTask;
+  private long equipmentRetry, regroupRetry;
+  private final Map<String, ItemStack> equipmentExpected = new HashMap<>();
   private JsonObject lastDefence;
   private long lastDefenceTick;
 
@@ -140,6 +143,8 @@ final class CompanionWorld implements WorldAccess {
   public Set<String> actionFeatures(String action) {
     return switch (action) {
       case "combat.attack" -> Set.of("confirmed_melee_v1", "local_defence_v1");
+      case "inventory.equip" -> Set.of("local_equipment_v1");
+      case "move.follow" -> Set.of("local_regroup_v1");
       case "craft.execute" -> Set.of("craft_station_v1");
       case "block.place" -> Set.of("confirmed_placement_v1");
       case "build.execute" -> Set.of("confirmed_placement_v1", "multiblock_blueprint_v1");
@@ -705,7 +710,7 @@ final class CompanionWorld implements WorldAccess {
 
   public Step step(Task task) {
     current = task;
-    if (!reflex.isEmpty() && task != defenceTask)
+    if (!reflex.isEmpty() && task != defenceTask && task != careTask)
       return Step.waiting(object("stage", "survival_reflex", "reflex", reflex));
     if (!player.isAlive()) throw new BridgeException("actor_dead", "Companion is dead");
     area(player.position());
@@ -925,6 +930,11 @@ final class CompanionWorld implements WorldAccess {
         || role(to).equals("craft_output"))
       throw new BridgeException("invalid_request", "Slots cannot accept this exchange");
     ItemStack a = from.getItem().copy(), b = to.getItem().copy();
+    if (isCare(t, "equip")
+        && (!b.isEmpty()
+            || !ItemStack.matches(a, equipmentExpected.getOrDefault(t.id, ItemStack.EMPTY))))
+      throw new BridgeException(
+          "equipment_changed", "Automatic equipment source or empty target changed");
     boolean swap = !t.action.equals("inventory.transfer");
     if (swap) {
       if (!b.isEmpty() && (!to.mayPickup(player) || !from.mayPlace(b))
@@ -2098,6 +2108,16 @@ final class CompanionWorld implements WorldAccess {
   }
 
   public void taskFinished(Task t) {
+    if (isCare(t, "equip")) {
+      equipmentRetry = tick() + (t.state == Task.State.succeeded ? 5 : 100);
+      equipmentExpected.remove(t.id);
+    } else if (isCare(t, "regroup")) {
+      regroupRetry = tick() + (t.state == Task.State.succeeded ? 40 : 200);
+    }
+    if (careTask == t) {
+      careTask = null;
+      reflex = "";
+    }
     if (isDefence(t)) {
       lastDefence = defenceSummary(t);
       lastDefenceTick = tick();
@@ -2156,10 +2176,11 @@ final class CompanionWorld implements WorldAccess {
       retreat = null;
       retreatTarget = null;
       defenceTask = null;
+      careTask = null;
     }
   }
 
-  boolean survivalReflex(BridgeEngine engine, boolean defend) {
+  boolean survivalReflex(BridgeEngine engine, boolean defend, boolean selfDirected) {
     if (defenceTask != null) return true;
     if (reflex.equals("eat")) {
       player.stopInputs();
@@ -2184,7 +2205,7 @@ final class CompanionWorld implements WorldAccess {
         return false;
       }
     }
-    if (!reflex.isEmpty()) {
+    if (!reflex.isEmpty() && careTask == null) {
       player.stopInputs();
       if (tick() >= reflexEnd) {
         stopReflex();
@@ -2193,7 +2214,7 @@ final class CompanionWorld implements WorldAccess {
       player.movement(false, true, false, false);
       return true;
     }
-    if (tick() < reflexRetry) return false;
+    if (tick() < reflexRetry) return careTask != null;
     if (player.isInWater() && player.getAirSupply() < 100 || player.isInLava()) {
       try {
         policy.check("move.jump", object(), dimension());
@@ -2315,7 +2336,120 @@ final class CompanionWorld implements WorldAccess {
         reflexRetry = tick() + 100;
       }
     }
+    if (careTask != null) return true;
+    if (selfDirected
+        && player.containerMenu == player.inventoryMenu
+        && player.containerMenu.getCarried().isEmpty()
+        && !player.isUsingItem()) {
+      if (human != null
+          && tick() >= regroupRetry
+          && human.level() == player.level()
+          && player.distanceTo(human) > 24
+          && CompanionCare.regroup(
+              player.distanceTo(human),
+              human.level() == player.level(),
+              !human.isInvisibleTo(player) && player.hasLineOfSight(human))) {
+        try {
+          area(player.position());
+          area(human.position());
+          path(human.position());
+          careTask =
+              engine.ownerReaction(
+                  "regroup",
+                  "move.follow",
+                  object(
+                      "entity_id",
+                      human.getUUID().toString(),
+                      "ticks",
+                      20,
+                      "distance",
+                      6,
+                      "sprint",
+                      true),
+                  600,
+                  32,
+                  "Компаньон возвращается ближе к владельцу.");
+          reflex = "regroup";
+          return true;
+        } catch (BridgeException denied) {
+          regroupRetry = tick() + 200;
+        }
+      }
+      if (tick() >= equipmentRetry && automaticArmor(engine)) return true;
+    }
     return false;
+  }
+
+  private static boolean isCare(Task task, String kind) {
+    return task.context.has("reaction") && task.context.get("reaction").getAsString().equals(kind);
+  }
+
+  private boolean automaticArmor(BridgeEngine engine) {
+    List<CompanionCare.Armor> candidates = new ArrayList<>();
+    Set<String> occupied = new HashSet<>();
+    for (int i = 36; i < 40; i++)
+      if (!player.getInventory().getItem(i).isEmpty()) occupied.add(equipment(i));
+    for (int i = 0; i < 36; i++) {
+      ItemStack stack = player.getInventory().getItem(i);
+      var equippable = stack.get(DataComponents.EQUIPPABLE);
+      if (stack.isEmpty() || equippable == null) continue;
+      EquipmentSlot slot = equippable.slot();
+      int inventory =
+          switch (slot) {
+            case HEAD -> 39;
+            case CHEST -> 38;
+            case LEGS -> 37;
+            case FEET -> 36;
+            default -> -1;
+          };
+      if (inventory < 0 || !inventorySlot(inventory).mayPlace(stack)) continue;
+      var modifiers =
+          stack.getOrDefault(
+              DataComponents.ATTRIBUTE_MODIFIERS,
+              net.minecraft.world.item.component.ItemAttributeModifiers.EMPTY);
+      candidates.add(
+          new CompanionCare.Armor(
+              i,
+              equipment(inventory),
+              modifiers.compute(net.minecraft.world.entity.ai.attributes.Attributes.ARMOR, 0, slot),
+              modifiers.compute(
+                  net.minecraft.world.entity.ai.attributes.Attributes.ARMOR_TOUGHNESS, 0, slot),
+              stack.isDamageableItem() ? stack.getMaxDamage() - stack.getDamageValue() : -1,
+              net.minecraft.world.item.enchantment.EnchantmentHelper.has(
+                  stack,
+                  net.minecraft.world.item.enchantment.EnchantmentEffectComponents
+                      .PREVENT_ARMOR_CHANGE)));
+    }
+    var best = CompanionCare.armor(candidates, occupied);
+    if (best.isEmpty()) {
+      equipmentRetry = tick() + 20;
+      return false;
+    }
+    var armor = best.get();
+    try {
+      careTask =
+          engine.ownerReaction(
+              "equip",
+              "inventory.equip",
+              object(
+                  "from_slot",
+                  inventorySlot(armor.slot()).index,
+                  "equipment_slot",
+                  armor.equipment(),
+                  "menu_id",
+                  player.containerMenu.containerId,
+                  "menu_revision",
+                  player.containerMenu.getStateId()),
+              40,
+              3,
+              "Компаньон надевает броню в пустую ячейку.");
+      equipmentExpected.put(careTask.id, player.getInventory().getItem(armor.slot()).copy());
+      reflex = "equip";
+      return true;
+    } catch (BridgeException denied) {
+      equipmentRetry = tick() + 100;
+      return false;
+    }
   }
 
   private static boolean isDefence(Task task) {

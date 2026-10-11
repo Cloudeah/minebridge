@@ -43,6 +43,7 @@ final class CompanionManager {
   private BridgeEngine engine;
   private BridgeSocket socket;
   private long nextGoal, deadAt = -1;
+  private String autonomousGoalId;
   private String dimension = "", error = "";
   private boolean broken;
 
@@ -404,13 +405,17 @@ final class CompanionManager {
           JsonObject state = engine.modelStatus();
           boolean connected = bool(state, "controller_connected", false);
           if (engine.armed() && connected) {
-            if (world.survivalReflex(engine, profile.defending())) {
+            boolean selfDirected =
+                CompanionCare.available(
+                    profile.autonomous(), engine.hasPendingTasks(), state, autonomousGoalId);
+            if (world.survivalReflex(engine, profile.defending(), selfDirected)) {
               nextGoal = world.tick() + 40;
             } else if (profile.autonomous()
                 && !engine.hasPendingTasks()
                 && !Set.of("queued", "thinking", "executing").contains(string(state, "state"))
                 && world.tick() >= nextGoal) {
               engine.ownerModelStart(CompanionProfile.GOAL, 8, false);
+              autonomousGoalId = string(engine.modelStatus(), "goal_id");
               nextGoal = world.tick() + 100;
             }
           } else world.stopReflex();

@@ -86,5 +86,7 @@
   "screen.minebridge.reflex.surface": "Пытается всплыть",
   "screen.minebridge.reflex.retreat": "Отходит от угрозы",
   "screen.minebridge.reflex.defend_owner": "Защищает владельца от моба",
-  "screen.minebridge.reflex.defend_self": "Защищается от моба"
+  "screen.minebridge.reflex.defend_self": "Защищается от моба",
+  "screen.minebridge.reflex.equip": "Надевает найденную броню",
+  "screen.minebridge.reflex.regroup": "Возвращается ближе к владельцу"
 }
