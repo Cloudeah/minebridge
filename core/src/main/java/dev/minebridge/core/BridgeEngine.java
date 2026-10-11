@@ -241,7 +241,7 @@ public final class BridgeEngine {
         Task t=active;
         try {
             policy.check(t.action,t.parameters,world.dimension());
-            if(t.actions>=t.maxActions) { finish(t,Task.State.failed,"action_limit","Action budget exhausted",t.result);return; }
+            if(t.actions>=t.maxActions && !world.awaitingConfirmation(t)) { finish(t,Task.State.failed,"action_limit","Action budget exhausted",t.result);return; }
             WorldAccess.Step step=world.step(t); t.result=step.result();
             if(step.done()) { refresh();finish(t,step.error()==null ? Task.State.succeeded : Task.State.failed,step.error(),step.detail(),step.result()); }
             else if(world.tick()-t.lastProgress>=10) { t.lastProgress=world.tick();event("task.progress",t.json()); }

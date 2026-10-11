@@ -6,8 +6,10 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.core.*;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
+import net.minecraft.stats.Stats;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.*;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.inventory.*;
 import net.minecraft.world.item.*;
 import net.minecraft.world.level.ClipContext;
@@ -32,12 +34,17 @@ final class MinecraftWorld implements WorldAccess {
     private final Map<String,List<Pathfinder.Cell>> routes=new HashMap<>();
     private final Map<String,JumpSequence> jumps=new HashMap<>();
     private final Map<String,CrouchSequence> crouches=new HashMap<>();
+    private final Map<String,ItemDropSequence> drops=new HashMap<>();
+    private final PickupLedger pickups;
+    // Accessed only by server-side pickup/player-tick callbacks.
+    private final Map<String,PickupAttempt> pickupAttempts=new HashMap<>();
     private final Map<String,CraftPlanner.Plan> crafts=new HashMap<>();
     private final Map<String,BuildPlanner.Plan> builds=new HashMap<>();
     private final Map<String,CompletableFuture<Integer>> buildChecks=new HashMap<>();
     private final Set<net.minecraft.client.KeyMapping> held=new HashSet<>();
     MinecraftWorld(Minecraft mc,OwnerPolicy policy) throws java.io.IOException {
         this.mc=mc;this.policy=policy;actor=mc.player.getUUID().toString();initialDimension=mc.level.dimension().identifier().toString();
+        pickups=new PickupLedger(actor,initialDimension);
         if(mc.hasSingleplayerServer()) {
             Path marker=mc.getSingleplayerServer().getWorldPath(LevelResource.ROOT).resolve("minebridge-world-id.txt");
             if(!Files.exists(marker))Files.writeString(marker,id(),StandardOpenOption.CREATE_NEW);
@@ -54,10 +61,53 @@ final class MinecraftWorld implements WorldAccess {
     @Override public long tick(){if(mc.level!=null)lastTick=mc.level.getGameTime();return lastTick;}
     @Override public boolean visionAvailable(){return mc.hasSingleplayerServer() && mc.getMainRenderTarget().getColorTexture() instanceof com.mojang.blaze3d.opengl.GlTexture && mc.getMainRenderTarget().getDepthTexture() instanceof com.mojang.blaze3d.opengl.GlTexture;}
     @Override public List<String> movementModes(){return mc.hasSingleplayerServer()?List.of("walk","sprint","jump","crouch"):List.of();}
-    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);}
+    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
+    @Override public boolean awaitingConfirmation(Task t){
+        return switch(t.action){
+            case "item.use"->t.context.has("use_sent");
+            case "item.drop"->drops.containsKey(t.id) && drops.get(t.id).awaitingConfirmation();
+            case "item.pickup"->t.context.has("pickup_started");
+            case "inventory.select"->t.context.has("selection_sent");
+            case "container.close"->t.context.has("sent");
+            default->false;
+        };
+    }
+    // NeoForge dispatches Post on the server thread, before an empty stack is discarded.
+    void recordPickup(net.neoforged.neoforge.event.entity.player.ItemEntityPickupEvent.Post event){
+        var player=event.getPlayer();var entity=event.getItemEntity();var original=event.getOriginalStack();
+        int remaining=event.getCurrentStack().getCount();
+        pickupAttempts.remove(entity.getUUID().toString());
+        pickups.record(player.getUUID().toString(),player.level().dimension().identifier().toString(),
+                entity.getUUID().toString(),itemId(original),original.getCount()-remaining,remaining,player.level().getGameTime());
+    }
+    private int inventoryCount(net.minecraft.world.entity.player.Player player,String item){
+        int count=0;for(int i=0;i<player.getInventory().getContainerSize();i++){
+            ItemStack stack=player.getInventory().getItem(i);if(itemId(stack).equals(item))count+=stack.getCount();
+        }return count;
+    }
+    void recordPickupAttempt(net.neoforged.neoforge.event.entity.player.ItemEntityPickupEvent.Pre event){
+        var player=event.getPlayer();var entity=event.getItemEntity();String target=entity.getUUID().toString();
+        if(!actor.equals(player.getUUID().toString()) || !initialDimension.equals(player.level().dimension().identifier().toString()) || !pickups.watching(target))return;
+        String item=itemId(entity.getItem());pickupAttempts.put(target,new PickupAttempt(item,entity.getItem().getCount(),inventoryCount(player,item),player.level().getGameTime()));
+    }
+    void confirmPickupAttempts(net.minecraft.world.entity.player.Player player){
+        if(player.level().isClientSide() || !actor.equals(player.getUUID().toString()) || !initialDimension.equals(player.level().dimension().identifier().toString()))return;
+        var level=(net.minecraft.server.level.ServerLevel)player.level();
+        for(var pending:pickupAttempts.entrySet()){
+            Entity entity=level.getEntity(UUID.fromString(pending.getKey()));var before=pending.getValue();
+            if(entity instanceof ItemEntity item && pickups.watching(pending.getKey())){
+                int remaining=item.getItem().getCount();
+                int collected=before.collected(itemId(item.getItem()),remaining,inventoryCount(player,before.item()),level.getGameTime(),!item.isRemoved());
+                if(collected>0)pickups.record(actor,initialDimension,pending.getKey(),before.item(),collected,remaining,level.getGameTime(),"integrated_server_pickup_state");
+            }
+        }
+        // Inventory.add can partially insert a stack yet return false once it cannot add
+        // more, so vanilla skips Post. The same-tick two-sided delta confirms that case.
+        pickupAttempts.clear();
+    }
     @Override public Set<String> capabilities() {
         if(!mc.hasSingleplayerServer())return Set.of("inventory.inspect");
-        return Set.of("move.to","move.follow","move.jump","move.relative","move.crouch","route.plan","look.at","look.turn","combat.attack","item.use","world.interact","block.break","block.place",
+        return Set.of("move.to","move.follow","move.jump","move.relative","move.crouch","route.plan","look.at","look.turn","combat.attack","item.use","item.drop","item.pickup","world.interact","block.break","block.place",
                 "inventory.inspect","inventory.select","inventory.transfer","inventory.equip","container.open","container.close","craft.plan","craft.execute","build.plan","build.execute");
     }
     @Override public void validate(String action,JsonObject p) {
@@ -75,7 +125,9 @@ final class MinecraftWorld implements WorldAccess {
             case "inventory.transfer", "inventory.equip"->{integer(p,"from_slot",0,0,mc.player.containerMenu.slots.size()-1);integer(p,"to_slot",0,0,mc.player.containerMenu.slots.size()-1);if(p.has("count"))integer(p,"count",1,1,64);}
             case "craft.execute"->{Identifier.parse(string(p,"item"));integer(p,"count",1,1,4096);}
             case "build.execute"->{var plan=new BuildPlanner().plan(p);for(var b:plan.blocks())checkArea(new Vec3(b.x()+0.5,b.y()+0.5,b.z()+0.5));}
-            case "item.use"->{String hand=string(p,"hand","main");if(!hand.equals("main")&&!hand.equals("off"))throw new BridgeException("invalid_request","hand must be main/off");integer(p,"duration_ticks",32,1,1200);}
+            case "item.use"->{String hand=string(p,"hand","main");if(!hand.equals("main")&&!hand.equals("off"))throw new BridgeException("invalid_request","hand must be main/off");integer(p,"duration_ticks",40,1,1200);if(p.has("target"))point(child(p,"target"));}
+            case "item.drop"->{ItemDropSequence.count(p);if(!string(p,"hand","main").equals("main"))throw new BridgeException("invalid_request","item.drop supports only the selected main hand");if(p.has("expected_item"))Identifier.parse(string(p,"expected_item"));}
+            case "item.pickup"->{UUID.fromString(string(p,"entity_id"));if(p.has("count"))throw new BridgeException("invalid_request","item.pickup collects the whole ground stack; count is not supported");}
             default->{}
         }
     }
@@ -84,6 +136,7 @@ final class MinecraftWorld implements WorldAccess {
     static String itemId(ItemStack s){return s.isEmpty()?"minecraft:air":BuiltInRegistries.ITEM.getKey(s.getItem()).toString();}
     static String blockId(BlockState s){return BuiltInRegistries.BLOCK.getKey(s.getBlock()).toString();}
     static JsonObject stack(ItemStack s){return object("type",itemId(s),"count",s.getCount(),"damage",s.getDamageValue(),"max_stack_size",s.getMaxStackSize(),"name",s.getHoverName().getString(),"components","Only public name, damage and stack limit are exposed; other components are unavailable");}
+    static JsonObject heldStack(ItemStack s){return object("type",itemId(s),"count",s.getCount(),"damage",s.getDamageValue());}
     private static <T extends Comparable<T>> String propertyValue(Property<T> p,BlockState state){return p.getName(state.getValue(p));}
     static JsonObject properties(BlockState state){JsonObject o=object();for(Property<?> p:state.getProperties())o.addProperty(p.getName(),propertyValue(p,state));return o;}
     @Override public JsonObject snapshot(int radius,boolean telemetry) {
@@ -93,6 +146,7 @@ final class MinecraftWorld implements WorldAccess {
         for(Entity e:mc.level.getEntities(mc.player,mc.player.getBoundingBox().inflate(radius),e->!e.isInvisibleTo(mc.player))) {
             boolean visible=visible(e);if(!telemetry && !visible)continue;
             JsonObject ent=object("entity_id",e.getUUID().toString(),"type",BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).toString(),"position",vector(e.position()),"velocity",vector(e.getDeltaMovement()),"visible",visible,"source","client_engine","health","unavailable");
+            if(e instanceof ItemEntity item)ent.add("item",heldStack(item.getItem()));
             entities.add(ent);
         }
         JsonArray blocks=new JsonArray();BlockPos center=mc.player.blockPosition();int count=0;
@@ -104,7 +158,7 @@ final class MinecraftWorld implements WorldAccess {
             JsonObject b=position(p);b.addProperty("dimension",dimension());b.addProperty("type",blockId(state));b.add("properties",properties(state));
             b.addProperty("solid",!state.getCollisionShape(mc.level,p).isEmpty());b.addProperty("fluid",!state.getFluidState().isEmpty());b.addProperty("source",telemetry?"owner_telemetry":"ray_observation");blocks.add(b);
         }
-        return object("actor",object("position",vector(mc.player.position()),"velocity",vector(mc.player.getDeltaMovement()),"yaw",mc.player.getYRot(),"pitch",mc.player.getXRot(),"health",mc.player.getHealth(),"food",mc.player.getFoodData().getFoodLevel(),"armor",mc.player.getArmorValue(),"effects",mc.player.getActiveEffects().stream().map(e->e.toString()).toList(),"selected_slot",mc.player.getInventory().getSelectedSlot(),"using_item",mc.player.isUsingItem(),"on_ground",mc.player.onGround(),"flying",mc.player.getAbilities().flying,"in_water",mc.player.isInWater(),"in_lava",mc.player.isInLava(),"riding",mc.player.isPassenger(),"crouching",mc.player.isCrouching(),"sprinting",mc.player.isSprinting()),
+        return object("actor",object("position",vector(mc.player.position()),"velocity",vector(mc.player.getDeltaMovement()),"yaw",mc.player.getYRot(),"pitch",mc.player.getXRot(),"health",mc.player.getHealth(),"food",mc.player.getFoodData().getFoodLevel(),"armor",mc.player.getArmorValue(),"effects",mc.player.getActiveEffects().stream().map(e->e.toString()).toList(),"selected_slot",mc.player.getInventory().getSelectedSlot(),"main_hand",heldStack(mc.player.getMainHandItem()),"off_hand",heldStack(mc.player.getOffhandItem()),"using_item",mc.player.isUsingItem(),"on_ground",mc.player.onGround(),"flying",mc.player.getAbilities().flying,"in_water",mc.player.isInWater(),"in_lava",mc.player.isInLava(),"riding",mc.player.isPassenger(),"crouching",mc.player.isCrouching(),"sprinting",mc.player.isSprinting()),
                 "inventory",inventory,"entities",entities,"blocks",blocks,"context",object("raining",mc.level.isRaining(),"day_time",mc.level.getDefaultClockTime(),"menu_id",mc.player.containerMenu.containerId,"menu_revision",mc.player.containerMenu.getStateId(),"menu_slots",menu,"cursor",stack(mc.player.containerMenu.getCarried()),"source","client_engine","coordinate_system","world_xyz_blocks","telemetry",telemetry));
     }
     boolean visible(Entity entity){return mc.level.clip(new ClipContext(mc.player.getEyePosition(),entity.getBoundingBox().getCenter(),ClipContext.Block.COLLIDER,ClipContext.Fluid.NONE,mc.player)).getType()==HitResult.Type.MISS;}
@@ -124,6 +178,11 @@ final class MinecraftWorld implements WorldAccess {
         if(down)held.add(k);else held.remove(k);
     }
     @Override public void releaseControls(){for(var k:Set.copyOf(held))hold(k,false);held.clear();if(mc.gameMode!=null)mc.gameMode.stopDestroyBlock();if(mc.gameMode!=null && mc.player!=null && mc.player.isUsingItem())mc.gameMode.releaseUsingItem(mc.player);routes.clear();crouches.values().forEach(CrouchSequence::released);}
+    void beforeClientTick(){
+        // Network packets are applied before Pre. Release before Minecraft handles keys
+        // when the first use finishes, preventing its held-key automatic repeat.
+        if(held.contains(mc.options.keyUse) && (mc.player==null || !mc.player.isUsingItem() || mc.screen!=null || mc.isPaused()))hold(mc.options.keyUse,false);
+    }
     private void look(Vec3 target){Vec3 d=target.subtract(mc.player.getEyePosition());mc.player.setYRot((float)Math.toDegrees(Math.atan2(-d.x,d.z)));mc.player.setXRot((float)-Math.toDegrees(Math.atan2(d.y,Math.sqrt(d.x*d.x+d.z*d.z))));}
     private void checkArea(Vec3 p){if(!policy.areas.isEmpty())policy.checkPoint(vector(p),dimension());}
     private void reach(BlockPos pos){if(!mc.level.hasChunkAt(pos))throw new BridgeException("chunk_unavailable","Target chunk is not loaded",true);checkArea(Vec3.atCenterOf(pos));if(mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(pos))>mc.player.blockInteractionRange())throw new BridgeException("out_of_reach","Target block is out of reach",true);}
@@ -132,6 +191,7 @@ final class MinecraftWorld implements WorldAccess {
         if(pending==null) {
             var server=mc.getSingleplayerServer();if(server==null)throw new BridgeException("permission_denied","Actions require an integrated server");
             var dim=mc.level.dimension();UUID player=mc.player.getUUID();
+            String usedItem=string(task.context,"use_item","minecraft:air");
             pending=server.submit(()->{
                 var level=server.getLevel(dim);var actor=server.getPlayerList().getPlayer(player);
                 if(level==null || actor==null)throw new BridgeException("disconnected","Actor unavailable");
@@ -140,6 +200,10 @@ final class MinecraftWorld implements WorldAccess {
                 view.addProperty("crouching",actor.isCrouching());view.addProperty("sprinting",actor.isSprinting());
                 view.addProperty("yaw",actor.getYRot());view.addProperty("pitch",actor.getXRot());
                 view.addProperty("selected_slot",actor.getInventory().getSelectedSlot());
+                view.add("main_hand",heldStack(actor.getMainHandItem()));view.add("off_hand",heldStack(actor.getOffhandItem()));
+                view.addProperty("food",actor.getFoodData().getFoodLevel());view.addProperty("using_item",actor.isUsingItem());
+                view.addProperty("use_hand",actor.isUsingItem()?(actor.getUsedItemHand()==InteractionHand.MAIN_HAND?"main":"off"):"none");
+                view.addProperty("item_uses",actor.getStats().getValue(Stats.ITEM_USED,BuiltInRegistries.ITEM.getValue(Identifier.parse(usedItem))));
                 JsonArray slots=new JsonArray();for(Slot s:actor.containerMenu.slots){JsonObject item=stack(s.getItem());item.addProperty("slot",s.index);slots.add(item);}view.add("slots",slots);
                 Map<String,Integer> counts=new HashMap<>();for(int i=0;i<actor.getInventory().getContainerSize();i++){ItemStack s=actor.getInventory().getItem(i);if(!s.isEmpty())counts.merge(itemId(s),s.getCount(),Integer::sum);}view.add("inventory_counts",GSON.toJsonTree(counts));
                 if(pos!=null){BlockState state=level.getBlockState(pos);view.add("block",object("type",blockId(state),"properties",properties(state)));}
@@ -154,7 +218,7 @@ final class MinecraftWorld implements WorldAccess {
         if(!mc.hasSingleplayerServer() || mc.player.isSpectator())throw new BridgeException("permission_denied","Singleplayer controllable actor required");
         if(mc.player.isDeadOrDying())return Step.failure("actor_dead","Actor is dead",object());
         if(mc.player.getHealth()<=number(t.parameters,"stop_health",4)){releaseControls();return Step.failure("critical_health","Actor health reached stop threshold",object("health",mc.player.getHealth()));}
-        if(bool(t.context,"revalidate",false)){t.context.remove("revalidate");routes.remove(t.id);confirmations.remove(t.id);if(t.action.equals("look.turn"))t.context.addProperty("turn_sent",tick());if(t.action.equals("build.execute")){t.context.addProperty("build_index",0);t.context.remove("placing");}}
+        if(bool(t.context,"revalidate",false)){t.context.remove("revalidate");routes.remove(t.id);confirmations.remove(t.id);if(drops.containsKey(t.id))drops.get(t.id).resumed(tick());if(t.action.equals("look.turn"))t.context.addProperty("turn_sent",tick());if(t.action.equals("build.execute")){t.context.addProperty("build_index",0);t.context.remove("placing");}}
         if(mc.screen instanceof ModelScreen){
             releaseControls();confirmations.remove(t.id);
             t.context.addProperty("owner_panel_waiting",true);
@@ -165,6 +229,7 @@ final class MinecraftWorld implements WorldAccess {
             // The panel is an observation pause, not evidence of being stuck. Keep the
             // original targets and owner deadline, but restart short confirmation timers.
             t.context.remove("last_position");t.context.remove("last_moved");
+            if(drops.containsKey(t.id))drops.get(t.id).resumed(tick());
             if(t.action.equals("look.turn"))t.context.addProperty("turn_sent",tick());
         }
         return switch(t.action) {
@@ -181,6 +246,8 @@ final class MinecraftWorld implements WorldAccess {
             case "world.interact", "container.open" -> interact(t);
             case "container.close" -> {if(!t.context.has("sent")){mc.player.closeContainer();t.context.addProperty("sent",true);t.actions++;}JsonObject v=serverView(t,null,null);yield v!=null && v.get("menu_id").getAsInt()==0?Step.success(v):Step.waiting(object("waiting","server_menu"));}
             case "item.use" -> use(t);
+            case "item.drop" -> drop(t);
+            case "item.pickup" -> pickup(t);
             case "inventory.select" -> {
                 int slot=integer(t.parameters,"slot",0,0,8);
                 if(!t.context.has("selection_sent")){mc.player.getInventory().setSelectedSlot(slot);t.actions++;t.context.addProperty("selection_sent",tick());}
@@ -363,14 +430,107 @@ final class MinecraftWorld implements WorldAccess {
         return Step.waiting(object("waiting","interface_confirmation"));
     }
     private Step use(Task t) {
-        InteractionHand hand=string(t.parameters,"hand","main").equals("off")?InteractionHand.OFF_HAND:InteractionHand.MAIN_HAND;
-        int duration=integer(t.parameters,"duration_ticks",32,1,1200);
-        if(!t.context.has("using")){t.context.add("before",stack(mc.player.getItemInHand(hand)));mc.gameMode.useItem(mc.player,hand);t.context.addProperty("using",tick());t.actions++;}
-        if(tick()-number(t.context,"using",tick())>=duration || (!mc.player.isUsingItem() && tick()-number(t.context,"using",tick())>2)){
-            if(mc.player.isUsingItem())mc.gameMode.releaseUsingItem(mc.player);JsonObject view=serverView(t,null,null);
-            if(view!=null)return Step.success(object("before",t.context.get("before"),"after",stack(mc.player.getItemInHand(hand)),"server",view,"outcome","use_finished"));
+        checkArea(mc.player.position());
+        String handName=string(t.parameters,"hand","main");
+        InteractionHand hand=handName.equals("off")?InteractionHand.OFF_HAND:InteractionHand.MAIN_HAND;
+        int duration=integer(t.parameters,"duration_ticks",40,1,1200);
+        if(!t.context.has("use_sent")){
+            if(mc.screen!=null || mc.player.containerMenu.containerId!=0)return Step.failure("interface_open","Close interfaces before using an item",object());
+            if(mc.player.isUsingItem())return Step.failure("busy","Actor is already using an item",object());
+            t.context.addProperty("use_item",itemId(mc.player.getItemInHand(hand)));
+            JsonObject before=serverView(t,null,null);
+            if(before==null)return Step.waiting(object("stage","reading_held_item"));
+            if(number(child(before,handName+"_hand"),"count",0)==0)return Step.failure("empty_hand","Selected hand is empty",object());
+            if(bool(before,"using_item",false))return Step.failure("busy","Server actor is already using an item",object());
+            if(!before.get(handName+"_hand").equals(heldStack(mc.player.getItemInHand(hand))))return Step.failure("target_changed","Held item changed before use",object());
+            t.context.add("use_before",before);
+            if(t.parameters.has("target"))look(point(child(t.parameters,"target")));
+            mc.gameMode.useItem(mc.player,hand);t.context.addProperty("use_sent",tick());t.actions++;
+            if(mc.player.isUsingItem())hold(mc.options.keyUse,true);
+            return Step.waiting(object("stage","confirming_item_use"));
         }
-        return Step.waiting(object("stage","using_item"));
+        JsonObject view=serverView(t,null,null);
+        long elapsed=tick()-(long)number(t.context,"use_sent",tick());
+        if(view==null)return Step.waiting(object("stage","confirming_item_use"));
+        JsonObject before=child(t.context,"use_before");
+        if(hand==InteractionHand.MAIN_HAND && number(view,"selected_slot",-1)!=number(before,"selected_slot",-1))
+            return Step.failure("target_changed","Selected hand changed during use",object());
+        boolean active=ItemUseEvidence.using(view,handName);
+        if(active){
+            if(!t.context.has("use_first_tick"))t.context.addProperty("use_first_tick",number(view,"tick",tick()));
+            t.context.addProperty("use_last_tick",number(view,"tick",tick()));
+        }
+        boolean changed=ItemUseEvidence.itemChanged(before,view,handName),recorded=ItemUseEvidence.recordedUse(before,view);
+        boolean observed=t.context.has("use_first_tick");
+        long heldTicks=observed?(long)(number(t.context,"use_last_tick",0)-number(t.context,"use_first_tick",0)+1):0;
+        JsonObject evidence=object("item",string(t.context,"use_item"),"hand",handName,"held_item_changed",changed,"server_use_ticks",heldTicks,
+                "recorded_uses",Math.max(0,(int)(number(view,"item_uses",0)-number(before,"item_uses",0))));
+        JsonObject result=object("before",ItemUseEvidence.summary(before,handName),"after",ItemUseEvidence.summary(view,handName),
+                "server_use_confirmed",observed||changed||recorded,"effect_observed",changed,"source","integrated_server");
+        if(observed||changed||recorded)t.confirmed.add("item_use",evidence);
+        if(active && elapsed>=duration && !t.context.has("use_released")){
+            hold(mc.options.keyUse,false);mc.gameMode.releaseUsingItem(mc.player);t.context.addProperty("use_released",tick());
+            return Step.waiting(result);
+        }
+        // Poll after release so the result includes its server effects (e.g. bow damage).
+        if(!active && (observed||changed||recorded) && (!t.context.has("use_released") || tick()-number(t.context,"use_released",tick())>=4)){
+            result.addProperty("outcome",changed?"held_item_changed":recorded?"item_use_recorded":"use_released");
+            return Step.success(result);
+        }
+        if(!observed && !changed && !recorded && elapsed>20)return Step.failure("use_no_effect","Server observed no use or held-item change; the item may require a block/entity target or hunger",result);
+        if(t.context.has("use_released") && tick()-number(t.context,"use_released",tick())>20)return Step.failure("use_unconfirmed","Server did not confirm item release",result);
+        return Step.waiting(result);
+    }
+    private Step drop(Task t){
+        if(mc.screen!=null || mc.player.containerMenu.containerId!=0)return Step.failure("interface_open","Close interfaces before dropping an item",t.result);
+        if(mc.player.isUsingItem())return Step.failure("busy","Stop using the held item before dropping it",t.result);
+        checkArea(mc.player.position());
+        ItemDropSequence sequence=drops.computeIfAbsent(t.id,key->new ItemDropSequence(ItemDropSequence.count(t.parameters),string(t.parameters,"expected_item","")));
+        JsonObject view=serverView(t,null,null);
+        ItemDropSequence.Sample sample=view==null?null:new ItemDropSequence.Sample((long)number(view,"tick",0),
+                (int)number(view,"selected_slot",-1),string(child(view,"main_hand"),"type"),(int)number(child(view,"main_hand"),"count",0));
+        var update=sequence.observe(tick(),sample);
+        t.confirmed.add("drop",object("item",update.progress().get("item"),"count",sequence.completed()));
+        if(update.error()!=null)return Step.failure(update.error(),"Held-item count did not confirm the requested drop",update.progress());
+        if(update.pressDrop()){
+            if(!mc.player.drop(false))return Step.failure("target_changed","Client hand became empty before drop",update.progress());
+            t.actions++;
+        }
+        return update.done()?Step.success(update.progress()):Step.waiting(update.progress());
+    }
+    private Step pickup(Task t){
+        String target=string(t.parameters,"entity_id");
+        if(!t.context.has("pickup_started")){
+            Entity entity=entity(t.parameters);
+            if(!(entity instanceof ItemEntity item))return Step.failure("invalid_target","Pickup requires an observed item entity",object());
+            checkArea(entity.position());pickups.begin(target);
+            t.context.addProperty("pickup_started",tick());t.context.add("pickup_item",heldStack(item.getItem()));
+        }
+        var receipt=pickups.peek(target,(long)number(t.context,"pickup_started",tick()));
+        if(receipt!=null){
+            releaseControls();
+            JsonObject result=object("entity_id",target,"item",receipt.item(),"collected",receipt.collected(),"remaining",receipt.remaining(),"source",receipt.source());
+            t.confirmed.add("pickup",object("item",receipt.item(),"count",receipt.collected()));
+            return receipt.remaining()==0?Step.success(result):Step.failure("inventory_full","Only part of the ground stack fitted in the inventory",result);
+        }
+        if(t.actions>=t.maxActions){
+            releaseControls();if(!t.context.has("pickup_budget_wait"))t.context.addProperty("pickup_budget_wait",tick());
+            if(tick()-number(t.context,"pickup_budget_wait",tick())>20)return Step.failure("action_limit","Movement budget exhausted without a server pickup receipt",t.result);
+            return Step.waiting(object("stage","confirming_pickup","entity_id",target));
+        }
+        if(mc.screen!=null || mc.player.containerMenu.containerId!=0)return Step.failure("interface_open","Close interfaces before picking up an item",t.result);
+        Entity entity=entity(t.parameters);
+        if(!(entity instanceof ItemEntity item) || !itemId(item.getItem()).equals(string(child(t.context,"pickup_item"),"type")))
+            return Step.failure("target_changed","Observed ground item changed",t.result);
+        checkArea(entity.position());
+        Step movement=move(t,entity.position(),0.5,false);
+        if(movement.error()!=null)return movement;
+        if(movement.done() || mc.player.position().distanceTo(entity.position())<=0.5){
+            if(!t.context.has("pickup_wait"))t.context.addProperty("pickup_wait",tick());
+            if(tick()-number(t.context,"pickup_wait",tick())>40)return Step.failure("pickup_unconfirmed","No server pickup receipt; inventory may be full or item may not be available",object("entity_id",target));
+            return Step.waiting(object("stage","waiting_for_pickup","entity_id",target));
+        }
+        t.context.remove("pickup_wait");return movement;
     }
     private Step transfer(Task t) {
         AbstractContainerMenu menu=mc.player.containerMenu;int from=integer(t.parameters,"from_slot",0,0,menu.slots.size()-1),to=integer(t.parameters,"to_slot",0,0,menu.slots.size()-1);

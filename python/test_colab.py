@@ -122,6 +122,17 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(progress["confirmed_jumps"], 2)
         self.assertEqual(progress["completed_steps"], 0)
 
+    def test_item_goal_totals_keep_partial_confirmations_without_double_counting(self):
+        partial = {"result": {"task_id": "partial-drop", "state": "cancelled", "confirmed_changes": {"drop": {"item": "minecraft:stone", "count": 2}}}}
+        history = [partial, partial,
+                   {"result": {"task_id": "pickup", "state": "failed", "confirmed_changes": {"pickup": {"item": "minecraft:apple", "count": 3}}}},
+                   {"result": {"task_id": "unconfirmed", "state": "failed", "result": {"collected": 10}}},
+                   {"result": {"task_id": "invalid", "state": "failed", "confirmed_changes": {"drop": {"item": "minecraft:stone", "count": True}}}}]
+        progress = controller.goal_progress(snapshot(), history)
+        self.assertEqual(progress["dropped_items"], {"minecraft:stone": 2})
+        self.assertEqual(progress["picked_up_items"], {"minecraft:apple": 3})
+        self.assertEqual(progress["completed_steps"], 0)
+
     def test_compact_result_preserves_confirmation_and_failure_without_task_boilerplate(self):
         history = [{"decision": {"action": "move.jump", "parameters": {"count": 10}, "reason": "repeat me"},
                     "result": {"task_id": "actual-task", "action": "move.jump", "priority": 99,
@@ -576,6 +587,9 @@ class VllmAdapterTest(unittest.TestCase):
             ("move.relative", {"forward": 2, "right": -1, "crouch": True}),
             ("move.crouch", {"ticks": 40}),
             ("look.turn", {"delta_yaw": 90, "delta_pitch": -15}),
+            ("item.drop", {"count": 5, "expected_item": "minecraft:stone"}),
+            ("item.pickup", {"entity_id": "418f10e9-bc78-4d9c-bb26-6a9cfa352b69"}),
+            ("item.use", {"hand": "off", "duration_ticks": 40, "target": {"x": 3, "y": 65, "z": 0}}),
         ]
         for action, parameters in cases:
             with self.subTest(action=action):
@@ -583,6 +597,23 @@ class VllmAdapterTest(unittest.TestCase):
                 decision = {"action": action, "parameters": parameters, "reason": "documented action"}
                 self.model.content = json.dumps(decision)
                 self.assertEqual(self.namespace["infer_decision"](payload), decision)
+
+    def test_item_parameters_are_rejected_in_both_notebook_and_controller(self):
+        cases = [("item.drop", {"count": count}) for count in (0, 65, True, "5", 1.5)]
+        cases += [("item.drop", {"expected_item": "stone;command"}), ("item.pickup", {}),
+                  ("item.drop", {"hand": "off"}), ("item.pickup", {"entity_id": "418f10e9-bc78-4d9c-bb26-6a9cfa352b69", "count": 1}),
+                  ("item.pickup", {"entity_id": "invented-target"}), ("item.pickup", {"entity_id": 3}),
+                  ("item.use", {"hand": "left"}), ("item.use", {"duration_ticks": True}),
+                  ("item.use", {"duration_ticks": 1201}), ("item.use", {"target": {"x": "1+3", "y": 64, "z": 0}})]
+        schema = controller.model_payload("items", snapshot(), ["item.drop", "item.pickup", "item.use"], [], compact=True)["format"]
+        for action, parameters in cases:
+            decision = {"action": action, "parameters": parameters, "reason": "items"}
+            response = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(decision)}}]}
+            with self.subTest(action=action, parameters=parameters):
+                with self.assertRaises(ValueError):
+                    self.namespace["parse_decision"](response, schema)
+                with self.assertRaises(ValueError):
+                    controller.validate_decision(decision, schema["properties"]["action"]["enum"])
 
     def test_relative_movement_rejects_invalid_numbers_flags_and_distances(self):
         cases = [

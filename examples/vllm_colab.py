@@ -16,14 +16,16 @@ from minebridge_client import BridgeClient, BridgeError
 
 ACTION_HELP = {
     "move.to": "target:{x,y,z},tolerance:0.3..16,sprint/crouch:bool(exclusive); safe loaded route<=96 blocks",
-    "move.relative": "forward/right:-16..16(default0; nonzero vector,length<=16),tolerance:0.3..16(default0.7),sprint/crouch:bool(exclusive); target relative to starting yaw: +forward ahead,+right right; camera follows route",
+    "move.relative": "forward/right:-16..16(default0,nonzero,length<=16),tolerance:0.3..16(default0.7),sprint/crouch:bool(exclusive); offset from starting yaw:+forward ahead,+right right",
     "move.follow": "entity_id,distance:0.3..16; continuous, may time out",
-    "move.jump": "count:1..30(default1); in-place jumps, confirmed takeoff+landing; ground only, no flight/water/vehicle",
+    "move.jump": "count:1..30(default1); ground jumps in place, confirmed takeoff+landing",
     "move.crouch": "ticks:1..200(default20); crouch in place, auto-release",
     "look.at": "target:{x,y,z} OR entity_id",
-    "look.turn": "delta_yaw:-180..180,delta_pitch:-90..90(default0,both0 forbidden); relative view: +yaw right,+pitch down; final pitch clamped+-90",
+    "look.turn": "delta_yaw:-180..180,delta_pitch:-90..90(default0,nonzero); +yaw right,+pitch down,final pitch clamped+-90",
     "combat.attack": "entity_id,chase:bool; melee, no players",
-    "item.use": "hand:main/off,duration_ticks:1..200; use/eat held item, never jump/move",
+    "item.use": "hand:main/off,duration_ticks:1..1200(default40),target:{x,y,z} optional aim; held item only; effect_observed=false means no held-item change",
+    "item.drop": "count:1..64(default1),expected_item:namespace:id optional; selected main-hand stack only; confirmed count",
+    "item.pickup": "entity_id of observed minecraft:item; approach and collect whole stack; partial count possible",
     "block.break": "position:{x,y,z} integer, require_tool:true",
     "block.place": "position:{x,y,z} integers,block:namespace:id,properties:{}; hotbar material required",
     "world.interact": "position:{x,y,z} OR entity_id",
@@ -91,6 +93,14 @@ def goal_progress(snapshot, history, initial_actor=None):
         jumps = result.get("confirmed_changes", {}).get("jumps", 0)
         if type(jumps) is int and jumps >= 0:
             progress["confirmed_jumps"] += jumps
+        for operation, field in (("drop", "dropped_items"), ("pickup", "picked_up_items")):
+            receipt = result.get("confirmed_changes", {}).get(operation, {})
+            if not isinstance(receipt, dict):
+                continue
+            item, count = receipt.get("item"), receipt.get("count")
+            if isinstance(item, str) and type(count) is int and count > 0:
+                totals = progress.setdefault(field, {})
+                totals[item] = totals.get(item, 0) + count
     return progress
 
 
@@ -153,7 +163,40 @@ def validate_decision(value, allowed):
         raise ValueError("Invalid model parameters/reason")
     if len(value["reason"]) > 500 or len(json.dumps(value, allow_nan=False).encode()) > 32768:
         raise ValueError("Model decision exceeds limits")
+    validate_item_parameters(value["action"], value["parameters"])
     return value
+
+
+def validate_item_parameters(action, parameters):
+    from uuid import UUID
+    import re
+    if action == "item.drop":
+        if parameters.get("hand", "main") != "main":
+            raise ValueError("item.drop: only the selected main hand is supported")
+        count = parameters.get("count", 1)
+        if type(count) is not int or not 1 <= count <= 64:
+            raise ValueError("item.drop: count must be an integer from 1 to 64")
+        item = parameters.get("expected_item", "minecraft:air")
+        if not isinstance(item, str) or not re.fullmatch(r"[a-z0-9_.-]+:[a-z0-9/._-]+", item):
+            raise ValueError("item.drop: expected_item must be namespace:id")
+    if action == "item.pickup":
+        if "count" in parameters:
+            raise ValueError("item.pickup: whole stack only; count is not supported")
+        entity_id = parameters.get("entity_id")
+        if not isinstance(entity_id, str):
+            raise ValueError("item.pickup: entity_id must be an observed UUID")
+        UUID(entity_id)
+    if action == "item.use":
+        if parameters.get("hand", "main") not in ("main", "off"):
+            raise ValueError("item.use: hand must be main/off")
+        ticks = parameters.get("duration_ticks", 40)
+        if type(ticks) is not int or not 1 <= ticks <= 1200:
+            raise ValueError("item.use: duration_ticks must be an integer from 1 to 1200")
+        if "target" in parameters:
+            target = parameters["target"]
+            if not isinstance(target, dict) or any(type(target.get(axis)) not in (int, float) for axis in ("x", "y", "z")):
+                raise ValueError("item.use: target must contain numeric x/y/z")
+            json.dumps(target, allow_nan=False)
 
 
 async def wait_task(bridge, task_id, stop, timeout):

@@ -28,7 +28,7 @@ public final class BridgeClient {
     private ModelScreen panel;
     private BridgeEngine engine;
     private BridgeSocket socket;
-    private MinecraftWorld world;
+    private volatile MinecraftWorld world;
     private ClientVision vision;
     private OwnerPolicy policy;
     private String identity;
@@ -41,10 +41,25 @@ public final class BridgeClient {
     public BridgeClient(IEventBus bus) {
         bus.addListener(this::keys);
         NeoForge.EVENT_BUS.addListener(this::tick);
+        NeoForge.EVENT_BUS.addListener(this::beforeTick);
         NeoForge.EVENT_BUS.addListener(this::keyInput);
         NeoForge.EVENT_BUS.addListener(this::mouseInput);
         NeoForge.EVENT_BUS.addListener(this::extract);
         NeoForge.EVENT_BUS.addListener(this::render);
+        NeoForge.EVENT_BUS.addListener(this::pickup);
+        NeoForge.EVENT_BUS.addListener(this::pickupAttempt);
+        NeoForge.EVENT_BUS.addListener(this::afterPlayerTick);
+    }
+    private void pickup(net.neoforged.neoforge.event.entity.player.ItemEntityPickupEvent.Post event){
+        MinecraftWorld activeWorld=world;
+        if(activeWorld!=null)activeWorld.recordPickup(event);
+    }
+    private void beforeTick(ClientTickEvent.Pre event){if(world!=null)world.beforeClientTick();}
+    private void pickupAttempt(net.neoforged.neoforge.event.entity.player.ItemEntityPickupEvent.Pre event){
+        MinecraftWorld activeWorld=world;if(activeWorld!=null)activeWorld.recordPickupAttempt(event);
+    }
+    private void afterPlayerTick(net.neoforged.neoforge.event.tick.PlayerTickEvent.Post event){
+        MinecraftWorld activeWorld=world;if(activeWorld!=null)activeWorld.confirmPickupAttempts(event.getEntity());
     }
     private void keys(RegisterKeyMappingsEvent event){event.registerCategory(category);event.register(arm);event.register(stop);event.register(panelKey);}
     private void tick(ClientTickEvent.Post event) {

@@ -14,6 +14,8 @@ public interface WorldAccess {
     JsonObject snapshot(int radius, boolean telemetry);
     default void validate(String action,JsonObject parameters) {}
     Step step(Task task);
+    /** May only poll or release an already sent action; never send another mutation. */
+    default boolean awaitingConfirmation(Task task) { return false; }
     void releaseControls();
     default void taskFinished(Task task) {}
     default List<String> movementModes() { return List.of(); }

@@ -12,12 +12,13 @@ class BridgeEngineTest {
     @TempDir Path directory;
     FakeWorld world;OwnerPolicy owner;BridgeEngine engine;Peer peer;
     static final class FakeWorld implements WorldAccess {
-        long tick;int steps,releases,queries;double health=20;boolean done;String dim="minecraft:overworld";
+        long tick;int steps,releases,queries;double health=20;boolean done,confirmationOnly;String dim="minecraft:overworld";
         public String actorId(){return "player";} public String worldId(){return "world";} public String dimension(){return dim;} public long tick(){return tick;}
         public Set<String> capabilities(){return Set.of("move.to","block.break","inventory.inspect");}
         public JsonObject query(String operation,JsonObject parameters){queries++;return object("inventory",List.of());}
         public JsonObject snapshot(int radius,boolean telemetry){return object("actor",object("health",health),"blocks",List.of(),"entities",List.of());}
-        public Step step(Task t){steps++;t.actions++;t.confirmed.addProperty("steps",steps);return done?Step.success(object("steps",steps)):Step.waiting(object("steps",steps));}
+        public Step step(Task t){if(confirmationOnly && t.actions>0)return done?Step.success(object("steps",steps)):Step.waiting(object("steps",steps));steps++;t.actions++;t.confirmed.addProperty("steps",steps);return done?Step.success(object("steps",steps)):Step.waiting(object("steps",steps));}
+        public boolean awaitingConfirmation(Task t){return confirmationOnly && t.actions>0;}
         public void releaseControls(){releases++;}
     }
     static final class Peer implements BridgeEngine.Peer {
@@ -66,6 +67,8 @@ class BridgeEngineTest {
     @Test void manualInputPauses(){auth();String task=submit("a");engine.manualInput();int steps=world.steps;world.tick++;engine.tick();assertEquals(steps,world.steps);assertEquals("paused",send("task.status","s",object("task_id",task)).get("state").getAsString());}
     @Test void timeoutIsDistinctFromCancellation(){auth();String task=send("task.submit","a",object("action","move.to","parameters",object(),"timeout_ticks",1)).get("task_id").getAsString();world.tick+=2;engine.tick();JsonObject result=send("task.status","s",object("task_id",task));assertEquals("failed",result.get("state").getAsString());assertEquals("timeout",result.get("error").getAsString());}
     @Test void actionBudgetStopsExecution(){auth();String task=send("task.submit","a",object("action","move.to","parameters",object(),"max_actions",1)).get("task_id").getAsString();world.tick++;engine.tick();assertEquals(1,world.steps);assertEquals("action_limit",send("task.status","s",object("task_id",task)).get("error").getAsString());}
+    @Test void exactActionBudgetAllowsConfirmationWithoutAnotherMutation(){auth();world.confirmationOnly=true;String task=send("task.submit","a",object("action","move.to","parameters",object(),"max_actions",1)).get("task_id").getAsString();world.tick++;engine.tick();assertEquals(1,world.steps);world.done=true;JsonObject result=send("task.status","s",object("task_id",task));world.tick++;engine.tick();result=send("task.status","final",object("task_id",task));assertEquals("succeeded",result.get("state").getAsString());assertEquals(1,world.steps);assertEquals(1,result.get("actions").getAsInt());}
+    @Test void confirmationWaitStillHasADeadlineAndOwnerCancellation(){auth();world.confirmationOnly=true;String task=send("task.submit","a",object("action","move.to","parameters",object(),"max_actions",1,"timeout_ticks",3)).get("task_id").getAsString();world.tick+=4;engine.tick();assertEquals("timeout",send("task.status","s",object("task_id",task)).get("error").getAsString());assertEquals(1,world.steps);String next=submit("b");engine.ownerStop();assertEquals("cancelled",send("task.status","cancelled",object("task_id",next)).get("state").getAsString());assertEquals(2,world.steps);}
     @Test void ownerAreaRejectsOutOfBounds(){auth();owner.areas.add(new OwnerPolicy.Area(world.dimension(),0,0,0,1,1,1));assertEquals("permission_denied",send("move.to","a",object("target",object("x",2,"y",0,"z",0))).get("code").getAsString());}
     @Test void replayDetectsHistoryGap(){auth();for(int i=0;i<600;i++)engine.event("test",object());JsonObject result=send("session.resume","r",object("after_sequence",0));assertTrue(result.get("history_gap").getAsBoolean());assertTrue(result.has("snapshot"));assertEquals(0,result.getAsJsonArray("events").size());}
     @Test void replayRetainsTerminalResults(){auth();world.done=true;String task=submit("a");JsonObject result=send("session.resume","r",object("after_sequence",0));assertFalse(result.get("history_gap").getAsBoolean());assertEquals(task,result.getAsJsonArray("tasks").get(0).getAsJsonObject().get("task_id").getAsString());}
