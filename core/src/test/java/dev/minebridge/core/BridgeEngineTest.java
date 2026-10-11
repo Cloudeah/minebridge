@@ -140,4 +140,13 @@ class BridgeEngineTest {
         JsonObject summary=engine.modelStatus().getAsJsonObject("recent_task").getAsJsonObject("confirmed_changes");
         assertEquals(1,summary.get("shots").getAsInt());assertEquals(1,summary.get("hits").getAsInt());assertEquals(3.5,summary.get("damage").getAsDouble());assertFalse(summary.has("combat"));
     }
+    @Test void ownerGoalSummaryKeepsEquipmentCountersAndOmitsDetailedStackReceipts(){
+        auth();engine.ownerModelStart("equip helmet",2,false);String goal=engine.modelStatus().get("goal_id").getAsString();send("model.claim","claim",object("goal_id",goal));
+        String task=send("task.submit","equipment",object("action","move.to","parameters",object(),"model_goal_id",goal)).get("task_id").getAsString();
+        world.finalConfirmed=object("inventory_swaps",1,"equips",1,"inventory_swap",object("source_slot",object("name","old helmet")),"transfer",object("transferred",3));
+        send("task.cancel","cancel-equipment",object("task_id",task));
+        JsonObject summary=engine.modelStatus().getAsJsonObject("recent_task").getAsJsonObject("confirmed_changes");
+        assertEquals(1,summary.get("inventory_swaps").getAsInt());assertEquals(1,summary.get("equips").getAsInt());assertEquals(3,summary.get("transfer_count").getAsInt());
+        assertFalse(summary.has("inventory_swap"));assertFalse(summary.has("transfer"));
+    }
 }

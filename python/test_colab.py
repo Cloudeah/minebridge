@@ -985,6 +985,12 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def test_vllm_preview_uses_openai_api_without_submitting_game_action(self):
         await self.integration()
 
+    async def test_vllm_named_equipment_crosses_notebook_relay_and_bridge_unchanged(self):
+        await self.integration(execute=True, decision={"action": "inventory.equip", "parameters": {"from_slot": 12, "equipment_slot": "head"}, "reason": "equip helmet"})
+
+    async def test_vllm_whole_stack_swap_crosses_notebook_relay_and_bridge_unchanged(self):
+        await self.integration(execute=True, decision={"action": "inventory.swap", "parameters": {"from_slot": 5, "to_slot": 12}, "reason": "remove helmet"})
+
     async def test_vllm_execution_submits_decision_and_reads_result(self):
         await self.integration(execute=True)
 
@@ -1019,6 +1025,115 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(task, 3)
             self.assertTrue(relay.broker.closed)
             self.assertTrue(relay.broker.worker_ready.is_set())
+
+
+class InventoryDecisionTest(unittest.TestCase):
+    def setUp(self):
+        notebook = json.loads((ROOT / 'examples/vllm_tpu_colab.ipynb').read_text())
+        source = next(''.join(cell['source']) for cell in notebook['cells'] if cell['cell_type'] == 'code' and 'def validate_item_parameters(' in ''.join(cell['source']))
+        tree = ast.parse(source)
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'validate_item_parameters')
+        namespace = {}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), '<notebook inventory validator>', 'exec'), namespace)
+        self.validators = [controller.validate_item_parameters, namespace['validate_item_parameters']]
+
+    def test_inventory_proof_is_compacted_once_with_counter_and_full_source_untouched(self):
+        proof = {"source": "integrated_server", "source_slot": {"slot": 9, "type": "minecraft:iron_helmet", "count": 1}, "target_slot": {"slot": 5, "type": "minecraft:diamond_helmet", "count": 1}}
+        for key, counters in (("inventory_swap", {"inventory_swaps": 1, "equips": 1}), ("transfer", {"transfer_count": 1})):
+            full = {"result": proof, "confirmed_changes": {**counters, key: proof}}
+            original = deepcopy(full)
+            compact = controller.compact_result(full)
+            self.assertEqual(compact["result"], proof)
+            self.assertEqual(compact["confirmed_changes"], counters)
+            self.assertEqual(full, original)
+
+    def test_filtered_inventory_query_keeps_source_separate_from_five_equipment_cells(self):
+        gear = [{"slot": 5+i, "equipment_slot": name, "role": "armor" if i<4 else "offhand", "type": "minecraft:air", "count": 0}
+                for i, name in enumerate(('head', 'chest', 'legs', 'feet', 'offhand'))]
+        source = {"slot": 34, "inventory_slot": 34, "role": "main", "type": "minecraft:diamond_helmet", "count": 1}
+        query = {"operation": "inventory.inspect", "state": "queried", "result": {"inventory": [], "menu": {"menu_id": 0, "menu_revision": 42, "menu_slots": gear+[source], "item_filter": "minecraft:diamond_helmet"}}}
+        original = deepcopy(query)
+        compact = controller.compact_result(query)
+        menu = compact['result']['menu']
+        self.assertEqual(menu['menu_slots'], [source])
+        self.assertEqual(set(menu['equipment_slots']), {'head','chest','legs','feet','offhand'})
+        self.assertEqual(menu['equipment_slots']['offhand']['slot'], 9)
+        self.assertEqual(query, original)
+
+    def test_context_shrinking_preserves_equipment_cells_and_can_reduce_other_collections(self):
+        notebook = json.loads((ROOT / 'examples/vllm_tpu_colab.ipynb').read_text())
+        source = next(''.join(cell['source']) for cell in notebook['cells'] if 'def shrink_observation(' in ''.join(cell['source']))
+        function = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == 'shrink_observation')
+        namespace = {"json": json}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), '<context shrinking>', 'exec'), namespace)
+        gear = [{"slot": 5+i, "role": "armor" if i<4 else "offhand", "count": 0} for i in range(5)]
+        slots = gear + [{"slot": 9+i, "role": "main", "type": "minecraft:stone", "count": 64} for i in range(36)]
+        data = {"goal": "equip helmet", "goal_progress": {"confirmed_equips": 1}, "recent_results": [], "observation": {"menu_slots": slots}}
+        body = {"messages": [{"role": "user", "content": json.dumps(data)}]}
+        for _ in range(6):
+            changed = namespace['shrink_observation'](body)
+            fitted = json.loads(body['messages'][0]['content'])
+            self.assertEqual([slot for slot in fitted['observation']['menu_slots'] if slot['role'] in ('armor','offhand')], gear)
+            self.assertEqual(fitted['goal_progress'], data['goal_progress'])
+            self.assertEqual(fitted['goal'], data['goal'])
+            if not changed:break
+        self.assertFalse(namespace['shrink_observation'](body))
+        fitted['observation']['blocks'] = [{"x": i} for i in range(8)]
+        body['messages'][0]['content'] = json.dumps(fitted)
+        self.assertTrue(namespace['shrink_observation'](body))
+        self.assertEqual(len(json.loads(body['messages'][0]['content'])['observation']['blocks']), 4)
+
+    def test_named_equipment_and_whole_stack_swaps_keep_observed_slot_numbers(self):
+        cases = [('inventory.equip', {'from_slot': 12, 'equipment_slot': 'head', 'menu_id': 0, 'menu_revision': 42}),
+                 ('inventory.equip', {'from_slot': 17, 'equipment_slot': 'offhand'}),
+                 ('inventory.swap', {'from_slot': 5, 'to_slot': 12}),
+                 ('inventory.transfer', {'from_slot': 12, 'to_slot': 13, 'count': 3}),
+                 ('inventory.equip', {'from_slot': 36, 'to_slot': 5, 'count': 1})]
+        for action, parameters in cases:
+            for validate in self.validators:
+                with self.subTest(action=action, parameters=parameters):
+                    original = deepcopy(parameters)
+                    validate(action, parameters)
+                    self.assertEqual(parameters, original)
+
+    def test_ambiguous_equipment_and_invalid_slots_rejected_in_both_workers(self):
+        cases = [('inventory.equip', {'from_slot': 12, 'equipment_slot': 'head', 'to_slot': 5}),
+                 ('inventory.equip', {'from_slot': 12, 'equipment_slot': 'head', 'count': 1}),
+                 ('inventory.equip', {'from_slot': 12, 'equipment_slot': 'body'}),
+                 ('inventory.equip', {'equipment_slot': 'head'}),
+                 ('inventory.swap', {'from_slot': 12, 'to_slot': 13, 'count': 1}),
+                 ('inventory.swap', {'from_slot': 12, 'to_slot': 12}),
+                 ('inventory.swap', {'from_slot': False, 'to_slot': 13}),
+                 ('inventory.swap', {'from_slot': '12', 'to_slot': 13}),
+                 ('inventory.swap', {'from_slot': 12, 'to_slot': -1}),
+                 ('inventory.swap', {'from_slot': 12, 'to_slot': 13, 'menu_revision': True}),
+                 ('inventory.transfer', {'from_slot': 12, 'to_slot': 13, 'count': 1.5})]
+        for action, parameters in cases:
+            for validate in self.validators:
+                with self.subTest(action=action, parameters=parameters), self.assertRaises(ValueError):
+                    validate(action, parameters)
+
+    def test_empty_equipment_cells_survive_compaction_without_spending_general_slot_budget(self):
+        state = snapshot()
+        gear = [{'slot': 5+i, 'type': 'minecraft:air', 'count': 0, 'role': 'armor' if i<4 else 'offhand',
+                 'inventory_slot': 39-i if i<4 else 40, 'equipment_slot': name}
+                for i, name in enumerate(('head', 'chest', 'legs', 'feet', 'offhand'))]
+        ordinary = [{'slot': 9+i, 'type': 'minecraft:air', 'count': 0, 'role': 'main'} for i in range(8)]
+        state['context']['menu_slots'] = gear + ordinary
+        state['context']['menu_slots'].insert(0, {'slot': 0, 'type': 'minecraft:air', 'count': 0, 'role': 'craft_output'})
+        original = deepcopy(state)
+        compact = controller.compact_snapshot(state, compact_menu=True)
+        self.assertEqual([cell['equipment_slot'] for cell in compact['menu_slots'] if 'equipment_slot' in cell], ['head', 'chest', 'legs', 'feet', 'offhand'])
+        self.assertEqual([cell['slot'] for cell in compact['menu_slots'] if cell['role']=='main'], [9, 10, 11, 12])
+        self.assertFalse(any(cell['slot']==0 for cell in compact['menu_slots']))
+        self.assertEqual(state, original)
+
+    def test_equipment_progress_counts_receipts_once_and_rejects_boolean_counts(self):
+        fact = {'task_id': 'equipped', 'state': 'succeeded', 'confirmed_changes': {'inventory_swaps': 1, 'equips': 1}}
+        history = [{'result': fact}, {'result': fact}, {'result': {'task_id': 'bad', 'confirmed_changes': {'inventory_swaps': True, 'equips': True}}}]
+        progress = controller.goal_progress(snapshot(), history)
+        self.assertEqual(progress['confirmed_inventory_swaps'], 1)
+        self.assertEqual(progress['confirmed_equips'], 1)
 
 
 if __name__ == "__main__":

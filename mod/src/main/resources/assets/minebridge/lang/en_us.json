@@ -61,5 +61,8 @@
   "screen.minebridge.progress.damage": "damage: %s",
   "screen.minebridge.progress.follow_ticks": "followed: %s ticks",
   "screen.minebridge.progress.crossbow_loads": "loaded: %s",
-  "screen.minebridge.progress.interactions": "interactions: %s"
+  "screen.minebridge.progress.interactions": "interactions: %s",
+  "screen.minebridge.action.inventory.swap": "Swap stacks",
+  "screen.minebridge.progress.inventory_swaps": "swaps: %s",
+  "screen.minebridge.progress.equips": "equipped: %s"
 }

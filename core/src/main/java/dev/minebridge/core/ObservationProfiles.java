@@ -24,7 +24,7 @@ public final class ObservationProfiles {
         if(source.has("context") && source.getAsJsonObject("context").has("menu_slots"))
             result.getAsJsonObject("context").add("menu_slots",slots(source.getAsJsonObject("context").getAsJsonArray("menu_slots"),4));
         result.addProperty("observation_profile","compact");
-        result.add("observation_limits",object("blocks",6,"entities",4,"empty_menu_slots",4,
+        result.add("observation_limits",object("blocks",6,"entities",4,"empty_menu_slots",4,"empty_equipment_slots","all observed",
                 "blocks_available",size(source,"blocks"),"entities_available",size(source,"entities"),"entity_selection","active target, living/item diversity, then distance; projectiles last","missing_data","unknown"));
         return result;
     }
@@ -61,15 +61,16 @@ public final class ObservationProfiles {
             JsonObject slot=item.getAsJsonObject();
             if(number(slot,"count",0)<=0) {
                 if(emptyLimit<=0)continue;
+                boolean equipment=Set.of("armor","offhand").contains(string(slot,"role",""));
                 if(slot.has("role") && !slot.get("role").isJsonNull()) {
                     String role=slot.get("role").isJsonPrimitive()&&slot.getAsJsonPrimitive("role").isString()
                             ?slot.get("role").getAsString():"";
-                    if(!Set.of("main","hotbar","container").contains(role))continue;
+                    if(!equipment && !Set.of("main","hotbar","container").contains(role))continue;
                 }
-                if(empty++>=emptyLimit)continue;
+                if(!equipment && empty++>=emptyLimit)continue;
             }
             JsonObject concise=object();
-            for(String field:List.of("slot","type","count","player_inventory","role","inventory_slot"))if(slot.has(field))concise.add(field,slot.get(field).deepCopy());
+            for(String field:List.of("slot","type","count","player_inventory","role","inventory_slot","equipment_slot"))if(slot.has(field))concise.add(field,slot.get(field).deepCopy());
             result.add(concise);
         }
         return result;

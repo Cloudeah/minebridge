@@ -36,6 +36,15 @@ final class MinecraftWorld implements WorldAccess {
     private long lastTick;
     private final CompletableFuture<RecipeCatalog> catalogFuture;
     private final Map<String,CompletableFuture<JsonObject>> confirmations=new HashMap<>();
+    private record SlotChange(int slot,ItemStack before,ItemStack after) {}
+    private record InventoryChange(int menu,List<SlotChange> slots,List<InventorySwapPlan.Click> clicks) {
+        boolean matches(AbstractContainerMenu current,boolean after) {
+            if(current.containerId!=menu || !current.getCarried().isEmpty())return false;
+            for(var change:slots)if(change.slot()>=current.slots.size() || !ItemStack.matches(current.getSlot(change.slot()).getItem(),after?change.after():change.before()))return false;
+            return true;
+        }
+    }
+    private final Map<String,InventoryChange> inventoryChanges=new HashMap<>();
     private final Map<String,List<Pathfinder.Cell>> routes=new HashMap<>();
     private final Map<String,JumpSequence> jumps=new HashMap<>();
     private final Map<String,CrouchSequence> crouches=new HashMap<>();
@@ -75,7 +84,7 @@ final class MinecraftWorld implements WorldAccess {
     @Override public long tick(){if(mc.level!=null)lastTick=mc.level.getGameTime();return lastTick;}
     @Override public boolean visionAvailable(){return mc.hasSingleplayerServer() && mc.getMainRenderTarget().getColorTexture() instanceof com.mojang.blaze3d.opengl.GlTexture && mc.getMainRenderTarget().getDepthTexture() instanceof com.mojang.blaze3d.opengl.GlTexture;}
     @Override public List<String> movementModes(){return mc.hasSingleplayerServer()?List.of("walk","sprint","jump","crouch"):List.of();}
-    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);crossbows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);interactions.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
+    @Override public void taskFinished(Task t){confirmations.remove(t.id);inventoryChanges.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);crossbows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);interactions.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
     @Override public void collectConfirmed(Task t) {
         updateCombatReceipt(t,combat.finish(t.id));
         updateInteractionReceipt(t,interactions.finish(t.id));
@@ -144,7 +153,7 @@ final class MinecraftWorld implements WorldAccess {
             case "item.pickup"->t.context.has("pickup_started");
             case "inventory.select"->t.context.has("selection_sent");
             case "inventory.select_item"->t.context.has("material_sent");
-            case "inventory.transfer", "inventory.equip"->t.context.has("transfer_sent");
+            case "inventory.transfer", "inventory.equip", "inventory.swap"->t.context.has("transfer_sent") || t.context.has("swap_sent");
             case "block.break"->t.context.has("breaking");
             case "block.place"->t.context.has("placing") || t.context.has("material_sent");
             case "world.interact", "container.open"->t.context.has("sent");
@@ -190,7 +199,7 @@ final class MinecraftWorld implements WorldAccess {
     @Override public Set<String> capabilities() {
         if(!mc.hasSingleplayerServer())return Set.of("inventory.inspect");
         return Set.of("move.to","move.follow","move.jump","move.relative","move.crouch","route.plan","look.at","look.turn","combat.attack","combat.ranged","item.use","item.drop","item.pickup","world.interact","block.break","block.place",
-                "inventory.inspect","inventory.select","inventory.select_item","inventory.transfer","inventory.equip","container.open","container.close","craft.plan","craft.execute","build.plan","build.execute");
+                "inventory.inspect","inventory.select","inventory.select_item","inventory.transfer","inventory.equip","inventory.swap","container.open","container.close","craft.plan","craft.execute","build.plan","build.execute");
     }
     @Override public void validate(String action,JsonObject p) {
         switch(action) {
@@ -213,7 +222,18 @@ final class MinecraftWorld implements WorldAccess {
             case "container.open", "world.interact"->{if(p.has("entity_id")==p.has("position"))throw new BridgeException("invalid_request","Choose position or entity_id");if(p.has("entity_id"))UUID.fromString(string(p,"entity_id"));else block(child(p,"position"));if(!Set.of("main","off").contains(string(p,"hand","main")))throw new BridgeException("invalid_request","hand must be main/off");}
             case "inventory.select"->integer(p,"slot",0,0,8);
             case "inventory.select_item"->{Identifier.parse(string(p,"item"));if(p.has("hotbar_slot"))integer(p,"hotbar_slot",0,0,8);}
-            case "inventory.transfer", "inventory.equip"->{integer(p,"from_slot",0,0,mc.player.containerMenu.slots.size()-1);integer(p,"to_slot",0,0,mc.player.containerMenu.slots.size()-1);if(p.has("count"))integer(p,"count",1,1,64);}
+            case "inventory.transfer", "inventory.equip", "inventory.swap"->{
+                if(!p.has("from_slot"))throw new BridgeException("invalid_request","from_slot is required");
+                integer(p,"from_slot",0,0,mc.player.containerMenu.slots.size()-1);
+                if(action.equals("inventory.equip") && p.has("equipment_slot")) {
+                    if(!Set.of("head","chest","legs","feet","offhand").contains(string(p,"equipment_slot")))throw new BridgeException("invalid_request","Unsupported equipment_slot");
+                    if(p.has("to_slot") || p.has("count"))throw new BridgeException("invalid_request","Named equipment exchanges a whole stack; omit to_slot/count");
+                } else {if(!p.has("to_slot"))throw new BridgeException("invalid_request","to_slot is required");integer(p,"to_slot",0,0,mc.player.containerMenu.slots.size()-1);}
+                if(action.equals("inventory.swap") && (p.has("count") || p.has("equipment_slot")))throw new BridgeException("invalid_request","swap exchanges whole stacks; omit count/equipment_slot");
+                if(p.has("count"))integer(p,"count",1,1,64);
+                if(p.has("menu_id"))integer(p,"menu_id",0,0,10000);
+                if(p.has("menu_revision"))integer(p,"menu_revision",0,0,Integer.MAX_VALUE);
+            }
             case "craft.execute"->{Identifier.parse(string(p,"item"));integer(p,"count",1,1,4096);}
             case "build.execute"->{var plan=new BuildPlanner().plan(p);for(var b:plan.blocks())checkArea(new Vec3(b.x()+0.5,b.y()+0.5,b.z()+0.5));}
             case "item.use"->{String hand=string(p,"hand","main");if(!hand.equals("main")&&!hand.equals("off"))throw new BridgeException("invalid_request","hand must be main/off");integer(p,"duration_ticks",40,1,1200);if(p.has("target"))point(child(p,"target"));}
@@ -234,6 +254,7 @@ final class MinecraftWorld implements WorldAccess {
     }
     private static <T extends Comparable<T>> String propertyValue(Property<T> p,BlockState state){return p.getName(state.getValue(p));}
     static JsonObject properties(BlockState state){JsonObject o=object();for(Property<?> p:state.getProperties())o.addProperty(p.getName(),propertyValue(p,state));return o;}
+    private static String equipmentSlot(int inventorySlot){return switch(inventorySlot){case 39->"head";case 38->"chest";case 37->"legs";case 36->"feet";case 40->"offhand";default->"";};}
     private String slotRole(Slot slot) {
         if(slot.container==mc.player.getInventory()) {int index=slot.getContainerSlot();return index<9?"hotbar":index<36?"main":index==40?"offhand":index<40?"armor":"player_special";}
         if(mc.player.containerMenu instanceof AbstractCraftingMenu crafting) {if(slot==crafting.getResultSlot())return "craft_output";if(crafting.getInputGridSlots().contains(slot))return "craft_grid";}
@@ -242,7 +263,7 @@ final class MinecraftWorld implements WorldAccess {
     @Override public JsonObject snapshot(int radius,boolean telemetry) {
         JsonArray inventory=new JsonArray();for(int i=0;i<mc.player.getInventory().getContainerSize();i++){JsonObject s=stack(mc.player.getInventory().getItem(i));s.addProperty("slot",i);inventory.add(s);}
         JsonArray menu=new JsonArray();for(Slot slot:mc.player.containerMenu.slots){JsonObject s=stack(slot.getItem());s.addProperty("slot",slot.index);s.addProperty("player_inventory",slot.container==mc.player.getInventory());s.addProperty("role",slotRole(slot));
-            if(slot.container==mc.player.getInventory())s.addProperty("inventory_slot",slot.getContainerSlot());menu.add(s);}
+            if(slot.container==mc.player.getInventory()){s.addProperty("inventory_slot",slot.getContainerSlot());String equipment=equipmentSlot(slot.getContainerSlot());if(!equipment.isEmpty())s.addProperty("equipment_slot",equipment);}menu.add(s);}
         JsonArray entities=new JsonArray();
         for(Entity e:mc.level.getEntities(mc.player,mc.player.getBoundingBox().inflate(radius),e->!e.isInvisibleTo(mc.player))) {
             boolean visible=visible(e);if(!telemetry && !visible)continue;
@@ -321,10 +342,13 @@ final class MinecraftWorld implements WorldAccess {
             var server=mc.getSingleplayerServer();if(server==null)throw new BridgeException("permission_denied","Actions require an integrated server");
             var dim=mc.level.dimension();UUID player=mc.player.getUUID();
             String usedItem=string(task.context,"use_item","minecraft:air"),craftedItem=string(task.context,"craft_item","minecraft:air");
+            InventoryChange inventoryChange=inventoryChanges.get(task.id);
             pending=server.submit(()->{
                 var level=server.getLevel(dim);var actor=server.getPlayerList().getPlayer(player);
                 if(level==null || actor==null)throw new BridgeException("disconnected","Actor unavailable");
                 JsonObject view=object("source","integrated_server","tick",level.getGameTime(),"health",actor.getHealth(),"menu_id",actor.containerMenu.containerId,"cursor",stack(actor.containerMenu.getCarried()));
+                view.addProperty("menu_revision",actor.containerMenu.getStateId());
+                if(inventoryChange!=null){view.addProperty("inventory_before_matches",inventoryChange.matches(actor.containerMenu,false));view.addProperty("inventory_after_matches",inventoryChange.matches(actor.containerMenu,true));}
                 view.add("position",vector(actor.position()));view.addProperty("on_ground",actor.onGround());
                 view.addProperty("crouching",actor.isCrouching());view.addProperty("sprinting",actor.isSprinting());
                 view.addProperty("yaw",actor.getYRot());view.addProperty("pitch",actor.getXRot());
@@ -396,7 +420,9 @@ final class MinecraftWorld implements WorldAccess {
                 yield Step.waiting(object("waiting","server_selection"));
             }
             case "inventory.select_item" -> selectItem(t,string(t.parameters,"item"),t.parameters.has("hotbar_slot")?integer(t.parameters,"hotbar_slot",0,0,8):-1);
-            case "inventory.transfer", "inventory.equip" -> transfer(t);
+            case "inventory.transfer" -> transfer(t);
+            case "inventory.equip" -> t.parameters.has("equipment_slot")?swap(t):transfer(t);
+            case "inventory.swap" -> swap(t);
             case "craft.execute" -> craft(t);
             case "build.execute" -> build(t);
             default -> throw new BridgeException("unsupported_capability",t.action);
@@ -884,34 +910,117 @@ final class MinecraftWorld implements WorldAccess {
         }
         t.context.remove("pickup_wait");return movement;
     }
-    private Step transfer(Task t) {
-        AbstractContainerMenu menu=mc.player.containerMenu;int from=integer(t.parameters,"from_slot",0,0,menu.slots.size()-1),to=integer(t.parameters,"to_slot",0,0,menu.slots.size()-1);
-        if(from==to)throw new BridgeException("invalid_request","Source and destination are identical");
+    private void inventoryGuards(Task t,boolean sent) {
+        var menu=mc.player.containerMenu;
         if(t.parameters.has("menu_id") && integer(t.parameters,"menu_id",0,0,10000)!=menu.containerId)throw new BridgeException("stale_revision","Menu changed");
-        if(t.parameters.has("menu_revision") && !t.context.has("transfer_sent") && integer(t.parameters,"menu_revision",0,0,Integer.MAX_VALUE)!=menu.getStateId())throw new BridgeException("stale_revision","Menu contents changed");
-        if(!t.context.has("transfer_sent")) {
-            if(!menu.getCarried().isEmpty())throw new BridgeException("cursor_occupied","Clear cursor before transferring");
-            Slot source=menu.getSlot(from),target=menu.getSlot(to);ItemStack src=source.getItem(),dst=target.getItem();
+        if(!sent && t.parameters.has("menu_revision") && integer(t.parameters,"menu_revision",0,0,Integer.MAX_VALUE)!=menu.getStateId())throw new BridgeException("stale_revision","Menu contents changed");
+        if(!sent && !menu.getCarried().isEmpty())throw new BridgeException("cursor_occupied","Clear cursor before changing inventory");
+        if(!sent && mc.player.isUsingItem())throw new BridgeException("busy","Stop using the held item before changing inventory");
+    }
+    private static boolean fits(Slot slot,ItemStack item) {return item.isEmpty() || slot.mayPlace(item) && item.getCount()<=slot.getMaxStackSize(item);}
+    private static void exchangeAllowed(Slot from,Slot to,net.minecraft.world.entity.player.Player player) {
+        if(!from.isActive() || !to.isActive() || !from.getItem().isEmpty() && !from.mayPickup(player) || !to.getItem().isEmpty() && !to.mayPickup(player))
+            throw new BridgeException("permission_denied","Slot cannot be changed; armor may be bound");
+        if(!from.getItem().isEmpty() && !to.mayPlace(from.getItem()) || !to.getItem().isEmpty() && !from.mayPlace(to.getItem()))
+            throw new BridgeException("invalid_target","Equipment or slot rejects the exchanged item");
+        if(!fits(to,from.getItem()) || !fits(from,to.getItem()))throw new BridgeException("inventory_full","Whole stack does not fit; split it with inventory.transfer first");
+    }
+    private Step swap(Task t) {
+        boolean sent=t.context.has("swap_sent");inventoryGuards(t,sent);
+        if(mc.player.containerMenu!=mc.player.inventoryMenu)return Step.failure("interface_open","Close the container before equipment or whole-stack exchanges",object());
+        var menu=mc.player.containerMenu;
+        InventoryChange change=inventoryChanges.get(t.id);
+        if(change==null) {
+            int from=integer(t.parameters,"from_slot",0,0,menu.slots.size()-1),to=-1;
+            if(t.parameters.has("equipment_slot")) {
+                String named=string(t.parameters,"equipment_slot");
+                for(Slot slot:menu.slots)if(slot.container==mc.player.getInventory() && equipmentSlot(slot.getContainerSlot()).equals(named)){to=slot.index;break;}
+                if(to<0)throw new BridgeException("unsupported_capability","Equipment slot is unavailable");
+                if(menu.getSlot(from).getItem().isEmpty())throw new BridgeException("missing_materials","Source contains no item to equip");
+            } else to=integer(t.parameters,"to_slot",0,0,menu.slots.size()-1);
+            if(from==to)throw new BridgeException("invalid_request","Choose two different menu slots");
+            Slot source=menu.getSlot(from),target=menu.getSlot(to);
+            if(source.container!=mc.player.getInventory() || target.container!=mc.player.getInventory())throw new BridgeException("unsupported_capability","Exchanges support main/hotbar/armor/offhand cells in the player menu");
+            if(!Set.of("main","hotbar","armor","offhand").contains(slotRole(source)) || !Set.of("main","hotbar","armor","offhand").contains(slotRole(target)))throw new BridgeException("unsupported_capability","Unsupported player inventory cells");
+            exchangeAllowed(source,target,mc.player);
+            ItemStack src=source.getItem().copy(),dst=target.getItem().copy();
+            List<InventorySwapPlan.Click> clicks=List.of();List<SlotChange> changes=new ArrayList<>();
+            changes.add(new SlotChange(from,src,dst));changes.add(new SlotChange(to,dst,src));
+            if(!ItemStack.matches(src,dst)) {
+                int staging=from,bufferInventory=-1;
+                if(!InventorySwapPlan.direct(source.getContainerSlot()) && !InventorySwapPlan.direct(target.getContainerSlot())) {
+                    Slot stage=slotRole(source).equals("main")?source:slotRole(target).equals("main")?target:null;
+                    if(stage==null)throw new BridgeException("unsupported_capability","Exchange needs a main inventory cell or a hotbar/offhand endpoint");
+                    staging=stage.index;
+                    Slot buffer=null;
+                    for(int pass=0;pass<2 && buffer==null;pass++)for(Slot slot:menu.slots) {
+                        if(slot.container!=mc.player.getInventory() || slot.getContainerSlot()<0 || slot.getContainerSlot()>8 || pass==0 && !slot.getItem().isEmpty())continue;
+                        if(slot.isActive() && slot.mayPickup(mc.player) && fits(stage,slot.getItem()) && fits(slot,src) && fits(slot,dst)){buffer=slot;break;}
+                    }
+                    if(buffer==null)throw new BridgeException("inventory_full","No suitable hotbar buffer");
+                    bufferInventory=buffer.getContainerSlot();ItemStack held=buffer.getItem().copy();changes.add(new SlotChange(buffer.index,held,held));
+                }
+                clicks=InventorySwapPlan.plan(from,to,source.getContainerSlot(),target.getContainerSlot(),staging,bufferInventory);
+                ActionBudget.require(t,clicks.size());
+            }
+            change=new InventoryChange(menu.containerId,List.copyOf(changes),clicks);inventoryChanges.put(t.id,change);
+        }
+        JsonObject view=serverView(t,null,null);if(view==null)return Step.waiting(object("stage",sent?"confirming_inventory_exchange":"checking_inventory_exchange"));
+        if(number(view,"menu_id",-1)!=change.menu())return Step.failure("interface_closed","Menu changed during exchange",object());
+        if(!sent) {
+            if(bool(view,"using_item",false))throw new BridgeException("busy","Server actor is using an item");
+            if(!bool(view,"inventory_before_matches",false) || !change.matches(menu,false))throw new BridgeException("stale_revision","Source, destination, buffer or cursor changed before exchange");
+            if(t.parameters.has("menu_revision") && number(view,"menu_revision",-1)!=number(t.parameters,"menu_revision",-2))throw new BridgeException("stale_revision","Server menu revision changed");
+            if(change.clicks().isEmpty())return Step.success(object("outcome","unchanged","source_slot",view.getAsJsonArray("slots").get(change.slots().get(0).slot()),"target_slot",view.getAsJsonArray("slots").get(change.slots().get(1).slot()),"source","integrated_server"));
+            ActionBudget.require(t,change.clicks().size());
+            for(var input:change.clicks())click(input.slot(),input.inventoryButton(),ContainerInput.SWAP);
+            t.actions+=change.clicks().size();t.context.addProperty("swap_sent",tick());return Step.waiting(object("stage","confirming_inventory_exchange"));
+        }
+        JsonArray slots=view.getAsJsonArray("slots");
+        JsonObject result=object("outcome","unconfirmed","menu_id",change.menu(),"source_slot",slots.get(change.slots().get(0).slot()),"target_slot",slots.get(change.slots().get(1).slot()),"cursor",view.get("cursor"),"tick",view.get("tick"),"source","integrated_server");
+        if(change.slots().size()==3)result.add("buffer_slot",slots.get(change.slots().get(2).slot()));
+        if(t.parameters.has("equipment_slot"))result.addProperty("equipment_slot",string(t.parameters,"equipment_slot"));
+        if(bool(view,"inventory_after_matches",false)) {
+            result.addProperty("outcome","exchanged");t.confirmed.addProperty("inventory_swaps",1);if(t.parameters.has("equipment_slot"))t.confirmed.addProperty("equips",1);
+            t.confirmed.add("inventory_swap",result);return Step.success(result);
+        }
+        if(tick()-number(t.context,"swap_sent",tick())>20)return Step.failure("swap_unconfirmed","Server stacks, components, cursor or restored buffer differ; exchange is not repeated",result);
+        return Step.waiting(result);
+    }
+    private Step transfer(Task t) {
+        boolean sent=t.context.has("transfer_sent");inventoryGuards(t,sent);
+        AbstractContainerMenu menu=mc.player.containerMenu;
+        InventoryChange change=inventoryChanges.get(t.id);
+        if(change==null) {
+            int from=integer(t.parameters,"from_slot",0,0,menu.slots.size()-1),to=integer(t.parameters,"to_slot",0,0,menu.slots.size()-1);
+            if(from==to)throw new BridgeException("invalid_request","Source and destination are identical");
+            Slot source=menu.getSlot(from),target=menu.getSlot(to);ItemStack src=source.getItem().copy(),dst=target.getItem().copy();
             int count=integer(t.parameters,"count",src.getCount(),1,64);
             if(src.isEmpty() || src.getCount()<count)throw new BridgeException("missing_materials","Source contains too few items");
             if(!source.mayPickup(mc.player)||!target.mayPlace(src))throw new BridgeException("permission_denied","Menu disallows this transfer");
             if(!dst.isEmpty()&&!ItemStack.isSameItemSameComponents(src,dst))throw new BridgeException("inventory_full","Destination contains another item");
             if(target.getMaxStackSize(src)-dst.getCount()<count)throw new BridgeException("inventory_full","Destination has insufficient capacity");
-            t.context.addProperty("source_before",src.getCount());t.context.addProperty("target_before",dst.getCount());t.context.addProperty("item",itemId(src));t.context.addProperty("count",count);t.context.addProperty("transfer_menu",menu.containerId);
-            int clicks=ActionBudget.transferClicks(src.getCount(),count);ActionBudget.require(t,clicks);
-            click(from,0,ContainerInput.PICKUP);
-            if(count==t.context.get("source_before").getAsInt())click(to,0,ContainerInput.PICKUP);
-            else {for(int i=0;i<count;i++)click(to,1,ContainerInput.PICKUP);click(from,0,ContainerInput.PICKUP);}
-            t.actions+=clicks;t.context.addProperty("transfer_sent",tick());
+            ActionBudget.require(t,ActionBudget.transferClicks(src.getCount(),count));
+            change=new InventoryChange(menu.containerId,List.of(new SlotChange(from,src,src.copyWithCount(src.getCount()-count)),new SlotChange(to,dst,src.copyWithCount(dst.getCount()+count))),List.of());
+            inventoryChanges.put(t.id,change);t.context.addProperty("count",count);
         }
-        JsonObject v=serverView(t,null,null);
-        if(v==null)return Step.waiting(object("waiting","server_transfer"));
-        if(v.get("menu_id").getAsInt()!=t.context.get("transfer_menu").getAsInt())return Step.failure("interface_closed","Menu changed during transfer",object("server",v));
-        JsonArray slots=v.getAsJsonArray("slots");int source=slots.get(from).getAsJsonObject().get("count").getAsInt(),target=slots.get(to).getAsJsonObject().get("count").getAsInt(),count=t.context.get("count").getAsInt();
-        int transferred=Math.max(0,t.context.get("source_before").getAsInt()-source);
-        JsonObject result=object("transferred",transferred,"remaining",Math.max(0,count-transferred),"source_slot",slots.get(from),"target_slot",slots.get(to),"cursor",v.get("cursor"));
-        if(source==t.context.get("source_before").getAsInt()-count && target==t.context.get("target_before").getAsInt()+count && child(v,"cursor").get("count").getAsInt()==0){t.confirmed.add("transfer",result);return Step.success(result);}
-        if(tick()-number(t.context,"transfer_sent",tick())>20)return Step.failure("transfer_unconfirmed","Observed slot counts differ",result);
+        JsonObject v=serverView(t,null,null);if(v==null)return Step.waiting(object("waiting","server_transfer"));
+        if(number(v,"menu_id",-1)!=change.menu())return Step.failure("interface_closed","Menu changed during transfer",object());
+        SlotChange from=change.slots().get(0),to=change.slots().get(1);int count=t.context.get("count").getAsInt();
+        if(!sent) {
+            if(!bool(v,"inventory_before_matches",false) || !change.matches(menu,false))throw new BridgeException("stale_revision","Source, destination or cursor changed before transfer");
+            if(bool(v,"using_item",false))throw new BridgeException("busy","Server actor is using an item");
+            if(t.parameters.has("menu_revision") && number(v,"menu_revision",-1)!=number(t.parameters,"menu_revision",-2))throw new BridgeException("stale_revision","Server menu revision changed");
+            int clicks=ActionBudget.transferClicks(from.before().getCount(),count);ActionBudget.require(t,clicks);
+            click(from.slot(),0,ContainerInput.PICKUP);
+            if(count==from.before().getCount())click(to.slot(),0,ContainerInput.PICKUP);
+            else {for(int i=0;i<count;i++)click(to.slot(),1,ContainerInput.PICKUP);click(from.slot(),0,ContainerInput.PICKUP);}
+            t.actions+=clicks;t.context.addProperty("transfer_sent",tick());return Step.waiting(object("waiting","server_transfer"));
+        }
+        JsonArray slots=v.getAsJsonArray("slots");
+        JsonObject result=object("transferred",0,"remaining",count,"source_slot",slots.get(from.slot()),"target_slot",slots.get(to.slot()),"cursor",v.get("cursor"),"source","integrated_server");
+        if(bool(v,"inventory_after_matches",false)){result.addProperty("transferred",count);result.addProperty("remaining",0);t.confirmed.addProperty("transfer_count",count);t.confirmed.add("transfer",result);return Step.success(result);}
+        if(tick()-number(t.context,"transfer_sent",tick())>20)return Step.failure("transfer_unconfirmed","Server stacks or components differ; no transfer count is claimed from counts alone",result);
         return Step.waiting(result);
     }
     private void click(int slot,int button,ContainerInput action){mc.gameMode.handleContainerInput(mc.player.containerMenu.containerId,slot,button,action,mc.player);}
@@ -1027,7 +1136,7 @@ final class MinecraftWorld implements WorldAccess {
                     JsonArray empty=new JsonArray();
                     for(JsonElement slot:child(observed,"context").getAsJsonArray("menu_slots")) {
                         JsonObject entry=slot.getAsJsonObject();
-                        if(string(entry,"type").equals(item))menu.add(slot);
+                        if(string(entry,"type").equals(item) || Set.of("armor","offhand").contains(string(entry,"role")))menu.add(slot);
                         else if(integer(entry,"count",0,0,Integer.MAX_VALUE)==0 && Set.of("main","hotbar","container").contains(string(entry,"role")) && empty.size()<4)empty.add(slot);
                     }
                     for(JsonElement slot:empty)menu.add(slot);

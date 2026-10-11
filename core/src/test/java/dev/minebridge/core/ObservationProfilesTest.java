@@ -33,12 +33,12 @@ class ObservationProfilesTest {
         menu.add(menuSlot(10,"armor",1,"minecraft:iron_helmet",39));
         JsonObject source=object("actor",object("position",object("x",0,"y",64,"z",0)),"context",object("menu_slots",menu));
         JsonArray compact=ObservationProfiles.apply(source,"compact").getAsJsonObject("context").getAsJsonArray("menu_slots");
-        assertEquals(5,compact.size());
-        int[] expectedSlots={5,6,7,8,10};String[] expectedRoles={"main","hotbar","container","main","armor"};
+        assertEquals(7,compact.size());
+        int[] expectedSlots={1,2,5,6,7,8,10};String[] expectedRoles={"armor","offhand","main","hotbar","container","main","armor"};
         for(int i=0;i<expectedSlots.length;i++){JsonObject slot=compact.get(i).getAsJsonObject();assertEquals(expectedSlots[i],slot.get("slot").getAsInt());assertEquals(expectedRoles[i],slot.get("role").getAsString());}
-        assertEquals(10,compact.get(0).getAsJsonObject().get("inventory_slot").getAsInt());assertEquals(3,compact.get(1).getAsJsonObject().get("inventory_slot").getAsInt());
-        assertFalse(compact.get(2).getAsJsonObject().has("inventory_slot"));assertEquals(11,compact.get(3).getAsJsonObject().get("inventory_slot").getAsInt());
-        assertEquals(39,compact.get(4).getAsJsonObject().get("inventory_slot").getAsInt());assertEquals(1,compact.get(4).getAsJsonObject().get("count").getAsInt());
+        assertEquals(10,compact.get(2).getAsJsonObject().get("inventory_slot").getAsInt());assertEquals(3,compact.get(3).getAsJsonObject().get("inventory_slot").getAsInt());
+        assertFalse(compact.get(4).getAsJsonObject().has("inventory_slot"));assertEquals(11,compact.get(5).getAsJsonObject().get("inventory_slot").getAsInt());
+        assertEquals(39,compact.get(6).getAsJsonObject().get("inventory_slot").getAsInt());assertEquals(1,compact.get(6).getAsJsonObject().get("count").getAsInt());
     }
     @Test void fullProfileDoesNotChangeExistingShape(){JsonObject source=object("actor",object("health",20));assertEquals(source,ObservationProfiles.apply(source,"full"));}
     @Test void CompactKeepsLivingTargetsAndAnItemDespiteNearbyProjectiles() {

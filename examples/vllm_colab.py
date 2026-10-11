@@ -35,7 +35,8 @@ ACTION_HELP = {
     "inventory.select": "slot:0..8 hotbar",
     "inventory.select_item": "item:namespace:id,hotbar_slot:0..8 optional; main inventory to hand",
     "inventory.transfer": "from_slot,to_slot,count,menu_id,menu_revision:current menu",
-    "inventory.equip": "from_slot,to_slot,count,menu_id,menu_revision:current menu",
+    "inventory.equip": "from_slot:observed menu slot,equipment_slot:head/chest/legs/feet/offhand; whole stack (armor max1), old gear returns to source; close container; needs 1 or 3 actions",
+    "inventory.swap": "from_slot,to_slot:observed player-menu slots; exchange whole stacks; close container; needs 1 or 3 actions",
     "craft.execute": "item:namespace:id,count:1..4096 total; 3x3 requires open crafting table",
     "build.execute": "origin:{x,y,z},rotation:0/90/180/270,replace:false,blocks:[{x,y,z,type,properties:{}}]",
 }
@@ -89,8 +90,20 @@ def compact_result(result):
         facts["verified_block_count"] = len(updates)
     data = result.get("result", {})
     if isinstance(data, dict):
-        if isinstance(facts, dict) and facts.get("interaction") == data:
-            facts.pop("interaction")  # Keep the identical proof once, alongside its counter.
+        if isinstance(facts, dict):
+            for proof in ("interaction", "inventory_swap", "transfer"):
+                if facts.get(proof) == data:
+                    facts.pop(proof)  # Keep the identical proof once, alongside its counter.
+        if result.get("operation") == "inventory.inspect" and isinstance(data.get("menu"), dict):
+            menu = data["menu"]
+            slots = menu.get("menu_slots", [])
+            fields = ("slot", "type", "count", "role", "inventory_slot", "equipment_slot")
+            # Keep filtered source cells visible; five equipment cells must not consume
+            # the general four-entry bound used for query results.
+            menu["equipment_slots"] = {slot["equipment_slot"]: {key: slot[key] for key in fields if key in slot}
+                                       for slot in slots if slot.get("equipment_slot")}
+            menu["menu_slots"] = [{key: slot[key] for key in fields if key in slot}
+                                  for slot in slots if not slot.get("equipment_slot")]
         data.pop("server", None)
         data.pop("finalInventory", None)
         if "path" in data:
@@ -148,8 +161,8 @@ def compact_snapshot(snapshot, block_limit=64, entity_limit=24, compact_menu=Fal
     context = snapshot.get("context", {})
     slots = context.get("menu_slots", [])
     if compact_menu:
-        empty_slots = [slot for slot in slots if not slot.get("count")][:4]
-        slots = [slot for slot in slots if slot.get("count") or slot in empty_slots]
+        empty_slots = [slot for slot in slots if not slot.get("count") and slot.get("role") not in ("armor", "offhand") and slot.get("role", "main") in ("main", "hotbar", "container")][:4]
+        slots = [slot for slot in slots if slot.get("count") or slot.get("role") in ("armor", "offhand") or slot in empty_slots]
     return {
         "actor_id": snapshot["actor_id"], "dimension": snapshot["dimension"],
         "revision": snapshot["revision"], "game_tick": snapshot["game_tick"],
@@ -157,9 +170,9 @@ def compact_snapshot(snapshot, block_limit=64, entity_limit=24, compact_menu=Fal
         "inventory": [{k: item[k] for k in ("slot", "type", "count")} for item in snapshot["inventory"] if item["count"]],
         "entities": select_entities(snapshot, entity_limit), "blocks": blocks,
         "context": {k: context.get(k) for k in ("menu_id", "menu_revision", "cursor")},
-        "menu_slots": [{k: slot[k] for k in ("slot", "type", "count", "player_inventory", "role", "inventory_slot") if k in slot} for slot in slots],
+        "menu_slots": [{k: slot[k] for k in ("slot", "type", "count", "player_inventory", "role", "inventory_slot", "equipment_slot") if k in slot} for slot in slots],
         "observation_limits": f"Only {block_limit} nearest observed blocks and {entity_limit} observed entities are included; active target and living/item diversity first, projectiles last. "
-                              + ("Menu includes occupied slots and at most four empty slots. " if compact_menu else "")
+                              + ("Menu includes occupied slots, empty armor/offhand cells, and at most four other usable empty slots. " if compact_menu else "")
                               + "Missing data is unknown.",
     }
 
@@ -203,6 +216,10 @@ def goal_progress(snapshot, history, initial_actor=None):
         interactions = facts.get("interactions", 0)
         if type(interactions) is int and interactions > 0:
             progress["confirmed_interactions"] = progress.get("confirmed_interactions", 0) + interactions
+        for key in ("inventory_swaps", "equips"):
+            value = facts.get(key, 0)
+            if type(value) is int and value > 0:
+                progress["confirmed_" + key] = progress.get("confirmed_" + key, 0) + value
         for key in ("shots", "hits", "damage"):
             value = facts.get(key, 0)
             if type(value) in (int, float) and value > 0:
@@ -343,6 +360,23 @@ def validate_item_parameters(action, parameters):
         distance = parameters.get("max_distance", 24)
         if type(distance) not in (int, float) or not 1 <= distance <= 32:
             raise ValueError("combat.ranged: max_distance must be 1..32")
+    if action in ("inventory.transfer", "inventory.swap", "inventory.equip"):
+        named = action == "inventory.equip" and "equipment_slot" in parameters
+        if named:
+            if parameters["equipment_slot"] not in ("head", "chest", "legs", "feet", "offhand") or any(key in parameters for key in ("to_slot", "count")):
+                raise ValueError("inventory.equip: choose head/chest/legs/feet/offhand and omit to_slot/count")
+        if action == "inventory.swap" and any(key in parameters for key in ("count", "equipment_slot")):
+            raise ValueError("inventory.swap: exchange whole stacks; omit count/equipment_slot")
+        for key in (("from_slot",) if named else ("from_slot", "to_slot")):
+            if type(parameters.get(key)) is not int or parameters[key] < 0:
+                raise ValueError(action + ": observed nonnegative menu slot required: " + key)
+        if not named and parameters["from_slot"] == parameters["to_slot"]:
+            raise ValueError(action + ": choose different slots")
+        for key in ("menu_id", "menu_revision"):
+            if key in parameters and (type(parameters[key]) is not int or parameters[key] < 0):
+                raise ValueError(action + ": nonnegative integer required: " + key)
+        if "count" in parameters and (type(parameters["count"]) is not int or not 1 <= parameters["count"] <= 64):
+            raise ValueError(action + ": count must be an integer from 1 to 64")
     if action == "inventory.select_item":
         item = parameters.get("item")
         if not isinstance(item, str) or not re.fullmatch(r"[a-z0-9_.-]+:[a-z0-9/._-]+", item):

@@ -61,5 +61,8 @@
   "screen.minebridge.progress.damage": "урон: %s",
   "screen.minebridge.progress.follow_ticks": "сопровождение: %s тиков",
   "screen.minebridge.progress.crossbow_loads": "заряжено: %s",
-  "screen.minebridge.progress.interactions": "взаимодействий: %s"
+  "screen.minebridge.progress.interactions": "взаимодействий: %s",
+  "screen.minebridge.action.inventory.swap": "Перестановка стопок",
+  "screen.minebridge.progress.inventory_swaps": "перестановок: %s",
+  "screen.minebridge.progress.equips": "экипировано: %s"
 }
