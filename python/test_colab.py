@@ -96,6 +96,17 @@ class RelayTest(unittest.TestCase):
 
 
 class DecisionTest(unittest.TestCase):
+    def test_companion_build_count_reaches_next_model_step(self):
+        result = {"action": "build.execute", "state": "succeeded", "result": {"blocks": 2, "placed": 2},
+                  "confirmed_changes": {"placed_blocks": 2}}
+        original = deepcopy(result)
+        payload = controller.model_payload("Continue exploring", snapshot(), ["build.execute"],
+                                           [{"result": result}], compact=True)
+        recent = json.loads(payload["messages"][1]["content"])["recent_results"]
+        self.assertEqual(recent[0]["result"]["blocks"], 2)
+        self.assertEqual(recent[0]["confirmed_changes"]["placed_blocks"], 2)
+        self.assertEqual(result, original)
+
     def test_compact_prompt_keeps_goal_totals_and_initial_view_when_recent_history_is_truncated(self):
         initial_actor = {"position": {"x": 0, "y": 64, "z": 0}, "yaw": 90, "pitch": 10, "health": 20}
         current = snapshot()
@@ -500,6 +511,23 @@ class VllmAdapterTest(unittest.TestCase):
     def tearDown(self):
         self.session.close()
         self.model.close()
+
+    def test_continuous_worker_passes_thirty_decisions_and_remains_interruptible(self):
+        relay = MagicMock()
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"job_id": "job", "payload": self.payload}
+        relay.get.side_effect = [response] * 32 + [KeyboardInterrupt()]
+        relay.post.return_value.status_code = 200
+        self.namespace.update(relay_session=relay, RELAY_URL="http://fixture")
+        infer = MagicMock(return_value={"action": "wait", "parameters": {}, "reason": "ready"})
+        self.namespace["infer_decision"] = infer
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            self.worker(0, stop_on_wait=False)
+        self.assertEqual(infer.call_count, 32)
+        self.assertEqual(relay.post.call_count, 32)
+        for invalid in (-1, 31, True, 1.5):
+            with self.assertRaises(ValueError):
+                self.worker(invalid)
 
     def test_large_inventory_is_reduced_before_generation_without_changing_goal_totals(self):
         state = snapshot()

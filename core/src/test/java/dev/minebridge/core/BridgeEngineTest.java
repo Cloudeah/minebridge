@@ -14,6 +14,8 @@ class BridgeEngineTest {
     static final class FakeWorld implements WorldAccess {
         Map<String,Set<String>> features=new HashMap<>();
         long tick;int steps,releases,queries;double health=20;boolean done,confirmationOnly;String dim="minecraft:overworld";JsonArray confirmedBlockUpdates=new JsonArray();JsonObject finalConfirmed=object();
+        String mode="existing_player";
+        public String actorMode(){return mode;}
         public String actorId(){return "player";} public String worldId(){return "world";} public String dimension(){return dim;} public long tick(){return tick;}
         public Set<String> capabilities(){return Set.of("move.to","block.break","inventory.inspect");}
         public Set<String> actionFeatures(String action){return features.getOrDefault(action,Set.of());}
@@ -37,6 +39,8 @@ class BridgeEngineTest {
     @Test void unauthenticatedCannotReadOrAct(){assertEquals("permission_denied",send("observe.snapshot","a",object()).get("code").getAsString());assertEquals(0,world.steps);}
     @Test void wrongTokenDoesNotAcquireSession(){assertEquals("permission_denied",send("session.authenticate","a",object("token","wrong")).get("code").getAsString());assertEquals("permission_denied",send("session.capabilities","b",object()).get("code").getAsString());}
     @Test void helloRejectsCompanion(){assertEquals("unsupported_capability",send("session.hello","a",object("actor_mode","companion")).get("code").getAsString());}
+    @Test void companionSessionCannotBeMistakenForTheOwnersPlayer(){world.mode="companion";assertEquals("unsupported_capability",send("session.hello","wrong",object("actor_mode","existing_player")).get("code").getAsString());assertEquals("companion",send("session.hello","right",object("actor_mode","companion")).get("actor_mode").getAsString());auth();JsonObject caps=engine.capabilities();assertEquals("companion",caps.get("actor_mode").getAsString());assertEquals("companion",child(caps,"profile").get("actor_mode").getAsString());assertEquals("companion",send("observe.snapshot","obs",object()).get("actor_mode").getAsString());}
+    @Test void survivalInterruptionCancelsTasksAndRejectsLateDecisionsWithoutDisarming(){auth();long epoch=send("observe.snapshot","before",object()).get("control_epoch").getAsLong();String task=submit("walk");int steps=world.steps;engine.actorInterrupt("eat");assertTrue(engine.armed());assertFalse(engine.hasPendingTasks());assertEquals("cancelled",send("task.status","result",object("task_id",task)).get("state").getAsString());assertEquals("stale_control",send("task.submit","late",object("action","move.to","parameters",object("target",object("x",1,"y",0,"z",0)),"expected_control_epoch",epoch)).get("code").getAsString());assertEquals(steps,world.steps);assertTrue(peer.messages.stream().anyMatch(m->string(m,"type").equals("actor.interrupted")));engine.ownerStop();assertFalse(engine.armed());}
     @Test void ownerMustArmBeforeMutation(){send("session.authenticate","auth",object("token",owner.token));assertEquals("permission_denied",send("move.to","a",object("target",object("x",0,"y",0,"z",0))).get("code").getAsString());}
     @Test void unsupportedIsRejectedBeforeAcceptance(){auth();assertEquals("unsupported_capability",send("fly.to","a",object()).get("code").getAsString());assertEquals(0,world.steps);}
     @Test void capabilitiesExposeOnlySupportedActionsAllowedByOwner(){

@@ -18,6 +18,11 @@ from test_colab import ROOT, DECISION, EXPRESSION_REPLY, FakeVllm, controller, n
 
 
 class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_companion_mode_and_owner_context_reach_the_model(self):
+        await self.integration(companion=True)
+
+    async def test_survival_reflex_discards_slow_reply_and_accepts_a_new_goal(self):
+        await self.integration(companion=True, cancel_first=True, survival_interrupt=True)
     async def test_bow_decisions_cross_notebook_relay_and_guarded_tasks_without_rewriting(self):
         await self.integration(ranged=True)
 
@@ -39,7 +44,7 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
     async def test_blueprint_reaches_notebook_relay_and_guarded_task_unchanged(self):
         await self.integration(placement=True, build=True)
 
-    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False, ranged=False, follow=False, crossbow=False, interaction=False, craft=False, placement=False, build=False):
+    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False, ranged=False, follow=False, crossbow=False, interaction=False, craft=False, placement=False, build=False, companion=False, survival_interrupt=False):
         submitted, observed_profiles, reports, queries = [], [], [], []
         terminal = asyncio.Event()
         holder = {}
@@ -101,6 +106,9 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
 
         def observation():
             state = {**snapshot(), "control_epoch": 7}
+            if companion:
+                state["actor_mode"] = "companion"
+                state["context"]["owner"] = {"entity_id": "human-owner", "position": {"x": 2, "y": 64, "z": 2}, "dimension": "minecraft:overworld", "same_dimension": True, "distance": 3}
             if ranged or follow:
                 state["actor"]["main_hand"] = {"type": "minecraft:crossbow" if crossbow else "minecraft:bow", "count": 1, "damage": 0}
                 if crossbow:state["actor"]["main_hand"]["crossbow"] = {"charged": False, "projectiles": []}
@@ -116,6 +124,7 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                 message = json.loads(raw)
                 operation, data = message["type"], message["data"]
                 if operation == "session.hello":
+                    self.assertEqual(data["actor_mode"], "companion" if companion else "existing_player")
                     value = {"session_id": "test-session"}
                 elif operation == "session.authenticate":
                     value = {"capabilities": capabilities}
@@ -188,6 +197,7 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                     "--relay-config", str(Path(directory) / "relay.json"), "--model-timeout", "5",
                     "--task-ticks", "600", "--max-actions", "17"])
                 args.compact_observations = True
+                args.companion = companion
                 actual_relay = controller.RelayServer
 
                 def create_relay(token, port):
@@ -212,7 +222,7 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                         if cancel_first:
                             self.assertTrue(await asyncio.to_thread(reached_model.wait, 3))
                             status["state"] = "cancelled"
-                            await holder["socket"].send(json.dumps({"type": "control.manual_override", "data": {}}))
+                            await holder["socket"].send(json.dumps({"type": "actor.interrupted" if survival_interrupt else "control.manual_override", "data": {}}))
                             async with asyncio.timeout(2):
                                 while holder["relay"].broker.pending is not None:
                                     await asyncio.sleep(.01)
@@ -231,6 +241,10 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                 user_content = payload["messages"][1]["content"]
                 user_content = user_content[-1]["text"] if isinstance(user_content, list) else user_content
                 self.assertEqual(json.loads(user_content)["task_limits"], {"timeout_ticks": 600, "max_actions": 17})
+                if companion:
+                    observation = json.loads(user_content)["observation"]
+                    self.assertEqual(observation["actor_mode"], "companion")
+                    self.assertEqual(observation["context"]["owner"]["entity_id"], "human-owner")
             self.assertEqual([item["model_goal_id"] for item in submitted], ["second"] if cancel_first else ["first", "second"])
             if query_first:
                 self.assertEqual(len(queries), 2)

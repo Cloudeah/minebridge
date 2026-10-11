@@ -25,6 +25,9 @@ public final class BridgeClient {
     private final KeyMapping arm=new KeyMapping("key.minebridge.arm",GLFW.GLFW_KEY_F8,category);
     private final KeyMapping stop=new KeyMapping("key.minebridge.stop",GLFW.GLFW_KEY_F9,category);
     private final KeyMapping panelKey=new KeyMapping("key.minebridge.panel",GLFW.GLFW_KEY_F7,category);
+    private final KeyMapping companionKey=new KeyMapping("key.minebridge.companion",GLFW.GLFW_KEY_F6,category);
+    private boolean companionSelected;
+    private boolean companionSeen;
     private ModelScreen panel;
     private BridgeEngine engine;
     private BridgeSocket socket;
@@ -84,7 +87,14 @@ public final class BridgeClient {
     private void damage(net.neoforged.neoforge.event.entity.living.LivingDamageEvent.Post event){
         MinecraftWorld activeWorld=world;if(activeWorld!=null)activeWorld.recordDamage(event);
     }
-    private void keys(RegisterKeyMappingsEvent event){event.registerCategory(category);event.register(arm);event.register(stop);event.register(panelKey);}
+    private void keys(RegisterKeyMappingsEvent event){event.registerCategory(category);event.register(arm);event.register(stop);event.register(panelKey);event.register(companionKey);}
+    private void stopBoth(){if(engine!=null)engine.ownerStop();if(mc!=null&&mc.player!=null)CompanionManager.INSTANCE.controls(mc.player.getUUID()).ownerStop();}
+    private OwnerControls selectedControls(){OwnerControls selected=companionSelected?CompanionManager.INSTANCE.controls(mc.player.getUUID()):engine;return new OwnerControls(){
+        public boolean armed(){return selected.armed();}public com.google.gson.JsonObject modelStatus(){return selected.modelStatus();}public String actorMode(){return selected.actorMode();}public boolean visionAvailable(){return selected.visionAvailable();}
+        public void ownerArm(){selected.ownerArm();}public void ownerStop(){stopBoth();}public void ownerModelStart(String goal,int steps,boolean vision){selected.ownerModelStart(goal,steps,vision);}
+    };}
+    private void goals(net.minecraft.client.gui.screens.Screen previous){panel=new ModelScreen(selectedControls(),arm,stop,panelKey);panel.openFrom(previous);}
+    private void companionPanel(){if(!mc.hasSingleplayerServer()){message("Компаньон доступен в одиночном мире.");return;}mc.setScreen(new CompanionScreen(mc.player.getUUID(),()->companionSelected,value->{companionSelected=value;panel=null;},this::stopBoth,()->selectedControls().ownerArm(),arm,stop,companionKey));}
     private void tick(ClientTickEvent.Post event) {
         if(mc==null)mc=Minecraft.getInstance();
         if(mc==null)return;
@@ -93,17 +103,20 @@ public final class BridgeClient {
         if(identity!=null && !identity.equals(current)) {close();failed=false;}
         if(engine==null && !failed) open(current);
         if(engine==null) return;
+        boolean companionExists=CompanionManager.INSTANCE.status().get("exists").getAsBoolean();
+        if(companionExists&&!companionSeen){companionSelected=true;panel=null;}companionSeen=companionExists;
         boolean stopRequested=false;
         while(stop.consumeClick())stopRequested=true;
-        if(stopRequested){engine.ownerStop();message("AI Bridge: управление остановлено");}
+        if(stopRequested){stopBoth();message("AI Bridge: управление остановлено");}
         while(arm.consumeClick()) {
             if(stopRequested)continue;
             if(!mc.hasSingleplayerServer() && !policy.allowMultiplayer){message("AI Bridge: разрешена только одиночная игра");continue;}
-            engine.ownerArm();message("AI Bridge: управление разрешено; F9 — остановка");
+            selectedControls().ownerArm();message("AI Bridge: управление разрешено; F9 — остановка");
         }
-        while(panelKey.consumeClick()){if(panel==null)panel=new ModelScreen(engine,arm,stop,panelKey);if(mc.screen==panel)panel.onClose();else panel.openFrom(mc.screen);}
+        while(companionKey.consumeClick())companionPanel();
+        while(panelKey.consumeClick()){if(mc.screen instanceof ModelScreen shown)shown.onClose();else goals(mc.screen);}
         if(mc.isPaused()) {engine.manualInput();return;}
-        boolean panelOpen=mc.screen instanceof ModelScreen;
+        boolean panelOpen=mc.screen instanceof ModelScreen||mc.screen instanceof CompanionScreen;
         // GLFW recentres the cursor when the owner panel changes mouse capture.
         // Discard those transition samples; actual key/button presses and F9 still interrupt.
         if(panelOpen!=panelWasOpen)lookResetTicks=4;
@@ -133,22 +146,21 @@ public final class BridgeClient {
             Files.writeString(auditFile,e+"\n",StandardOpenOption.CREATE,StandardOpenOption.APPEND);
         } catch(IOException error){LOG.warn("AI Bridge audit persistence failed: {}",error.getClass().getSimpleName());}
     }
-    private void keyInput(InputEvent.Key event){if(engine!=null && !(mc.screen instanceof ModelScreen) && event.getAction()==GLFW.GLFW_PRESS && event.getKey()!=arm.getKey().getValue() && event.getKey()!=stop.getKey().getValue() && event.getKey()!=panelKey.getKey().getValue())engine.manualInput();}
+    private void keyInput(InputEvent.Key event){if(engine!=null && !(mc.screen instanceof ModelScreen) && !(mc.screen instanceof CompanionScreen) && event.getAction()==GLFW.GLFW_PRESS && event.getKey()!=arm.getKey().getValue() && event.getKey()!=stop.getKey().getValue() && event.getKey()!=panelKey.getKey().getValue() && event.getKey()!=companionKey.getKey().getValue())engine.manualInput();}
     private void screenKeyInput(ScreenEvent.KeyPressed.Pre event) {
-        if(engine==null || mc.player==null || event.getScreen() instanceof ModelScreen)return;
+        if(engine==null || mc.player==null || event.getScreen() instanceof ModelScreen || event.getScreen() instanceof CompanionScreen)return;
         int key=event.getKeyCode();
-        if(key==stop.getKey().getValue()){engine.ownerStop();message("AI Bridge: управление остановлено");event.setCanceled(true);}
+        if(key==stop.getKey().getValue()){stopBoth();message("AI Bridge: управление остановлено");event.setCanceled(true);}
         else if(key==arm.getKey().getValue()){
-            if(mc.hasSingleplayerServer() || policy.allowMultiplayer){engine.ownerArm();message("AI Bridge: управление разрешено; F9 — остановка");}
+            if(mc.hasSingleplayerServer() || policy.allowMultiplayer){selectedControls().ownerArm();message("AI Bridge: управление разрешено; F9 — остановка");}
             event.setCanceled(true);
         } else if(key==panelKey.getKey().getValue()){
-            if(panel==null)panel=new ModelScreen(engine,arm,stop,panelKey);
-            panel.openFrom(event.getScreen());event.setCanceled(true);
-        }
+            goals(event.getScreen());event.setCanceled(true);
+        } else if(key==companionKey.getKey().getValue()){companionPanel();event.setCanceled(true);}
     }
-    private void mouseInput(InputEvent.MouseButton.Pre event){if(engine!=null && !(mc.screen instanceof ModelScreen) && event.getAction()==GLFW.GLFW_PRESS)engine.manualInput();}
+    private void mouseInput(InputEvent.MouseButton.Pre event){if(engine!=null && !(mc.screen instanceof ModelScreen) && !(mc.screen instanceof CompanionScreen) && event.getAction()==GLFW.GLFW_PRESS)engine.manualInput();}
     private void extract(ExtractLevelRenderStateEvent event){if(vision!=null)vision.extract(event);}
     private void render(RenderLevelStageEvent.AfterLevel event){if(vision!=null)vision.capture(event);}
     private void message(String text){if(mc.player!=null)mc.player.sendSystemMessage(Component.literal(text));}
-    private void close(){if(mc!=null && mc.screen instanceof ModelScreen)mc.setScreen(null);panel=null;if(vision!=null)vision.close();if(engine!=null)engine.close();if(socket!=null)socket.close();engine=null;socket=null;world=null;vision=null;identity=null;haveLook=false;panelWasOpen=false;lookResetTicks=0;}
+    private void close(){if(mc!=null && (mc.screen instanceof ModelScreen||mc.screen instanceof CompanionScreen))mc.setScreen(null);panel=null;if(vision!=null)vision.close();if(engine!=null)engine.close();if(socket!=null)socket.close();engine=null;socket=null;world=null;vision=null;identity=null;haveLook=false;panelWasOpen=false;lookResetTicks=0;companionSeen=false;companionSelected=false;}
 }

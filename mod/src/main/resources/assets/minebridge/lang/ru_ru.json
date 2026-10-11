@@ -66,5 +66,18 @@
   "screen.minebridge.progress.inventory_swaps": "перестановок: %s",
   "screen.minebridge.progress.equips": "экипировано: %s",
   "screen.minebridge.progress.placed_blocks": "поставлено: %s",
-  "screen.minebridge.progress.matched_blocks": "совпало: %s"
+  "screen.minebridge.progress.matched_blocks": "совпало: %s",
+  "key.minebridge.companion": "Окно компаньона",
+  "screen.minebridge.companion": "MineBridge · компаньон",
+  "screen.minebridge.companion_goals": "MineBridge · цели компаньона",
+  "screen.minebridge.companion_name": "Имя компаньона",
+  "screen.minebridge.companion_create": "Создать компаньона",
+  "screen.minebridge.companion_hide": "Убрать и сохранить",
+  "screen.minebridge.companion_show": "Вернуть в мир",
+  "screen.minebridge.companion_respawn": "Возродить после смерти",
+  "screen.minebridge.companion_auto_on": "Без цели: исследовать и выживать · ВКЛ",
+  "screen.minebridge.companion_auto_off": "Без цели: исследовать и выживать · ВЫКЛ",
+  "screen.minebridge.companion_target": "F7 / F8 управляют: компаньоном",
+  "screen.minebridge.player_target": "F7 / F8 управляют: твоим игроком",
+  "screen.minebridge.companion_status": "%s · HP %s · еда %s · разрешение %s"
 }

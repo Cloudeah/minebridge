@@ -13,7 +13,7 @@ import java.util.function.Consumer;
 import static dev.minebridge.core.Json.*;
 
 /** Single game-thread executor. Network callbacks enqueue immutable messages only. */
-public final class BridgeEngine {
+public final class BridgeEngine implements OwnerControls {
     public static final String VERSION="1.0";
     public static final long DEDUP_MS=600_000;
     public interface Peer {
@@ -85,6 +85,11 @@ public final class BridgeEngine {
         if(tasks.values().stream().anyMatch(t->!t.terminal()))throw new BridgeException("busy","Сначала останови текущие задачи клавишей F9.");
         model.start(goal,steps,vision);controlEpoch++;event("model.updated",modelStatus());
     }
+    @Override public String actorMode(){return world.actorMode();}
+    @Override public boolean visionAvailable(){return world.visionAvailable();}
+    public boolean hasPendingTasks(){return tasks.values().stream().anyMatch(t->!t.terminal());}
+    /** Server-side survival reflexes interrupt plans while retaining the owner's permission. */
+    public void actorInterrupt(String reason){controlEpoch++;model.cancel(reason);stopAll("actor_interrupt");event("actor.interrupted",object("reason",reason));}
     public void manualInput() {
         if (active!=null) { transition(active,Task.State.paused); world.releaseControls(); active=null; }
         if(armed && (world.tick()!=lastManualTick || controlEpoch!=lastManualEpoch)){lastManualTick=world.tick();controlEpoch++;lastManualEpoch=controlEpoch;model.cancel("Ручной ввод: цель остановлена.");event("control.manual_override",object());}
@@ -119,7 +124,7 @@ public final class BridgeEngine {
     public JsonObject snapshot() {
         JsonObject s=observation.deepCopy();
         s.addProperty("observation_id",id()); s.addProperty("world_id",world.worldId()); s.addProperty("dimension",world.dimension());
-        s.addProperty("actor_id",world.actorId()); s.addProperty("game_tick",lastObservation); s.addProperty("capture_time",observationTime); s.addProperty("age_ms",System.currentTimeMillis()-observationTime); s.addProperty("revision",revision);
+        s.addProperty("actor_id",world.actorId());s.addProperty("actor_mode",world.actorMode()); s.addProperty("game_tick",lastObservation); s.addProperty("capture_time",observationTime); s.addProperty("age_ms",System.currentTimeMillis()-observationTime); s.addProperty("revision",revision);
         s.addProperty("control_epoch",controlEpoch);
         s.add("active_task",active==null ? JsonNull.INSTANCE : active.json()); return s;
     }
@@ -155,8 +160,8 @@ public final class BridgeEngine {
             string(m,"message_id"); String type=string(m,"type"); request=string(m,"request_id"); JsonObject data=child(m,"data");
             if(type.equals("session.hello")) {
                 String mode=string(data,"actor_mode","existing_player");
-                if(!mode.equals("existing_player")) throw new BridgeException("unsupported_capability","Only existing_player is implemented");
-                peer.text(envelope("response",request,object("status","hello","session_id",sessionId,"authentication_required",true,"actor_mode","existing_player"))); return;
+                if(!mode.equals(world.actorMode())) throw new BridgeException("unsupported_capability","This endpoint controls "+world.actorMode());
+                peer.text(envelope("response",request,object("status","hello","session_id",sessionId,"authentication_required",true,"actor_mode",world.actorMode()))); return;
             }
             if(!sessionId.equals(string(m,"session_id"))) throw new BridgeException("session_mismatch","Perform session.hello; do not reuse commands across worlds");
             if(type.equals("session.authenticate")) {
@@ -380,7 +385,9 @@ public final class BridgeEngine {
         Set<String> actions=new TreeSet<>(world.capabilities());
         if(!policy.allowedActions.isEmpty())actions.retainAll(policy.allowedActions);
         JsonObject features=object();for(String action:actions){Set<String> supported=world.actionFeatures(action);if(!supported.isEmpty())features.add(action,GSON.toJsonTree(new TreeSet<>(supported)));}
-        return object("actions",actions,"action_features",features,"queries",availableQueries(),"vision",world.visionAvailable(),"formats",List.of("MBV1/png/float32-le"),"actor_id",world.actorId(),"profile",policy.publicProfile(),"armed",armed,
+        JsonObject profile=policy.publicProfile();profile.addProperty("actor_mode",world.actorMode());
+        if(world.actorMode().equals("companion"))profile.addProperty("manual_input","owner_input_independent");
+        return object("actions",actions,"action_features",features,"queries",availableQueries(),"vision",world.visionAvailable(),"formats",List.of("MBV1/png/float32-le"),"actor_id",world.actorId(),"actor_mode",world.actorMode(),"profile",profile,"armed",armed,
                 "deduplication_window_ms",DEDUP_MS,"deduplication_capacity",4096,"event_history",512,"max_tasks",256,"vision_max_fps",5,"vision_max_resolution",List.of(640,360),"movement_modes",world.movementModes(),
                 "observation_profiles",ObservationProfiles.NAMES,"decision_guards",List.of("control_epoch","model_goal_id"),"model_control",true);
     }
@@ -395,7 +402,7 @@ public final class BridgeEngine {
     public void event(String type,JsonObject data) {
         JsonObject e=envelope(type,null,data); e.addProperty("event_id",id());e.addProperty("sequence",++sequence);e.addProperty("game_tick",world.tick());e.addProperty("revision",revision);
         journal.addLast(e);while(journal.size()>512) journal.removeFirst();audit.accept(e.deepCopy());
-        if(controller!=null && (eventSubscription || type.startsWith("task.") || type.startsWith("control.") || type.equals("model.updated") || type.equals("vision.error") || type.equals("actor.health") || type.equals("actor.death"))) controller.text(e);
+        if(controller!=null && (eventSubscription || type.startsWith("task.") || type.startsWith("control.") || type.equals("model.updated") || type.equals("vision.error") || type.equals("actor.health") || type.equals("actor.death") || type.equals("actor.interrupted"))) controller.text(e);
     }
     private JsonObject replay(JsonObject d) {
         long after=(long)number(d,"after_sequence",0);

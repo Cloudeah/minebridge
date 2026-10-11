@@ -66,5 +66,18 @@
   "screen.minebridge.progress.inventory_swaps": "swaps: %s",
   "screen.minebridge.progress.equips": "equipped: %s",
   "screen.minebridge.progress.placed_blocks": "placed: %s",
-  "screen.minebridge.progress.matched_blocks": "matched: %s"
+  "screen.minebridge.progress.matched_blocks": "matched: %s",
+  "key.minebridge.companion": "Companion controls",
+  "screen.minebridge.companion": "MineBridge · companion",
+  "screen.minebridge.companion_goals": "MineBridge · companion goals",
+  "screen.minebridge.companion_name": "Companion name",
+  "screen.minebridge.companion_create": "Create companion",
+  "screen.minebridge.companion_hide": "Hide and save",
+  "screen.minebridge.companion_show": "Return to world",
+  "screen.minebridge.companion_respawn": "Respawn after death",
+  "screen.minebridge.companion_auto_on": "Without a goal: explore and survive · ON",
+  "screen.minebridge.companion_auto_off": "Without a goal: explore and survive · OFF",
+  "screen.minebridge.companion_target": "F7 / F8 control: companion",
+  "screen.minebridge.player_target": "F7 / F8 control: your player",
+  "screen.minebridge.companion_status": "%s · HP %s · food %s · permission %s"
 }

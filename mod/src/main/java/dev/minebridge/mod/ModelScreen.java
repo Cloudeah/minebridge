@@ -1,7 +1,7 @@
 package dev.minebridge.mod;
 
 import com.google.gson.JsonObject;
-import dev.minebridge.core.BridgeEngine;
+import dev.minebridge.core.OwnerControls;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.*;
@@ -11,7 +11,7 @@ import net.minecraft.network.chat.Component;
 
 /** Local owner controls; networking and model inference stay off the Minecraft thread. */
 final class ModelScreen extends Screen {
-    private final BridgeEngine engine;
+    private final OwnerControls engine;
     private final KeyMapping armKey,stopKey,panelKey;
     private Screen returnScreen;
     private int returnMenu;
@@ -21,7 +21,7 @@ final class ModelScreen extends Screen {
     private String draft="",stepDraft="8",error="";
     private boolean visionDraft;
     private int left,top,panelWidth;
-    ModelScreen(BridgeEngine engine,KeyMapping armKey,KeyMapping stopKey,KeyMapping panelKey){super(Component.translatable("screen.minebridge.title"));this.engine=engine;this.armKey=armKey;this.stopKey=stopKey;this.panelKey=panelKey;
+    ModelScreen(OwnerControls engine,KeyMapping armKey,KeyMapping stopKey,KeyMapping panelKey){super(Component.translatable(engine.actorMode().equals("companion")?"screen.minebridge.companion_goals":"screen.minebridge.title"));this.engine=engine;this.armKey=armKey;this.stopKey=stopKey;this.panelKey=panelKey;
         JsonObject status=engine.modelStatus();
         if(status.has("goal"))draft=status.get("goal").getAsString();
         if(status.has("steps"))stepDraft=status.get("steps").getAsString();
@@ -34,7 +34,7 @@ final class ModelScreen extends Screen {
         steps=addRenderableWidget(new EditBox(font,left+58,top+66,40,20,Component.translatable("screen.minebridge.steps")));
         steps.setMaxLength(2);steps.setValue(stepDraft);steps.setResponder(value->stepDraft=value);
         vision=addRenderableWidget(Checkbox.builder(Component.translatable("screen.minebridge.vision"),font).pos(left+114,top+66)
-                .selected(visionDraft).onValueChange((box,value)->visionDraft=value).build());
+                .selected(visionDraft&&engine.visionAvailable()).onValueChange((box,value)->visionDraft=value).build());vision.active=engine.visionAvailable();
         int half=(panelWidth-8)/2;
         start=addRenderableWidget(Button.builder(Component.translatable("screen.minebridge.start"),button->startGoal()).bounds(left,top+96,half,20).build());
         addRenderableWidget(Button.builder(Component.translatable("screen.minebridge.stop"),button->{engine.ownerStop();error="";}).bounds(left+half+8,top+96,half,20).build());
@@ -51,7 +51,7 @@ final class ModelScreen extends Screen {
     }
     @Override public void tick() {
         String state=engine.modelStatus().get("state").getAsString();
-        start.active=engine.armed() && !java.util.Set.of("queued","thinking","executing").contains(state);
+        start.active=engine.armed() && (engine.actorMode().equals("companion") || !java.util.Set.of("queued","thinking","executing").contains(state));
     }
     @Override public boolean isPauseScreen(){return false;}
     void openFrom(Screen previous) {

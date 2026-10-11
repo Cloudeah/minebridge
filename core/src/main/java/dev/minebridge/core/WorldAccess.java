@@ -7,6 +7,7 @@ import java.util.List;
 /** All methods are called on the game thread. An action may only report success after observation. */
 public interface WorldAccess {
     String actorId();
+    default String actorMode(){return "existing_player";}
     String worldId();
     String dimension();
     long tick();

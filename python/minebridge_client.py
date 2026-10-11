@@ -40,8 +40,11 @@ def decode_frame(packet: bytes):
 
 
 class BridgeClient:
-    def __init__(self, token: str, url="ws://127.0.0.1:8765/bridge"):
+    def __init__(self, token: str, url="ws://127.0.0.1:8765/bridge", *, actor_mode="existing_player"):
+        if actor_mode not in ("existing_player", "companion"):
+            raise ValueError("actor_mode must be existing_player or companion")
         self.token, self.url = token, url
+        self.actor_mode = actor_mode
         self.session_id = None
         self.actor_id = None
         self.last_sequence = 0
@@ -51,9 +54,12 @@ class BridgeClient:
         self._socket = self._reader = None
 
     @classmethod
-    def from_owner_file(cls, filename, url=None):
+    def from_owner_file(cls, filename, url=None, *, actor_mode="existing_player"):
         config = json.loads(Path(filename).read_text())
-        return cls(config["token"], url or f'ws://127.0.0.1:{config["port"]}/bridge')
+        port = config["port"] + (2 if actor_mode == "companion" else 0)
+        if not url and not 1024 <= port <= 65535:
+            raise ValueError("Companion requires a free port: owner port + 2 (<=65535)")
+        return cls(config["token"], url or f'ws://127.0.0.1:{port}/bridge', actor_mode=actor_mode)
 
     async def __aenter__(self):
         await self.open()
@@ -66,7 +72,7 @@ class BridgeClient:
         previous = self.session_id
         self._socket = await connect(self.url, max_size=8 * 1024 * 1024, proxy=None)
         self._reader = asyncio.create_task(self._read())
-        hello = await self.request("session.hello", {"actor_mode": "existing_player"})
+        hello = await self.request("session.hello", {"actor_mode": self.actor_mode})
         self.session_id = hello["session_id"]
         auth = await self.request("session.authenticate", {"token": self.token})
         self.actor_id = auth["capabilities"]["actor_id"]

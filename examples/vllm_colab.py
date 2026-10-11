@@ -116,11 +116,11 @@ def compact_result(result):
                                   for slot in slots if not slot.get("equipment_slot")]
         data.pop("server", None)
         data.pop("finalInventory", None)
-        if "path" in data:
+        if isinstance(data.get("path"), list):
             path = data["path"]
             data["path_cells"] = len(path)
             data["destination"] = path[-1] if path else None
-        if "blocks" in data:
+        if isinstance(data.get("blocks"), list):
             data["block_count"] = len(data["blocks"])
     # A placement's primary cell is already described by position/before/after.
     # Keep other affected cells and their count without copying that state twice.
@@ -195,7 +195,8 @@ def compact_snapshot(snapshot, block_limit=64, entity_limit=24, compact_menu=Fal
         "actor": actor,
         "inventory": [{k: item[k] for k in ("slot", "type", "count")} for item in snapshot["inventory"] if item["count"]],
         "entities": select_entities(snapshot, entity_limit), "blocks": blocks,
-        "context": {k: context.get(k) for k in ("menu_id", "menu_revision", "cursor")},
+        "context": {k: context.get(k) for k in ("menu_id", "menu_revision", "cursor", "owner", "reflex", "last_task") if k in context},
+        "actor_mode": snapshot.get("actor_mode", "existing_player"),
         "menu_slots": [{k: slot[k] for k in ("slot", "type", "count", "player_inventory", "role", "inventory_slot", "equipment_slot") if k in slot} for slot in slots],
         "observation_limits": f"Only {block_limit} nearest observed blocks and {entity_limit} observed entities are included; active target and living/item diversity first, projectiles last. "
                               + ("Menu includes occupied slots, empty armor/offhand cells, and at most four other usable empty slots. " if compact_menu else "")
@@ -308,11 +309,13 @@ def model_payload(goal, snapshot, allowed, history, png=None, compact=False, tas
         "task_limits bound each action: 20 ticks/second, ~20 ticks/jump plus margin; split long series. "
         "goal_progress contains confirmed totals and initial position/view: avoid repeated work and "
         "interpret goal directions from that initial view after the camera turns. Never repeat failed changes blindly. "
-        "A requested single shot is complete when confirmed_shots reaches one; this alone proves no hit or kill. "
-        "Query before crafting/building or searching remembered resources. A query changes no blocks/items. "
+        + ("A requested single shot is complete when confirmed_shots reaches one; this alone proves no hit or kill. " if "combat.ranged" in allowed else "")
+        + "Query before crafting/building or searching remembered resources. A query changes no blocks/items. "
         "Parameters: " + json.dumps(actions, ensure_ascii=False, separators=(",", ":") if compact else None)
         + (" Queries: " + json.dumps(query_help, separators=(",", ":")) if "query" in allowed else "")
     )
+    if snapshot.get("actor_mode") == "companion":
+        system += " Companion: context.owner=human, range 64 blocks. item.use=consumables only; no ranged/PNG. Check context.last_task before retrying."
     observation = compact_snapshot(snapshot, 6, 4, True) if compact else compact_snapshot(snapshot)
     if compact:
         observation["actor"].pop("velocity", None)
@@ -537,7 +540,7 @@ def decision_context(snapshot, current):
 
 
 async def run_interactive(args):
-    bridge = BridgeClient.from_owner_file(args.config, args.url)
+    bridge = BridgeClient.from_owner_file(args.config, args.url, actor_mode="companion" if getattr(args, "companion", False) else "existing_player")
     relay_config = load_relay_config(args.relay_config)
     relay = RelayServer(relay_config["token"], args.relay_port)
     relay.start()
@@ -559,7 +562,7 @@ async def run_interactive(args):
         async def consume_events():
             while True:
                 event = await bridge.events.get()
-                if event["type"] in ("control.stopped", "control.manual_override", "actor.death"):
+                if event["type"] in ("control.stopped", "control.manual_override", "actor.death", "actor.interrupted"):
                     stopped.set()
                     relay.broker.cancel_pending()
 
@@ -654,7 +657,7 @@ async def run_interactive(args):
 async def run(args):
     if args.interactive:
         return await run_interactive(args)
-    bridge = BridgeClient.from_owner_file(args.config, args.url)
+    bridge = BridgeClient.from_owner_file(args.config, args.url, actor_mode="companion" if getattr(args, "companion", False) else "existing_player")
     relay_config = load_relay_config(args.relay_config)
     relay = RelayServer(relay_config["token"], args.relay_port)
     relay.start()
@@ -739,6 +742,7 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", required=True, help="Minecraft config/minebridge/bridge-owner.json")
     p.add_argument("--url", default=None, help="Override loopback bridge WebSocket URL")
+    p.add_argument("--companion", action="store_true", help="Control the world companion (owner port + 2) instead of your player")
     p.add_argument("--relay-config", default=".minebridge-colab.json")
     p.add_argument("--relay-port", type=int, default=8766)
     mode = p.add_mutually_exclusive_group(required=True)
