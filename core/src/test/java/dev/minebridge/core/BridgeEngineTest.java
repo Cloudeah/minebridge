@@ -12,7 +12,7 @@ class BridgeEngineTest {
     @TempDir Path directory;
     FakeWorld world;OwnerPolicy owner;BridgeEngine engine;Peer peer;
     static final class FakeWorld implements WorldAccess {
-        long tick;int steps,releases,queries;double health=20;boolean done,confirmationOnly;String dim="minecraft:overworld";JsonArray confirmedBlockUpdates=new JsonArray();
+        long tick;int steps,releases,queries;double health=20;boolean done,confirmationOnly;String dim="minecraft:overworld";JsonArray confirmedBlockUpdates=new JsonArray();JsonObject finalConfirmed=object();
         public String actorId(){return "player";} public String worldId(){return "world";} public String dimension(){return dim;} public long tick(){return tick;}
         public Set<String> capabilities(){return Set.of("move.to","block.break","inventory.inspect");}
         public JsonObject query(String operation,JsonObject parameters){queries++;return object("inventory",List.of());}
@@ -20,6 +20,7 @@ class BridgeEngineTest {
         public Step step(Task t){if(confirmationOnly && t.actions>0)return done?Step.success(object("steps",steps)):Step.waiting(object("steps",steps));steps++;t.actions++;t.confirmed.addProperty("steps",steps);if(!confirmedBlockUpdates.isEmpty())t.confirmed.add("block_updates",confirmedBlockUpdates.deepCopy());return done?Step.success(object("steps",steps)):Step.waiting(object("steps",steps));}
         public boolean awaitingConfirmation(Task t){return confirmationOnly && t.actions>0;}
         public void releaseControls(){releases++;}
+        public void collectConfirmed(Task t){for(var entry:finalConfirmed.entrySet())t.confirmed.add(entry.getKey(),entry.getValue().deepCopy());}
     }
     static final class Peer implements BridgeEngine.Peer {
         final List<JsonObject> messages=new ArrayList<>();String closed;
@@ -57,6 +58,16 @@ class BridgeEngineTest {
         assertTrue(send("inventory.inspect","allowed-query",object()).has("inventory"));assertEquals(1,world.queries);
     }
     @Test void acceptedIsNotSuccess(){auth();String task=submit("a");assertEquals("running",send("task.status","s",object("task_id",task)).get("state").getAsString());}
+    @Test void terminalEventCollectsPendingServerReceiptsBeforePublishingAndDoesNotChangeLater(){
+        auth();String task=submit("a");world.finalConfirmed=object("hits",1,"damage",3.5);
+        JsonObject cancelled=send("task.cancel","cancel",object("task_id",task));
+        assertEquals(1,cancelled.getAsJsonObject("confirmed_changes").get("hits").getAsInt());
+        JsonObject event=peer.messages.stream().filter(m->m.get("type").getAsString().equals("task.cancelled")).reduce((a,b)->b).orElseThrow();
+        assertEquals(3.5,event.getAsJsonObject("data").getAsJsonObject("confirmed_changes").get("damage").getAsDouble());
+        int steps=world.steps;world.finalConfirmed.addProperty("hits",2);
+        JsonObject later=send("task.status","later",object("task_id",task));
+        assertEquals(1,later.getAsJsonObject("confirmed_changes").get("hits").getAsInt());assertEquals(steps,world.steps);
+    }
     @Test void duplicateSubmitReturnsSameTask(){auth();String first=submit("a"),second=submit("a");assertEquals(first,second);assertEquals(1,send("task.list","list",object()).getAsJsonArray("tasks").size());}
     @Test void duplicateWithDifferentParametersIsRejected(){auth();submit("a");assertEquals("request_id_conflict",send("move.to","a",object("target",object("x",9,"y",0,"z",0))).get("code").getAsString());}
     @Test void staleRevisionDoesNotExecute(){auth();JsonObject m=message("block.break","break",object());m.addProperty("expected_revision",-1);engine.receive(peer,m.toString());engine.tick();assertEquals("stale_revision",peer.reply("break").get("code").getAsString());assertEquals(0,world.steps);}
@@ -120,5 +131,13 @@ class BridgeEngineTest {
         assertEquals("cancelled",recent.get("state").getAsString());assertFalse(recent.getAsJsonObject("confirmed_changes").has("block_updates"));assertEquals(1,recent.getAsJsonObject("confirmed_changes").get("blocks").getAsInt());
         JsonObject fact=send("memory.query","air-check",object("x",3,"y",4,"z",5)).getAsJsonArray("blocks").get(0).getAsJsonObject();
         assertEquals("minecraft:air",fact.get("type").getAsString());assertEquals("block.break",fact.get("confirmed_action").getAsString());assertEquals(44,fact.get("last_seen_tick").getAsLong());
+    }
+    @Test void ownerGoalSummaryPreservesCombatCountersWithoutPublishingDetailedReceipts(){
+        auth();engine.ownerModelStart("shoot once",2,false);String goal=engine.modelStatus().get("goal_id").getAsString();send("model.claim","claim",object("goal_id",goal));
+        String task=send("task.submit","shot",object("action","move.to","parameters",object(),"model_goal_id",goal)).get("task_id").getAsString();
+        world.finalConfirmed=object("shots",1,"hits",1,"damage",3.5,"combat",object("projectile_id",id(),"private_unbounded_payload",List.of(1,2,3)));
+        send("task.cancel","cancel",object("task_id",task));
+        JsonObject summary=engine.modelStatus().getAsJsonObject("recent_task").getAsJsonObject("confirmed_changes");
+        assertEquals(1,summary.get("shots").getAsInt());assertEquals(1,summary.get("hits").getAsInt());assertEquals(3.5,summary.get("damage").getAsDouble());assertFalse(summary.has("combat"));
     }
 }

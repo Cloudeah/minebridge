@@ -72,8 +72,9 @@ final class ModelScreen extends Screen {
             graphics.text(font,Component.translatable("screen.minebridge.task",Component.translatable("screen.minebridge.action."+task.get("action").getAsString()),task.get("actions").getAsInt(),task.get("max_actions").getAsInt()),left,y,0xffdddddd);y+=12;
             JsonObject changes=task.getAsJsonObject("confirmed_changes");
             java.util.List<String> parts=new java.util.ArrayList<>();
-            if(changes!=null)for(String key:java.util.List.of("jumps","blocks","crafts_confirmed","drop_count","pickup_count","transfer_count","selected_slot"))
+            if(changes!=null)for(String key:java.util.List.of("jumps","blocks","crafts_confirmed","drop_count","pickup_count","transfer_count","selected_slot","shots","hits"))
                 if(changes.has(key))parts.add(Component.translatable("screen.minebridge.progress."+key,changes.get(key).getAsInt()).getString());
+            if(changes!=null&&changes.has("damage"))parts.add(Component.translatable("screen.minebridge.progress.damage",String.format(java.util.Locale.ROOT,"%.1f",changes.get("damage").getAsDouble())).getString());
             String progress=parts.isEmpty()?Component.translatable("screen.minebridge.no_confirmations").getString():String.join(", ",parts);
             graphics.text(font,font.plainSubstrByWidth(Component.translatable("screen.minebridge.confirmed",progress).getString(),panelWidth),left,y,0xffaaddaa);y+=12;
         }

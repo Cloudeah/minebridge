@@ -629,6 +629,39 @@ class VllmAdapterTest(unittest.TestCase):
                 self.model.content = json.dumps(decision)
                 self.assertEqual(self.namespace["infer_decision"](payload), decision)
 
+    def test_bow_parameters_reject_unsupported_modes_before_game_execution(self):
+        target = "418f10e9-bc78-4d9c-bb26-6a9cfa352b69"
+        allowed = ["combat.ranged"]
+        schema = controller.model_payload("shoot once", snapshot(), allowed, [], compact=True)["format"]
+        invalid = [{}, {"entity_id": "fake"}]
+        invalid += [{"entity_id": target, key: value} for key, values in (
+            ("charge_ticks", [19, 61, True, "20", 20.5]),
+            ("wait_ticks", [9, 101, False]), ("max_distance", [0, 33, True, "24"]),
+            ("hand", ["off"]), ("shots", [2]), ("count", [1]), ("chase", [False])
+        ) for value in values]
+        for parameters in invalid:
+            decision = {"action": "combat.ranged", "parameters": parameters, "reason": "shoot"}
+            response = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(decision)}}]}
+            with self.subTest(parameters=parameters):
+                with self.assertRaises(ValueError):
+                    controller.validate_decision(decision, allowed)
+                with self.assertRaises(ValueError):
+                    self.namespace["parse_decision"](response, schema)
+        for parameters in ({"entity_id": target}, {"entity_id": target, "charge_ticks": 60, "wait_ticks": 100, "max_distance": 32}):
+            decision = {"action": "combat.ranged", "parameters": parameters, "reason": "shoot"}
+            self.model.content = json.dumps(decision)
+            self.assertEqual(self.namespace["infer_decision"](controller.model_payload("shoot once", snapshot(), allowed, [], compact=True)), decision)
+
+    def test_combat_goal_progress_counts_receipts_once_and_keeps_misses_distinct(self):
+        miss = {"result": {"task_id": "one", "state": "failed", "confirmed_changes": {"shots": 1}}}
+        hit = {"result": {"task_id": "two", "state": "succeeded", "confirmed_changes": {"shots": 1, "hits": 1, "damage": 3.5}}}
+        unknown = {"result": {"task_id": "three", "state": "cancelled", "confirmed_changes": {"attack_requests": 1}}}
+        progress = controller.goal_progress(snapshot(), [miss, hit, hit, unknown])
+        self.assertEqual(progress["confirmed_shots"], 2)
+        self.assertEqual(progress["confirmed_hits"], 1)
+        self.assertEqual(progress["confirmed_damage"], 3.5)
+        self.assertEqual(progress["completed_steps"], 1)
+
     def test_item_parameters_are_rejected_in_both_notebook_and_controller(self):
         cases = [("item.drop", {"count": count}) for count in (0, 65, True, "5", 1.5)]
         cases += [("item.drop", {"expected_item": "stone;command"}), ("item.pickup", {}),

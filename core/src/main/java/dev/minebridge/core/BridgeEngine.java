@@ -267,7 +267,7 @@ public final class BridgeEngine {
     }
     private static JsonObject summarizeResult(JsonObject source) {
         JsonObject summary=new JsonObject();
-        for(String field:List.of("stage","waiting","confirmed_blocks","total")) {
+        for(String field:List.of("stage","waiting","confirmed_blocks","total","outcome")) {
             if(source!=null&&source.has(field)&&source.get(field).isJsonPrimitive())summary.add(field,source.get(field).deepCopy());
         }
         return summary;
@@ -278,6 +278,11 @@ public final class BridgeEngine {
         addNonNegativeCounter(summary,"blocks",source,"blocks");
         addNonNegativeCounter(summary,"crafts_confirmed",source,"crafts_confirmed");
         addNonNegativeCounter(summary,"selected_slot",source,"selected_slot");
+        addNonNegativeCounter(summary,"shots",source,"shots");
+        addNonNegativeCounter(summary,"hits",source,"hits");
+        if(source!=null&&source.has("damage")&&source.get("damage").isJsonPrimitive()&&source.getAsJsonPrimitive("damage").isNumber()) {
+            double damage=source.get("damage").getAsDouble();if(Double.isFinite(damage)&&damage>=0)summary.addProperty("damage",damage);
+        }
         addNestedCounter(summary,"drop_count",source,"drop","count");
         addNestedCounter(summary,"pickup_count",source,"pickup","count");
         addNestedCounter(summary,"transfer_count",source,"transfer","transferred");
@@ -341,6 +346,7 @@ public final class BridgeEngine {
     private void finish(Task t,Task.State state,String error,String detail,JsonObject result) {
         if(t.terminal()) return;
         t.error=error;t.detail=detail;t.result=result;
+        world.collectConfirmed(t);
         rememberConfirmedBlocks(t);
         if(t==active) {world.releaseControls();active=null;}
         transition(t,state);

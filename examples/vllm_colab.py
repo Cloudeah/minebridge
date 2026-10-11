@@ -23,6 +23,7 @@ ACTION_HELP = {
     "look.at": "target:{x,y,z} OR entity_id",
     "look.turn": "delta_yaw:-180..180,delta_pitch:-90..90(default0); +yaw right,+pitch down",
     "combat.attack": "entity_id,chase:bool; melee, no players",
+    "combat.ranged": "entity_id,charge_ticks:20..60(default20),wait_ticks:10..100,max_distance:1..32; one main-hand vanilla bow shot, needs 2 actions; hit confirmed separately",
     "item.use": "hand:main/off,duration_ticks:1..1200(default40),target:{x,y,z} optional aim; held item only",
     "item.drop": "count:1..64(default1),expected_item:namespace:id optional; selected main hand",
     "item.pickup": "entity_id of observed minecraft:item; approach and collect whole stack; partial count possible",
@@ -167,6 +168,11 @@ def goal_progress(snapshot, history, initial_actor=None):
         jumps = result.get("confirmed_changes", {}).get("jumps", 0)
         if type(jumps) is int and jumps >= 0:
             progress["confirmed_jumps"] += jumps
+        facts = result.get("confirmed_changes", {})
+        for key in ("shots", "hits", "damage"):
+            value = facts.get(key, 0)
+            if type(value) in (int, float) and value > 0:
+                progress["confirmed_" + key] = progress.get("confirmed_" + key, 0) + value
         for operation, field in (("drop", "dropped_items"), ("pickup", "picked_up_items")):
             receipt = result.get("confirmed_changes", {}).get(operation, {})
             if not isinstance(receipt, dict):
@@ -212,6 +218,7 @@ def model_payload(goal, snapshot, allowed, history, png=None, compact=False, tas
         "task_limits bound each action: 20 ticks/second, ~20 ticks/jump plus margin; split long series. "
         "goal_progress contains confirmed totals and initial position/view: avoid repeated work and "
         "interpret goal directions from that initial view after the camera turns. Never repeat failed changes blindly. "
+        "A requested single shot is complete when confirmed_shots reaches one; this alone proves no hit or kill. "
         "Query before crafting/building or searching remembered resources. A query changes no blocks/items. "
         "Parameters: " + json.dumps(actions, ensure_ascii=False, separators=(",", ":") if compact else None)
         + (" Queries: " + json.dumps(query_help, separators=(",", ":")) if "query" in allowed else "")
@@ -260,6 +267,20 @@ def validate_decision(value, allowed):
 def validate_item_parameters(action, parameters):
     from uuid import UUID
     import re
+    if action == "combat.ranged":
+        entity_id = parameters.get("entity_id")
+        if not isinstance(entity_id, str):
+            raise ValueError("combat.ranged: entity_id must be an observed UUID")
+        UUID(entity_id)
+        if parameters.get("hand", "main") != "main" or any(key in parameters for key in ("count", "shots", "chase")):
+            raise ValueError("combat.ranged: one main-hand bow shot without chasing")
+        for key, default, minimum, maximum in (("charge_ticks", 20, 20, 60), ("wait_ticks", 40, 10, 100)):
+            value = parameters.get(key, default)
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ValueError("combat.ranged: " + key + " outside supported integer range")
+        distance = parameters.get("max_distance", 24)
+        if type(distance) not in (int, float) or not 1 <= distance <= 32:
+            raise ValueError("combat.ranged: max_distance must be 1..32")
     if action == "inventory.select_item":
         item = parameters.get("item")
         if not isinstance(item, str) or not re.fullmatch(r"[a-z0-9_.-]+:[a-z0-9/._-]+", item):

@@ -17,6 +17,8 @@ public interface WorldAccess {
     /** May only poll or release an already sent action; never send another mutation. */
     default boolean awaitingConfirmation(Task task) { return false; }
     void releaseControls();
+    /** Collect already observed receipts before publishing a terminal result; sends no actions. */
+    default void collectConfirmed(Task task) {}
     default void taskFinished(Task task) {}
     default List<String> movementModes() { return List.of(); }
     default JsonObject query(String operation, JsonObject data) { throw new BridgeException("unsupported_capability", operation); }

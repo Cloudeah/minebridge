@@ -44,7 +44,7 @@ WebSocket `/bridge`, управляющие сообщения JSON. Снача�
 | model.claim | goal_id — принять цель, созданную владельцем в окне F7 |
 | model.report | goal_id, state: thinking / executing / completed / waiting / failed, step, detail |
 
-Мод 0.5.0 сохраняет протокол 1.0. Capabilities объявляет `observation_profiles`, `decision_guards`, `model_control` и `queries`. `actions` отражает доступные адаптеру действия с учётом `allowedActions` владельца; `queries` перечисляет доступные операции чтения/планирования. На внешнем multiplayer-сервере управляемых действий нет. Профиль `full` по умолчанию сохраняет прежний снимок. `compact` возвращает шесть ближайших наблюдённых блоков, четыре ближайшие сущности, занятые слоты инвентаря и занятые слоты меню с первыми четырьмя пригодными пустыми слотами main/hotbar/container; номера слотов, UUID, свойства блоков и menu revision сохраняются. В `actor` указываются `main_hand` и `off_hand`; наблюдаемая предметная сущность `minecraft:item` включает `entity.item` с `type`, `count` и `damage`. Пропущенные данные остаются неизвестными.
+Мод 0.6.0 сохраняет протокол 1.0. Capabilities объявляет `observation_profiles`, `decision_guards`, `model_control` и `queries`. `actions` отражает доступные адаптеру действия с учётом `allowedActions` владельца; `queries` перечисляет доступные операции чтения/планирования. На внешнем multiplayer-сервере управляемых действий нет. Профиль `full` по умолчанию сохраняет прежний снимок. `compact` возвращает шесть ближайших наблюдённых блоков, четыре ближайшие сущности, занятые слоты инвентаря и занятые слоты меню с первыми четырьмя пригодными пустыми слотами main/hotbar/container; номера слотов, UUID, свойства блоков и menu revision сохраняются. В `actor` указываются `main_hand` и `off_hand`; наблюдаемая предметная сущность `minecraft:item` включает `entity.item` с `type`, `count` и `damage`. Пропущенные данные остаются неизвестными.
 
 `model.query` требует разрешения F8 и актуального `expected_control_epoch`; прямые запросы чтения требуют аутентификации и разрешённой операции, но не F8. `model.query` передаёт `{operation, arguments, expected_control_epoch, model_goal_id}`. Поддержанные операции: `map.nearest`, `map.query`, `memory.query`, `craft.plan`, `build.plan`, `route.plan`, `inventory.inspect` (для последней опционален `item`). Модель может выбрать `action: query`; запрос расходует один шаг решения модели, но не меняет игровой мир. Сначала запрашивайте `craft.plan` или `build.plan`, затем отправляйте отдельную задачу на исполнение. Существующие SDK read endpoints `map.query` и `memory.query` также остаются доступны напрямую.
 
@@ -55,6 +55,8 @@ WebSocket `/bridge`, управляющие сообщения JSON. Снача�
 Зависимости ссылаются на ранее принятые задачи; неуспех зависимости даёт dependency_failed. В каждый момент выполняется одна задача. Пауза освобождает управление; отмена не откатывает мир. После control.stop нужен F8 владельцем.
 
 Открытие окна F7 временно освобождает игровые клавиши и останавливает продвижение текущей задачи без отмены цели. Задача остаётся `running` с `result.stage: owner_panel_open`; её исходные координаты/углы и подтверждённый прогресс сохраняются. После закрытия окна выполнение продолжается, короткие таймеры подтверждения/застревания переинициализируются. Исходный `deadline_tick` сохраняется: время, проведённое в F7, входит в лимит задачи. F9 внутри окна отменяет задачу и не допускает возобновления при закрытии.
+
+Для `combat.ranged` F7 прерывает натяжение до выстрела штатным переключением hotbar туда и обратно, сохраняя выбранный слот и стопку лука/стрел. Так же прерывают натяжение F9, task.cancel, ручное вмешательство и разрыв связи. Возобновление такой задачи завершается `draw_interrupted`; отправьте новую задачу. После уже выпущенной стрелы отмена не удаляет снаряд: итог отмены содержит только receipts, полученные к моменту остановки, и не обещает добавить более позднее попадание.
 
 События содержат event_id, sequence, game_tick, revision. Типы: task.*, actor.health/death, inventory.changed, entity.observed/observation_lost, interface.changed, observe.changed, control.*, model.updated, vision.error. Потеря наблюдения не равна смерти. Критические события здоровья, смерти, задач и новых целей доставляются без обычной подписки.
 
@@ -74,6 +76,7 @@ WebSocket `/bridge`, управляющие сообщения JSON. Снача�
 | look.at | target или entity_id |
 | look.turn | delta_yaw: число -180..180, delta_pitch: число -90..90; по умолчанию 0, хотя бы одно ненулевое |
 | combat.attack | entity_id, chase, stop_health |
+| combat.ranged | entity_id: обязательный UUID; charge_ticks: целое 20..60, по умолчанию 20; wait_ticks: целое 10..100, по умолчанию 40; max_distance: число 1..32, по умолчанию 24; hand: main only |
 | item.drop | count: 1..64, по умолчанию 1; опционально expected_item: namespace:id |
 | item.pickup | entity_id: UUID наблюдаемой сущности minecraft:item |
 | item.use | hand: main/off, по умолчанию main; duration_ticks: 1..1200, по умолчанию 40; опционально target: {x,y,z} |
@@ -86,6 +89,12 @@ WebSocket `/bridge`, управляющие сообщения JSON. Снача�
 | inventory.transfer / equip | from_slot, to_slot, count: 1..64, menu_id, menu_revision |
 | craft.execute | item, count: 1..4096 |
 | build.execute | origin, rotation: 0/90/180/270, blocks, replace: false |
+
+`combat.ranged` делает ровно один выстрел из обычного `minecraft:bow` в основной руке, без преследования. `shots`, `count` и `chase` не поддерживаются. Требуется наблюдаемая, видимая и живая неигровая цель; игроки, вода и лава не поддерживаются. Стрелы должны быть доступны по обычным правилам Minecraft. `max_distance` задаёт максимальную дистанцию до цели. `charge_ticks` задаёт требуемое серверное время натяжения `use_ticks`; `wait_ticks` ограничивает ожидание попадания после выпуска стрелы.
+
+До первого воздействия задача резервирует бюджет двух действий — начать натяжение и отпустить лук; нужен `max_actions >= 2`. При меньшем бюджете задача отклоняется до начала натяжения. Мод сам не повторяет выстрел.
+
+Успех `hit` или `defeated` подтверждается только событием `LivingDamageEvent.Post` для конкретной стрелы, выпущенной этим actor. Появление стрелы не доказывает попадание. При подтверждённом выпуске без события урона возвращается `hit_unconfirmed` и `confirmed_changes.shots: 1`; если сам выпуск не подтверждён — `shot_unconfirmed`. `confirmed_changes` содержит `shots`, `hits`, `damage`, `target_defeated` и `combat: {target, projectile_id, remaining_health, tick, source}`. `combat.attack` также подтверждает серверные `hits`, `damage` и поражение; `attack_requests` учитывается отдельно от попаданий. `combat.remaining_health: -1` означает неизвестное здоровье до подтверждённого попадания; это не признак смерти. Для ближней атаки `projectile_id` может отсутствовать.
 
 `map.nearest`, `map.query` и `memory.query` принимают конечные `x`, `y`, `z`, `block` с одним точным ID либо `blocks` со списком до 16 точных ID, `radius: 1..64`, `limit: 1..128` и опциональный `max_age_ticks: 0..120000`. Запись помечается `observed` только если текущий тик совпадает с `last_seen_tick`; иначе она `remembered`. Неизвестное остаётся неизвестным и не является фактом. Подтверждённый `block.break` или `block.place` обновляет запись памяти фактическим состоянием блока.
 

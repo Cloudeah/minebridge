@@ -54,5 +54,9 @@
   "screen.minebridge.progress.pickup_count": "picked up: %s",
   "screen.minebridge.progress.transfer_count": "transferred: %s",
   "screen.minebridge.progress.selected_slot": "slot: %s",
-  "screen.minebridge.no_confirmations": "pending"
+  "screen.minebridge.no_confirmations": "pending",
+  "screen.minebridge.action.combat.ranged": "Bow shot",
+  "screen.minebridge.progress.shots": "shots: %s",
+  "screen.minebridge.progress.hits": "hits: %s",
+  "screen.minebridge.progress.damage": "damage: %s"
 }

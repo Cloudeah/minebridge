@@ -49,6 +49,9 @@ public final class BridgeClient {
         NeoForge.EVENT_BUS.addListener(this::pickup);
         NeoForge.EVENT_BUS.addListener(this::pickupAttempt);
         NeoForge.EVENT_BUS.addListener(this::afterPlayerTick);
+        NeoForge.EVENT_BUS.addListener(this::projectileTick);
+        NeoForge.EVENT_BUS.addListener(this::arrowSpawn);
+        NeoForge.EVENT_BUS.addListener(this::damage);
     }
     private void pickup(net.neoforged.neoforge.event.entity.player.ItemEntityPickupEvent.Post event){
         MinecraftWorld activeWorld=world;
@@ -60,6 +63,15 @@ public final class BridgeClient {
     }
     private void afterPlayerTick(net.neoforged.neoforge.event.tick.PlayerTickEvent.Post event){
         MinecraftWorld activeWorld=world;if(activeWorld!=null)activeWorld.confirmPickupAttempts(event.getEntity());
+    }
+    private void projectileTick(net.neoforged.neoforge.event.tick.EntityTickEvent.Pre event){
+        MinecraftWorld activeWorld=world;if(activeWorld!=null)activeWorld.recordProjectile(event.getEntity());
+    }
+    private void arrowSpawn(net.neoforged.neoforge.event.entity.EntityJoinLevelEvent event){
+        MinecraftWorld activeWorld=world;if(activeWorld!=null)activeWorld.recordArrowSpawn(event);
+    }
+    private void damage(net.neoforged.neoforge.event.entity.living.LivingDamageEvent.Post event){
+        MinecraftWorld activeWorld=world;if(activeWorld!=null)activeWorld.recordDamage(event);
     }
     private void keys(RegisterKeyMappingsEvent event){event.registerCategory(category);event.register(arm);event.register(stop);event.register(panelKey);}
     private void tick(ClientTickEvent.Post event) {

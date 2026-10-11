@@ -10,6 +10,8 @@ import net.minecraft.stats.Stats;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.*;
 import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.projectile.arrow.AbstractArrow;
+import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.world.inventory.*;
 import net.minecraft.world.item.*;
 import net.minecraft.world.level.ClipContext;
@@ -36,6 +38,10 @@ final class MinecraftWorld implements WorldAccess {
     private final Map<String,CrouchSequence> crouches=new HashMap<>();
     private final Map<String,ItemDropSequence> drops=new HashMap<>();
     private final PickupLedger pickups;
+    private final CombatLedger combat;
+    // Only server-side join/tick callbacks access this bounded set.
+    private final LinkedHashSet<String> freshArrows=new LinkedHashSet<>();
+    private boolean bowDrawing;
     // Accessed only by server-side pickup/player-tick callbacks.
     private final Map<String,PickupAttempt> pickupAttempts=new HashMap<>();
     private final Map<String,CraftPlanner.Plan> crafts=new HashMap<>();
@@ -45,6 +51,7 @@ final class MinecraftWorld implements WorldAccess {
     MinecraftWorld(Minecraft mc,OwnerPolicy policy) throws java.io.IOException {
         this.mc=mc;this.policy=policy;actor=mc.player.getUUID().toString();initialDimension=mc.level.dimension().identifier().toString();
         pickups=new PickupLedger(actor,initialDimension);
+        combat=new CombatLedger(actor,initialDimension);
         if(mc.hasSingleplayerServer()) {
             Path marker=mc.getSingleplayerServer().getWorldPath(LevelResource.ROOT).resolve("minebridge-world-id.txt");
             if(!Files.exists(marker))Files.writeString(marker,id(),StandardOpenOption.CREATE_NEW);
@@ -61,10 +68,35 @@ final class MinecraftWorld implements WorldAccess {
     @Override public long tick(){if(mc.level!=null)lastTick=mc.level.getGameTime();return lastTick;}
     @Override public boolean visionAvailable(){return mc.hasSingleplayerServer() && mc.getMainRenderTarget().getColorTexture() instanceof com.mojang.blaze3d.opengl.GlTexture && mc.getMainRenderTarget().getDepthTexture() instanceof com.mojang.blaze3d.opengl.GlTexture;}
     @Override public List<String> movementModes(){return mc.hasSingleplayerServer()?List.of("walk","sprint","jump","crouch"):List.of();}
-    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
+    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
+    @Override public void collectConfirmed(Task t) {
+        updateCombatReceipt(t,combat.finish(t.id));
+    }
+    private void updateCombatReceipt(Task t,CombatLedger.Snapshot receipt) {
+        if(receipt==null || receipt.shots()==0 && receipt.hits()==0)return;
+        t.confirmed.addProperty("shots",receipt.shots());t.confirmed.addProperty("hits",receipt.hits());t.confirmed.addProperty("damage",receipt.damage());
+        t.confirmed.addProperty("target_defeated",receipt.defeated());
+        t.confirmed.add("combat",object("target",string(t.parameters,"entity_id"),"projectile_id",receipt.projectileId(),"remaining_health",receipt.remainingHealth(),"tick",receipt.tick(),"source",receipt.hits()>0?"integrated_server_damage_event":"integrated_server_projectile_tick"));
+    }
+    void recordProjectile(Entity entity) {
+        // ServerLevel increments tickCount before EntityTickEvent.Pre.
+        if(entity.level().isClientSide() || entity.tickCount!=1 || !(entity instanceof AbstractArrow arrow) || arrow.getOwner()==null || !freshArrows.remove(entity.getUUID().toString()))return;
+        combat.recordShot(arrow.getOwner().getUUID().toString(),entity.level().dimension().identifier().toString(),entity.getUUID().toString(),entity.level().getGameTime());
+    }
+    void recordArrowSpawn(net.neoforged.neoforge.event.entity.EntityJoinLevelEvent event) {
+        if(event.getLevel().isClientSide() || event.loadedFromDisk() || !(event.getEntity() instanceof AbstractArrow arrow) || arrow.getOwner()==null || !actor.equals(arrow.getOwner().getUUID().toString()))return;
+        freshArrows.add(arrow.getUUID().toString());while(freshArrows.size()>128)freshArrows.remove(freshArrows.iterator().next());
+    }
+    void recordDamage(net.neoforged.neoforge.event.entity.living.LivingDamageEvent.Post event) {
+        LivingEntity target=event.getEntity();if(target.level().isClientSide())return;
+        Entity attacker=event.getSource().getEntity(),direct=event.getSource().getDirectEntity();if(attacker==null || direct==null)return;
+        combat.recordDamage(attacker.getUUID().toString(),target.level().dimension().identifier().toString(),target.getUUID().toString(),direct.getUUID().toString(),direct instanceof AbstractArrow,event.getHealthDamage(),target.getHealth(),target.level().getGameTime());
+    }
     @Override public boolean awaitingConfirmation(Task t){
         return switch(t.action){
             case "item.use"->t.context.has("use_sent");
+            case "combat.ranged"->t.context.has("bow_started");
+            case "combat.attack"->t.context.has("last_attack");
             case "item.drop"->drops.containsKey(t.id) && drops.get(t.id).awaitingConfirmation();
             case "item.pickup"->t.context.has("pickup_started");
             case "inventory.select"->t.context.has("selection_sent");
@@ -114,7 +146,7 @@ final class MinecraftWorld implements WorldAccess {
     }
     @Override public Set<String> capabilities() {
         if(!mc.hasSingleplayerServer())return Set.of("inventory.inspect");
-        return Set.of("move.to","move.follow","move.jump","move.relative","move.crouch","route.plan","look.at","look.turn","combat.attack","item.use","item.drop","item.pickup","world.interact","block.break","block.place",
+        return Set.of("move.to","move.follow","move.jump","move.relative","move.crouch","route.plan","look.at","look.turn","combat.attack","combat.ranged","item.use","item.drop","item.pickup","world.interact","block.break","block.place",
                 "inventory.inspect","inventory.select","inventory.select_item","inventory.transfer","inventory.equip","container.open","container.close","craft.plan","craft.execute","build.plan","build.execute");
     }
     @Override public void validate(String action,JsonObject p) {
@@ -125,6 +157,12 @@ final class MinecraftWorld implements WorldAccess {
             case "move.crouch"->MovementCommands.crouchTicks(p);
             case "look.turn"->MovementCommands.turn(p,0,0);
             case "move.follow", "combat.attack"->UUID.fromString(string(p,"entity_id"));
+            case "combat.ranged"->{
+                UUID.fromString(string(p,"entity_id"));integer(p,"charge_ticks",20,20,60);integer(p,"wait_ticks",40,10,100);
+                double range=number(p,"max_distance",24);if(range<1 || range>32)throw new BridgeException("invalid_request","max_distance must be 1..32");
+                if(!string(p,"hand","main").equals("main"))throw new BridgeException("invalid_request","Bow combat supports the main hand only");
+                if(p.has("shots") || p.has("count") || p.has("chase"))throw new BridgeException("invalid_request","combat.ranged fires one arrow without chasing");
+            }
             case "move.jump"->JumpSequence.count(p);
             case "block.break", "block.place"->{block(child(p,"position"));if(action.equals("block.place"))Identifier.parse(string(p,"block"));}
             case "container.open", "world.interact"->{if(p.has("entity_id"))UUID.fromString(string(p,"entity_id"));else block(child(p,"position"));}
@@ -191,7 +229,19 @@ final class MinecraftWorld implements WorldAccess {
         if(!down && k instanceof net.minecraft.client.ToggleKeyMapping mapping)mapping.shouldRestoreStateOnScreenClosed();
         if(down)held.add(k);else held.remove(k);
     }
-    @Override public void releaseControls(){for(var k:Set.copyOf(held))hold(k,false);held.clear();if(mc.gameMode!=null)mc.gameMode.stopDestroyBlock();if(mc.gameMode!=null && mc.player!=null && mc.player.isUsingItem())mc.gameMode.releaseUsingItem(mc.player);routes.clear();crouches.values().forEach(CrouchSequence::released);}
+    @Override public void releaseControls(){
+        combat.suspendMelee();
+        boolean cancelBow=bowDrawing || mc.player!=null && held.contains(mc.options.keyUse) && mc.player.getUseItem().is(Items.BOW) && mc.player.getUsedItemHand()==InteractionHand.MAIN_HAND;
+        for(var k:Set.copyOf(held))hold(k,false);held.clear();if(mc.gameMode!=null)mc.gameMode.stopDestroyBlock();
+        if(cancelBow && mc.player!=null) {
+            // Vanilla RELEASE_USE_ITEM fires a drawn bow. Switching away stops use on
+            // the server without firing; switch back preserves the owner's hotbar.
+            int slot=mc.player.getInventory().getSelectedSlot();
+            mc.player.connection.send(new ServerboundSetCarriedItemPacket((slot+1)%9));
+            mc.player.connection.send(new ServerboundSetCarriedItemPacket(slot));mc.player.stopUsingItem();bowDrawing=false;
+        } else if(mc.gameMode!=null && mc.player!=null && mc.player.isUsingItem())mc.gameMode.releaseUsingItem(mc.player);
+        routes.clear();crouches.values().forEach(CrouchSequence::released);
+    }
     void beforeClientTick(){
         // Network packets are applied before Pre. Release before Minecraft handles keys
         // when the first use finishes, preventing its held-key automatic repeat.
@@ -217,6 +267,7 @@ final class MinecraftWorld implements WorldAccess {
                 view.add("main_hand",heldStack(actor.getMainHandItem()));view.add("off_hand",heldStack(actor.getOffhandItem()));
                 view.addProperty("food",actor.getFoodData().getFoodLevel());view.addProperty("using_item",actor.isUsingItem());
                 view.addProperty("use_hand",actor.isUsingItem()?(actor.getUsedItemHand()==InteractionHand.MAIN_HAND?"main":"off"):"none");
+                view.addProperty("use_ticks",actor.getTicksUsingItem());
                 view.addProperty("item_uses",actor.getStats().getValue(Stats.ITEM_USED,BuiltInRegistries.ITEM.getValue(Identifier.parse(usedItem))));
                 view.addProperty("items_crafted",actor.getStats().getValue(Stats.ITEM_CRAFTED,BuiltInRegistries.ITEM.getValue(Identifier.parse(craftedItem))));
                 if(actor.containerMenu instanceof AbstractCraftingMenu crafting)view.add("craft_output",heldStack(crafting.getResultSlot().getItem()));
@@ -258,6 +309,7 @@ final class MinecraftWorld implements WorldAccess {
             case "look.turn" -> turn(t);
             case "look.at" -> lookAt(t);
             case "combat.attack" -> attack(t);
+            case "combat.ranged" -> ranged(t);
             case "block.break" -> breakBlock(t,block(child(t.parameters,"position")));
             case "block.place" -> placeBlock(t,block(child(t.parameters,"position")),string(t.parameters,"block"),t.parameters.has("properties")?child(t.parameters,"properties"):object());
             case "world.interact", "container.open" -> interact(t);
@@ -390,14 +442,81 @@ final class MinecraftWorld implements WorldAccess {
         return update.done()?Step.success(update.progress()):Step.waiting(update.progress());
     }
     private Step attack(Task t) {
-        String id=string(t.parameters,"entity_id");JsonObject view=serverView(t,null,id);
-        if(view!=null && !view.get("entity").isJsonNull() && !child(view,"entity").get("alive").getAsBoolean())return Step.success(object("outcome","defeated","server",view));
+        String id=string(t.parameters,"entity_id");
+        CombatLedger.Snapshot receipt=combat.peek(t.id);updateCombatReceipt(t,receipt);
+        if(receipt!=null && receipt.defeated())return Step.success(object("outcome","defeated","target",id,"source","integrated_server_damage_event"));
+        JsonObject view=serverView(t,null,id);
+        if(view!=null && !view.get("entity").isJsonNull() && !child(view,"entity").get("alive").getAsBoolean())return Step.failure("target_lost","Target died without a confirmed lethal hit from this task",object("outcome","target_dead","target",id));
+        if(t.actions>=t.maxActions) {
+            if(tick()-number(t.context,"last_attack",-100)>20)return Step.failure("action_limit","Attack budget exhausted",object("target",id));
+            return Step.waiting(object("stage","confirming_last_attack","target",id));
+        }
         Entity target=entity(t.parameters);checkArea(target.position());
         if(target instanceof net.minecraft.world.entity.player.Player)throw new BridgeException("permission_denied","Player combat is disabled");
+        if(!(target instanceof LivingEntity))throw new BridgeException("unsupported_capability","Combat requires a living target");
         if(mc.player.distanceTo(target)>mc.player.entityInteractionRange()) {if(!bool(t.parameters,"chase",false))throw new BridgeException("out_of_reach","Target out of attack range",true);return move(t,target.position(),Math.max(0.7,mc.player.entityInteractionRange()-0.5),true);}
         hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);look(target.getBoundingBox().getCenter());
-        if(mc.player.getAttackStrengthScale(0)>=1 && tick()-number(t.context,"last_attack",-100)>5) {mc.gameMode.attack(mc.player,target);mc.player.swing(InteractionHand.MAIN_HAND);t.actions++;t.context.addProperty("last_attack",tick());t.confirmed.addProperty("attack_requests",t.actions);}
+        if(mc.player.getAttackStrengthScale(0)>=1 && tick()-number(t.context,"last_attack",-100)>5) {if(view==null)return Step.waiting(object("waiting","server_attack_ready"));
+            ActionBudget.require(t,1);long serverTick=view.get("tick").getAsLong();
+            if(combat.peek(t.id)==null)combat.begin(t.id,id,"melee",serverTick);
+            if(!combat.expectMelee(t.id,serverTick))return Step.waiting(object("stage","confirming_combat"));mc.gameMode.attack(mc.player,target);mc.player.swing(InteractionHand.MAIN_HAND);t.actions++;t.context.addProperty("last_attack",tick());t.confirmed.addProperty("attack_requests",integer(t.confirmed,"attack_requests",0,0,100000)+1);}
         return Step.waiting(object("stage","combat","target",id,"server",view));
+    }
+    private Step ranged(Task t) {
+        String id=string(t.parameters,"entity_id");
+        if(t.context.has("bow_released")) {
+            CombatLedger.Snapshot receipt=combat.peek(t.id);updateCombatReceipt(t,receipt);
+            if(receipt!=null && receipt.hits()>0)return Step.success(object("outcome",receipt.defeated()?"defeated":"hit","target",id,"projectile_id",receipt.projectileId(),"source","integrated_server_damage_event"));
+            if(tick()-number(t.context,"bow_released",tick())>=integer(t.parameters,"wait_ticks",40,10,100))
+                return Step.failure(receipt!=null&&receipt.shots()>0?"hit_unconfirmed":"shot_unconfirmed","No damage to the requested target was confirmed; this task will not shoot again",object("stage","waiting_for_hit","target",id));
+            return Step.waiting(object("stage","waiting_for_hit","target",id));
+        }
+        if(mc.screen!=null)throw new BridgeException("interface_open","Close the interface before drawing a bow");
+        Entity target=entity(t.parameters);checkArea(target.position());checkArea(mc.player.position());
+        if(target instanceof net.minecraft.world.entity.player.Player)throw new BridgeException("permission_denied","Player combat is disabled");
+        if(!(target instanceof LivingEntity) || !target.isAlive())throw new BridgeException("target_lost","A visible living target is required");
+        if(mc.player.distanceTo(target)>number(t.parameters,"max_distance",24))throw new BridgeException("out_of_reach","Bow target is outside max_distance",true);
+        if(!mc.player.getMainHandItem().is(Items.BOW))throw new BridgeException("missing_weapon","Select minecraft:bow in the main hand first");
+        if(mc.player.isInWater() || mc.player.isInLava())throw new BridgeException("ranged_unavailable","Bow aiming from water or lava is unsupported");
+        if(!t.context.has("bow_started")) {
+            ActionBudget.require(t,2);
+            if(mc.player.isUsingItem())throw new BridgeException("item_busy","Finish the current item use first");
+            if(mc.player.getProjectile(mc.player.getMainHandItem()).isEmpty())throw new BridgeException("missing_ammo","No usable arrow is available");
+        }
+        JsonObject view=serverView(t,null,id);
+        if(!t.context.has("bow_started") && view==null)return Step.waiting(object("waiting","server_bow_ready"));
+        hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);hold(mc.options.keySprint,false);aimBow(target);
+        if(!t.context.has("bow_started")) {
+            if(combat.peek(t.id)==null)combat.begin(t.id,id,"bow",view.get("tick").getAsLong());
+            mc.gameMode.useItem(mc.player,InteractionHand.MAIN_HAND);t.actions++;t.context.addProperty("bow_started",tick());
+            bowDrawing=true;hold(mc.options.keyUse,true);
+            return Step.waiting(object("stage","drawing_bow","target",id));
+        }
+        if(!mc.player.isUsingItem() || !mc.player.getUseItem().is(Items.BOW))throw new BridgeException("draw_interrupted","Bow draw was interrupted; start a new task to shoot");
+        if(view==null)return Step.waiting(object("waiting","server_bow_draw"));
+        if(!bool(view,"using_item",false) || !string(view,"use_hand").equals("main")) {
+            if(tick()-number(t.context,"bow_started",tick())>10)throw new BridgeException("draw_interrupted","Server did not retain the bow draw");
+            return Step.waiting(object("waiting","server_bow_draw"));
+        }
+        int charged=integer(view,"use_ticks",0,0,12000),required=integer(t.parameters,"charge_ticks",20,20,60);
+        if(charged<required)return Step.waiting(object("stage","drawing_bow","charge_ticks",charged,"required_ticks",required,"target",id));
+        ActionBudget.require(t,1);if(!combat.expectShot(t.id,view.get("tick").getAsLong()))throw new BridgeException("shot_unconfirmed","No unique shot receipt can be opened");
+        hold(mc.options.keyUse,false);mc.gameMode.releaseUsingItem(mc.player);bowDrawing=false;
+        t.actions++;t.context.addProperty("bow_released",tick());
+        return Step.waiting(object("stage","waiting_for_shot","target",id));
+    }
+    private void aimBow(Entity target) {
+        Vec3 eye=mc.player.getEyePosition(),point=target.getBoundingBox().getCenter();
+        double flight=Math.max(1,eye.distanceTo(point)/3.0);
+        Vec3 velocity=target.getDeltaMovement();if(velocity.lengthSqr()<=1)point=point.add(velocity.scale(flight));
+        Vec3 d=point.subtract(eye);double horizontal=Math.sqrt(d.x*d.x+d.z*d.z);
+        if(horizontal<0.1){look(point);return;}
+        // Low ballistic arc for a fully drawn vanilla bow. Actual hit receipts remain
+        // authoritative: drag, spread and moving targets can still produce a miss.
+        double gravity=0.05,speedSquared=9,discriminant=speedSquared*speedSquared-gravity*(gravity*horizontal*horizontal+2*d.y*speedSquared);
+        if(discriminant<0)throw new BridgeException("out_of_reach","No supported bow trajectory");
+        double rise=(speedSquared-Math.sqrt(discriminant))/gravity;
+        look(eye.add(d.x,rise,d.z));
     }
     private Step breakBlock(Task t,BlockPos p) {
         reach(p);JsonObject view=serverView(t,p,null);
