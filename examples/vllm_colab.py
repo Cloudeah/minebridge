@@ -17,7 +17,7 @@ from minebridge_client import BridgeClient, BridgeError
 ACTION_HELP = {
     "move.to": "target:{x,y,z},tolerance:0.3..16,sprint/crouch:exclusive bool; loaded route<=96",
     "move.relative": "forward/right:-16..16(default0,nonzero,length<=16),tolerance(default0.7),sprint/crouch:exclusive bool; from initial yaw",
-    "move.follow": "entity_id,distance:0.3..16; continuous, may time out",
+    "move.follow": "entity_id,distance:0.7..16(default3),ticks:1..1200(default200); counts server ticks within distance; pauses excluded",
     "move.jump": "count:1..30(default1); ground jumps, confirms landing",
     "move.crouch": "ticks:1..200(default20); crouch in place, auto-release",
     "look.at": "target:{x,y,z} OR entity_id",
@@ -169,6 +169,9 @@ def goal_progress(snapshot, history, initial_actor=None):
         if type(jumps) is int and jumps >= 0:
             progress["confirmed_jumps"] += jumps
         facts = result.get("confirmed_changes", {})
+        followed = facts.get("follow_ticks", 0)
+        if type(followed) is int and followed > 0:
+            progress["confirmed_follow_ticks"] = progress.get("confirmed_follow_ticks", 0) + followed
         for key in ("shots", "hits", "damage"):
             value = facts.get(key, 0)
             if type(value) in (int, float) and value > 0:
@@ -267,6 +270,21 @@ def validate_decision(value, allowed):
 def validate_item_parameters(action, parameters):
     from uuid import UUID
     import re
+    if action == "move.follow":
+        if not isinstance(parameters.get("entity_id"), str):
+            raise ValueError("move.follow: entity_id must be an observed UUID")
+        UUID(parameters["entity_id"])
+        ticks = parameters.get("ticks", 200)
+        distance = parameters.get("distance", 3)
+        if type(ticks) is not int or not 1 <= ticks <= 1200:
+            raise ValueError("move.follow: ticks must be an integer 1..1200")
+        if type(distance) not in (int, float) or not .7 <= distance <= 16:
+            raise ValueError("move.follow: distance must be .7..16")
+        for flag in ("sprint", "crouch"):
+            if type(parameters.get(flag, False)) is not bool:
+                raise ValueError("move.follow: " + flag + " must be boolean")
+        if parameters.get("sprint", False) and parameters.get("crouch", False):
+            raise ValueError("move.follow: sprint and crouch cannot be combined")
     if action == "combat.ranged":
         entity_id = parameters.get("entity_id")
         if not isinstance(entity_id, str):

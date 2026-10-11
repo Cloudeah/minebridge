@@ -58,5 +58,6 @@
   "screen.minebridge.action.combat.ranged": "Bow shot",
   "screen.minebridge.progress.shots": "shots: %s",
   "screen.minebridge.progress.hits": "hits: %s",
-  "screen.minebridge.progress.damage": "damage: %s"
+  "screen.minebridge.progress.damage": "damage: %s",
+  "screen.minebridge.progress.follow_ticks": "followed: %s ticks"
 }

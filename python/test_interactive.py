@@ -21,7 +21,10 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
     async def test_bow_decisions_cross_notebook_relay_and_guarded_tasks_without_rewriting(self):
         await self.integration(ranged=True)
 
-    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False, ranged=False):
+    async def test_follow_decisions_cross_notebook_relay_and_guarded_tasks_without_rewriting(self):
+        await self.integration(follow=True)
+
+    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False, ranged=False, follow=False):
         submitted, observed_profiles, reports, queries = [], [], [], []
         terminal = asyncio.Event()
         holder = {}
@@ -29,6 +32,9 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
         bow_decision = {"action": "combat.ranged", "parameters": {"entity_id": "418f10e9-bc78-4d9c-bb26-6a9cfa352b69", "charge_ticks": 20}, "reason": "shoot once"}
         if ranged:
             model.content = json.dumps(bow_decision)
+        follow_decision = {"action": "move.follow", "parameters": {"entity_id": bow_decision["parameters"]["entity_id"], "ticks": 100, "distance": 3}, "reason": "follow five seconds"}
+        if follow:
+            model.content = json.dumps(follow_decision)
         if malformed_first:
             def reply():
                 model.content = EXPRESSION_REPLY if len(model.payloads) == 1 else json.dumps(DECISION)
@@ -51,11 +57,11 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
             model.before_reply = delay_first_reply
 
         def goal(identifier):
-            return {"goal_id": identifier, "goal": "shoot once" if ranged else "look east", "steps": 2 if query_first else 1, "vision": vision,
+            return {"goal_id": identifier, "goal": "follow five seconds" if follow else "shoot once" if ranged else "look east", "steps": 2 if query_first else 1, "vision": vision,
                     "state": "queued", "step": 0}
 
         status = goal("first")
-        capabilities = {"actions": ["combat.ranged"] if ranged else ["look.at"], "actor_id": "test-actor", "armed": True,
+        capabilities = {"actions": ["move.follow"] if follow else ["combat.ranged"] if ranged else ["look.at"], "actor_id": "test-actor", "armed": True,
                         "model_control": True, "observation_profiles": ["full", "compact"]}
 
         if query_first:
@@ -63,7 +69,7 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
 
         def observation():
             state = {**snapshot(), "control_epoch": 7}
-            if ranged:
+            if ranged or follow:
                 state["actor"]["main_hand"] = {"type": "minecraft:bow", "count": 1, "damage": 0}
                 state["entities"] = [{"entity_id": bow_decision["parameters"]["entity_id"], "type": "minecraft:pig", "position": {"x": 0, "y": 64, "z": 8}, "visible": True}]
             return state
@@ -116,7 +122,7 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                     submitted.append(dict(data))
                     value = {"status": "accepted", "task_id": "task-" + status["goal_id"]}
                 elif operation == "task.status":
-                    value = {"state": "succeeded", "task_id": data["task_id"], "result": {}, "confirmed_changes": {"shots": 1, "hits": 1, "damage": 6} if ranged else {}}
+                    value = {"state": "succeeded", "task_id": data["task_id"], "result": {}, "confirmed_changes": {"follow_ticks": 100} if follow else {"shots": 1, "hits": 1, "damage": 6} if ranged else {}}
                 elif operation == "vision.capture":
                     self.assertEqual(data["observation_profile"], "compact")
                     value = {"status": "accepted", "request_id": message["request_id"]}
@@ -200,6 +206,10 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                 for item in submitted:
                     self.assertEqual(item["action"], bow_decision["action"])
                     self.assertEqual(item["parameters"], bow_decision["parameters"])
+            if follow:
+                for item in submitted:
+                    self.assertEqual(item["action"], follow_decision["action"])
+                    self.assertEqual(item["parameters"], follow_decision["parameters"])
             self.assertIn("compact", observed_profiles)
             if vision:
                 image = model.payloads[0]["messages"][1]["content"][0]["image_url"]["url"]

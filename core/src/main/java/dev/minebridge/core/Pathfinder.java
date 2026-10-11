@@ -6,7 +6,11 @@ import java.util.*;
 public final class Pathfinder {
     public record Cell(int x,int y,int z) { public double distance(Cell b) { return Math.sqrt((double)(x-b.x)*(x-b.x)+(double)(y-b.y)*(y-b.y)+(double)(z-b.z)*(z-b.z)); } }
     public enum Terrain { WALKABLE, BLOCKED, UNKNOWN }
-    public interface Grid { Terrain terrain(Cell cell); }
+    public interface Grid {
+        Terrain terrain(Cell cell);
+        /** Clearance while crossing an edge, separate from standing at its endpoints. */
+        default Terrain transition(Cell from,Cell to) { return Terrain.WALKABLE; }
+    }
     public record Route(List<Cell> cells,int visited) {}
     private record Node(Cell cell,double score) {}
     public Route plan(Grid grid,Cell start,Cell goal,int budget) {
@@ -23,8 +27,8 @@ public final class Pathfinder {
                     Cell n=new Cell(c.x+offset[0],c.y+dy,c.z+offset[1]);
                     if(n.distance(start)>96 || closed.contains(n)) continue;
                     Terrain terrain=grid.terrain(n);if(terrain==Terrain.UNKNOWN){unknown=true;continue;}if(terrain!=Terrain.WALKABLE)continue;
-                    // A step up also requires the departure cell's upper headroom.
-                    if(dy==1 && grid.terrain(new Cell(c.x,c.y+1,c.z))==Terrain.UNKNOWN) {unknown=true;continue;}
+                    Terrain crossing=grid.transition(c,n);
+                    if(crossing==Terrain.UNKNOWN){unknown=true;continue;}if(crossing!=Terrain.WALKABLE)continue;
                     double next=cost.get(c)+1+Math.abs(dy)*0.5;
                     if(next<cost.getOrDefault(n,Double.POSITIVE_INFINITY)) {cost.put(n,next);previous.put(n,c);open.add(new Node(n,next+n.distance(goal)));}
                     break;

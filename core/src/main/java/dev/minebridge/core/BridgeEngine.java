@@ -277,6 +277,7 @@ public final class BridgeEngine {
         addNonNegativeCounter(summary,"jumps",source,"jumps");
         addNonNegativeCounter(summary,"blocks",source,"blocks");
         addNonNegativeCounter(summary,"crafts_confirmed",source,"crafts_confirmed");
+        addNonNegativeCounter(summary,"follow_ticks",source,"follow_ticks");
         addNonNegativeCounter(summary,"selected_slot",source,"selected_slot");
         addNonNegativeCounter(summary,"shots",source,"shots");
         addNonNegativeCounter(summary,"hits",source,"hits");

@@ -36,6 +36,7 @@ final class MinecraftWorld implements WorldAccess {
     private final Map<String,List<Pathfinder.Cell>> routes=new HashMap<>();
     private final Map<String,JumpSequence> jumps=new HashMap<>();
     private final Map<String,CrouchSequence> crouches=new HashMap<>();
+    private final Map<String,FollowSequence> follows=new HashMap<>();
     private final Map<String,ItemDropSequence> drops=new HashMap<>();
     private final PickupLedger pickups;
     private final CombatLedger combat;
@@ -68,7 +69,7 @@ final class MinecraftWorld implements WorldAccess {
     @Override public long tick(){if(mc.level!=null)lastTick=mc.level.getGameTime();return lastTick;}
     @Override public boolean visionAvailable(){return mc.hasSingleplayerServer() && mc.getMainRenderTarget().getColorTexture() instanceof com.mojang.blaze3d.opengl.GlTexture && mc.getMainRenderTarget().getDepthTexture() instanceof com.mojang.blaze3d.opengl.GlTexture;}
     @Override public List<String> movementModes(){return mc.hasSingleplayerServer()?List.of("walk","sprint","jump","crouch"):List.of();}
-    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
+    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
     @Override public void collectConfirmed(Task t) {
         updateCombatReceipt(t,combat.finish(t.id));
     }
@@ -94,6 +95,7 @@ final class MinecraftWorld implements WorldAccess {
     }
     @Override public boolean awaitingConfirmation(Task t){
         return switch(t.action){
+            case "move.follow"->follows.containsKey(t.id);
             case "item.use"->t.context.has("use_sent");
             case "combat.ranged"->t.context.has("bow_started");
             case "combat.attack"->t.context.has("last_attack");
@@ -156,7 +158,8 @@ final class MinecraftWorld implements WorldAccess {
             case "move.relative"->MovementCommands.relative(p,0);
             case "move.crouch"->MovementCommands.crouchTicks(p);
             case "look.turn"->MovementCommands.turn(p,0,0);
-            case "move.follow", "combat.attack"->UUID.fromString(string(p,"entity_id"));
+            case "move.follow"->{UUID.fromString(string(p,"entity_id"));FollowSequence.validate(p);}
+            case "combat.attack"->UUID.fromString(string(p,"entity_id"));
             case "combat.ranged"->{
                 UUID.fromString(string(p,"entity_id"));integer(p,"charge_ticks",20,20,60);integer(p,"wait_ticks",40,10,100);
                 double range=number(p,"max_distance",24);if(range<1 || range>32)throw new BridgeException("invalid_request","max_distance must be 1..32");
@@ -240,7 +243,7 @@ final class MinecraftWorld implements WorldAccess {
             mc.player.connection.send(new ServerboundSetCarriedItemPacket((slot+1)%9));
             mc.player.connection.send(new ServerboundSetCarriedItemPacket(slot));mc.player.stopUsingItem();bowDrawing=false;
         } else if(mc.gameMode!=null && mc.player!=null && mc.player.isUsingItem())mc.gameMode.releaseUsingItem(mc.player);
-        routes.clear();crouches.values().forEach(CrouchSequence::released);
+        routes.clear();crouches.values().forEach(CrouchSequence::released);follows.values().forEach(FollowSequence::released);
     }
     void beforeClientTick(){
         // Network packets are applied before Pre. Release before Minecraft handles keys
@@ -302,7 +305,7 @@ final class MinecraftWorld implements WorldAccess {
         }
         return switch(t.action) {
             case "move.to" -> move(t,point(child(t.parameters,"target")),number(t.parameters,"tolerance",0.7),false);
-            case "move.follow" -> move(t,entity(t.parameters).position(),number(t.parameters,"distance",3),true);
+            case "move.follow" -> follow(t);
             case "move.relative" -> relative(t);
             case "move.crouch" -> crouch(t);
             case "move.jump" -> jump(t);
@@ -341,7 +344,41 @@ final class MinecraftWorld implements WorldAccess {
         return Pathfinder.Terrain.WALKABLE;
     }
     private static Pathfinder.Cell cell(Vec3 v){return new Pathfinder.Cell((int)Math.floor(v.x),(int)Math.floor(v.y),(int)Math.floor(v.z));}
-    private List<Pathfinder.Cell> path(Vec3 target){return new Pathfinder().plan(this::terrain,cell(mc.player.position()),cell(target),8192).cells();}
+    private Pathfinder.Terrain transition(Pathfinder.Cell from,Pathfinder.Cell to) {
+        int height=Math.max(from.y(),to.y());
+        Vec3 start=new Vec3(from.x()+0.5,height,from.z()+0.5);
+        AABB clearance=mc.player.getDimensions(Pose.STANDING).makeBoundingBox(start).expandTowards(to.x()-from.x(),0,to.z()-from.z());
+        for(BlockPos p:BlockPos.betweenClosed(BlockPos.containing(clearance.minX,clearance.minY,clearance.minZ),BlockPos.containing(clearance.maxX,clearance.maxY,clearance.maxZ)))
+            if(!mc.level.hasChunkAt(p))return Pathfinder.Terrain.UNKNOWN;
+        return mc.level.getBlockCollisions(mc.player,clearance).iterator().hasNext()?Pathfinder.Terrain.BLOCKED:Pathfinder.Terrain.WALKABLE;
+    }
+    private List<Pathfinder.Cell> path(Vec3 target){
+        Pathfinder.Grid grid=new Pathfinder.Grid(){
+            @Override public Pathfinder.Terrain terrain(Pathfinder.Cell c){return MinecraftWorld.this.terrain(c);}
+            @Override public Pathfinder.Terrain transition(Pathfinder.Cell a,Pathfinder.Cell b){return MinecraftWorld.this.transition(a,b);}
+        };
+        return new Pathfinder().plan(grid,cell(mc.player.position()),cell(target),8192).cells();
+    }
+    private Step follow(Task t) {
+        Entity target=entity(t.parameters);checkArea(target.position());checkArea(mc.player.position());
+        FollowSequence sequence=follows.computeIfAbsent(t.id,key->new FollowSequence(integer(t.parameters,"ticks",200,1,1200),number(t.parameters,"distance",3)));
+        JsonObject view=serverView(t,null,string(t.parameters,"entity_id"));
+        FollowSequence.Sample sample=null;
+        if(view!=null) {
+            if(view.get("entity").isJsonNull() || !bool(child(view,"entity"),"alive",false))return Step.failure("target_lost","Follow target is no longer alive or available",t.result);
+            sample=new FollowSequence.Sample(view.get("tick").getAsLong(),point(child(view,"position")).distanceTo(point(child(child(view,"entity"),"position"))));
+        }
+        var update=sequence.observe(sample);JsonObject progress=update.progress();
+        progress.addProperty("target",string(t.parameters,"entity_id"));
+        t.confirmed.add("follow_ticks",progress.get("confirmed_follow_ticks"));
+        if(view!=null){progress.add("position",view.get("position"));progress.add("target_position",child(view,"entity").get("position"));progress.addProperty("remaining_distance",sample.distance());}
+        if(update.done()) {
+            hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);hold(mc.options.keySprint,false);hold(mc.options.keyShift,false);
+            t.confirmed.add("position",view.get("position"));return Step.success(progress);
+        }
+        Step movement=move(t,target.position(),number(t.parameters,"distance",3),true);
+        progress.add("movement",movement.result());return Step.waiting(progress);
+    }
     private Step move(Task t,Vec3 target,double tolerance,boolean follow) {
         if(tolerance<0.3||tolerance>16)throw new BridgeException("invalid_request","Movement tolerance must be 0.3..16");
         if(bool(t.parameters,"sprint",false) && bool(t.parameters,"crouch",false))throw new BridgeException("invalid_request","Sprint and crouch cannot be combined");
@@ -358,11 +395,11 @@ final class MinecraftWorld implements WorldAccess {
         }
         if(mc.screen!=null && mc.player.containerMenu.containerId!=0)throw new BridgeException("interface_open","Close container before moving");
         List<Pathfinder.Cell> route=routes.get(t.id);
-        if(route==null || (follow && tick()%20==0)) {route=path(target);routes.put(t.id,route);t.context.addProperty("waypoint",0);}
+        if(route==null || follow && tick()-number(t.context,"route_planned",-100)>=10 && !cell(target).equals(route.getLast())) {route=path(target);routes.put(t.id,route);t.context.addProperty("waypoint",0);t.context.addProperty("route_planned",tick());}
         int idx=integer(t.context,"waypoint",0,0,8192);
         while(idx<route.size()-1 && mc.player.position().distanceTo(new Vec3(route.get(idx).x()+0.5,route.get(idx).y(),route.get(idx).z()+0.5))<0.65)idx++;
         t.context.addProperty("waypoint",idx);Pathfinder.Cell next=route.get(Math.min(idx,route.size()-1));
-        if(terrain(next)!=Pathfinder.Terrain.WALKABLE){routes.remove(t.id);releaseControls();return Step.waiting(object("stage","replanning"));}
+        if(terrain(next)!=Pathfinder.Terrain.WALKABLE || transition(cell(mc.player.position()),next)!=Pathfinder.Terrain.WALKABLE){routes.remove(t.id);releaseControls();return Step.waiting(object("stage","replanning"));}
         // A tight tolerance can exclude the goal cell's centre. Finish at the actual
         // requested point instead of repeatedly steering back to the voxel centre.
         boolean finalCell=idx>=route.size()-1 && next.equals(cell(target));

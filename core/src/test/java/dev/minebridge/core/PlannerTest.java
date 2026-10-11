@@ -12,6 +12,30 @@ class PlannerTest {
     @Test void unknownIsNotWalkable(){BridgeException e=assertThrows(BridgeException.class,()->new Pathfinder().plan(c->Pathfinder.Terrain.UNKNOWN,new Pathfinder.Cell(0,0,0),new Pathfinder.Cell(2,0,0),100));assertEquals("chunk_unavailable",e.code);}
     @Test void blockedDiffersFromUnloaded(){BridgeException e=assertThrows(BridgeException.class,()->new Pathfinder().plan(c->Pathfinder.Terrain.BLOCKED,new Pathfinder.Cell(0,0,0),new Pathfinder.Cell(2,0,0),100));assertEquals("path_unreachable",e.code);}
     @Test void routeHasFiniteBudget(){assertThrows(BridgeException.class,()->new Pathfinder().plan(c->Pathfinder.Terrain.WALKABLE,new Pathfinder.Cell(0,0,0),new Pathfinder.Cell(20,0,20),5));}
+    @Test void WalkableEndpointsDoNotProveAnEdgeHasHeadroom() {
+        var start=new Pathfinder.Cell(0,0,0);var end=new Pathfinder.Cell(1,1,0);
+        Pathfinder.Grid grid=new Pathfinder.Grid(){
+            public Pathfinder.Terrain terrain(Pathfinder.Cell c){return c.equals(start)||c.equals(end)?Pathfinder.Terrain.WALKABLE:Pathfinder.Terrain.BLOCKED;}
+            public Pathfinder.Terrain transition(Pathfinder.Cell a,Pathfinder.Cell b){return Pathfinder.Terrain.BLOCKED;}
+        };
+        assertEquals("path_unreachable",assertThrows(BridgeException.class,()->new Pathfinder().plan(grid,start,end,100)).code);
+    }
+    @Test void UnknownCrossingIsExcludedAndReportedAsUnavailable() {
+        Pathfinder.Grid grid=new Pathfinder.Grid(){
+            public Pathfinder.Terrain terrain(Pathfinder.Cell c){return c.y()==0?Pathfinder.Terrain.WALKABLE:Pathfinder.Terrain.BLOCKED;}
+            public Pathfinder.Terrain transition(Pathfinder.Cell a,Pathfinder.Cell b){return Pathfinder.Terrain.UNKNOWN;}
+        };
+        assertEquals("chunk_unavailable",assertThrows(BridgeException.class,()->new Pathfinder().plan(grid,new Pathfinder.Cell(0,0,0),new Pathfinder.Cell(1,0,0),100)).code);
+    }
+    @Test void RouteDetoursAroundACollisionEdge() {
+        var start=new Pathfinder.Cell(0,0,0);var end=new Pathfinder.Cell(1,0,0);
+        Pathfinder.Grid grid=new Pathfinder.Grid(){
+            public Pathfinder.Terrain terrain(Pathfinder.Cell c){return c.y()==0?Pathfinder.Terrain.WALKABLE:Pathfinder.Terrain.BLOCKED;}
+            public Pathfinder.Terrain transition(Pathfinder.Cell a,Pathfinder.Cell b){return a.equals(start)&&b.equals(end)?Pathfinder.Terrain.BLOCKED:Pathfinder.Terrain.WALKABLE;}
+        };
+        var route=new Pathfinder().plan(grid,start,end,100);
+        assertTrue(route.cells().size()>2);assertEquals(end,route.cells().getLast());
+    }
     @Test void craftResolvesDependenciesAndOutputMultiplicity(){CraftPlanner p=new CraftPlanner(List.of(recipe("plank",4,ingredient("log")),recipe("stick",4,ingredient("plank"),ingredient("plank")),recipe("tool",1,ingredient("stick"),ingredient("plank"))));var plan=p.plan("tool",1,Map.of("log",1),Set.of("inventory"));assertTrue(plan.executable());assertEquals(List.of("plank","stick","tool"),plan.stages().stream().map(CraftPlanner.Stage::item).toList());assertEquals(3,plan.finalInventory().get("stick"));}
     @Test void craftChoosesAvailableIngredientAlternative(){var plan=new CraftPlanner(List.of(recipe("plank",4,ingredient("oak","birch")))).plan("plank",4,Map.of("birch",1),Set.of("inventory"));assertTrue(plan.executable());assertEquals(List.of("birch"),plan.stages().getFirst().ingredients());}
     @Test void craftChoosesRecipeWithAvailableResources(){var plan=new CraftPlanner(List.of(recipe("out",1,ingredient("missing")),recipe("out",1,ingredient("available")))).plan("out",1,Map.of("available",1),Set.of("inventory"));assertTrue(plan.executable());assertEquals(List.of("available"),plan.stages().getFirst().ingredients());}

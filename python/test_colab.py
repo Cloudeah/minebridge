@@ -662,6 +662,34 @@ class VllmAdapterTest(unittest.TestCase):
         self.assertEqual(progress["confirmed_damage"], 3.5)
         self.assertEqual(progress["completed_steps"], 1)
 
+    def test_follow_parameters_are_identical_in_controller_and_notebook(self):
+        target = "418f10e9-bc78-4d9c-bb26-6a9cfa352b69"
+        schema = controller.model_payload("follow", snapshot(), ["move.follow"], [], compact=True)["format"]
+        invalid = [{}, {"entity_id": "unknown"}]
+        invalid += [{"entity_id": target, key: value} for key, values in (
+            ("ticks", [0, 1201, True, "20", 20.5]), ("distance", [.3, 17, True, "3"]),
+            ("sprint", [1]), ("crouch", ["true"])
+        ) for value in values]
+        invalid += [{"entity_id": target, "sprint": True, "crouch": True}]
+        for parameters in invalid:
+            decision = {"action": "move.follow", "parameters": parameters, "reason": "follow"}
+            response = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(decision)}}]}
+            with self.subTest(parameters=parameters):
+                with self.assertRaises(ValueError):controller.validate_decision(decision, ["move.follow"])
+                with self.assertRaises(ValueError):self.namespace["parse_decision"](response, schema)
+        decision = {"action": "move.follow", "parameters": {"entity_id": target, "ticks": 100, "distance": 3}, "reason": "follow"}
+        self.model.content = json.dumps(decision)
+        self.assertEqual(self.namespace["infer_decision"](controller.model_payload("follow", snapshot(), ["move.follow"], [], compact=True)), decision)
+
+    def test_follow_progress_preserves_partial_receipts_without_double_counting(self):
+        partial = {"result": {"task_id": "partial", "state": "cancelled", "confirmed_changes": {"follow_ticks": 20}}}
+        history = [partial, partial, {"result": {"task_id": "done", "state": "succeeded", "confirmed_changes": {"follow_ticks": 40}}},
+                   {"result": {"task_id": "unknown", "state": "failed", "result": {"confirmed_follow_ticks": 200}}},
+                   {"result": {"task_id": "invalid", "state": "failed", "confirmed_changes": {"follow_ticks": True}}}]
+        progress = controller.goal_progress(snapshot(), history)
+        self.assertEqual(progress["confirmed_follow_ticks"], 60)
+        self.assertEqual(progress["completed_steps"], 1)
+
     def test_item_parameters_are_rejected_in_both_notebook_and_controller(self):
         cases = [("item.drop", {"count": count}) for count in (0, 65, True, "5", 1.5)]
         cases += [("item.drop", {"expected_item": "stone;command"}), ("item.pickup", {}),
