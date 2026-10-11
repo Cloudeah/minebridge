@@ -31,6 +31,7 @@ final class MinecraftWorld implements WorldAccess {
     private final Map<String,CompletableFuture<JsonObject>> confirmations=new HashMap<>();
     private final Map<String,List<Pathfinder.Cell>> routes=new HashMap<>();
     private final Map<String,JumpSequence> jumps=new HashMap<>();
+    private final Map<String,CrouchSequence> crouches=new HashMap<>();
     private final Map<String,CraftPlanner.Plan> crafts=new HashMap<>();
     private final Map<String,BuildPlanner.Plan> builds=new HashMap<>();
     private final Map<String,CompletableFuture<Integer>> buildChecks=new HashMap<>();
@@ -52,16 +53,20 @@ final class MinecraftWorld implements WorldAccess {
     @Override public String dimension(){return mc.level==null?initialDimension:mc.level.dimension().identifier().toString();}
     @Override public long tick(){if(mc.level!=null)lastTick=mc.level.getGameTime();return lastTick;}
     @Override public boolean visionAvailable(){return mc.hasSingleplayerServer() && mc.getMainRenderTarget().getColorTexture() instanceof com.mojang.blaze3d.opengl.GlTexture && mc.getMainRenderTarget().getDepthTexture() instanceof com.mojang.blaze3d.opengl.GlTexture;}
-    @Override public List<String> movementModes(){return mc.hasSingleplayerServer()?List.of("walk","sprint","jump"):List.of();}
-    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);}
+    @Override public List<String> movementModes(){return mc.hasSingleplayerServer()?List.of("walk","sprint","jump","crouch"):List.of();}
+    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);}
     @Override public Set<String> capabilities() {
         if(!mc.hasSingleplayerServer())return Set.of("inventory.inspect");
-        return Set.of("move.to","move.follow","move.jump","route.plan","look.at","combat.attack","item.use","world.interact","block.break","block.place",
+        return Set.of("move.to","move.follow","move.jump","move.relative","move.crouch","route.plan","look.at","look.turn","combat.attack","item.use","world.interact","block.break","block.place",
                 "inventory.inspect","inventory.select","inventory.transfer","inventory.equip","container.open","container.close","craft.plan","craft.execute","build.plan","build.execute");
     }
     @Override public void validate(String action,JsonObject p) {
         switch(action) {
-            case "move.to", "look.at"->{if(p.has("entity_id"))UUID.fromString(string(p,"entity_id"));else point(child(p,"target"));}
+            case "move.to"->{point(child(p,"target"));MovementCommands.validateTravel(p);}
+            case "look.at"->{if(p.has("entity_id"))UUID.fromString(string(p,"entity_id"));else point(child(p,"target"));}
+            case "move.relative"->MovementCommands.relative(p,0);
+            case "move.crouch"->MovementCommands.crouchTicks(p);
+            case "look.turn"->MovementCommands.turn(p,0,0);
             case "move.follow", "combat.attack"->UUID.fromString(string(p,"entity_id"));
             case "move.jump"->JumpSequence.count(p);
             case "block.break", "block.place"->{block(child(p,"position"));if(action.equals("block.place"))Identifier.parse(string(p,"block"));}
@@ -99,7 +104,7 @@ final class MinecraftWorld implements WorldAccess {
             JsonObject b=position(p);b.addProperty("dimension",dimension());b.addProperty("type",blockId(state));b.add("properties",properties(state));
             b.addProperty("solid",!state.getCollisionShape(mc.level,p).isEmpty());b.addProperty("fluid",!state.getFluidState().isEmpty());b.addProperty("source",telemetry?"owner_telemetry":"ray_observation");blocks.add(b);
         }
-        return object("actor",object("position",vector(mc.player.position()),"velocity",vector(mc.player.getDeltaMovement()),"yaw",mc.player.getYRot(),"pitch",mc.player.getXRot(),"health",mc.player.getHealth(),"food",mc.player.getFoodData().getFoodLevel(),"armor",mc.player.getArmorValue(),"effects",mc.player.getActiveEffects().stream().map(e->e.toString()).toList(),"selected_slot",mc.player.getInventory().getSelectedSlot(),"using_item",mc.player.isUsingItem(),"on_ground",mc.player.onGround(),"flying",mc.player.getAbilities().flying,"in_water",mc.player.isInWater(),"in_lava",mc.player.isInLava(),"riding",mc.player.isPassenger()),
+        return object("actor",object("position",vector(mc.player.position()),"velocity",vector(mc.player.getDeltaMovement()),"yaw",mc.player.getYRot(),"pitch",mc.player.getXRot(),"health",mc.player.getHealth(),"food",mc.player.getFoodData().getFoodLevel(),"armor",mc.player.getArmorValue(),"effects",mc.player.getActiveEffects().stream().map(e->e.toString()).toList(),"selected_slot",mc.player.getInventory().getSelectedSlot(),"using_item",mc.player.isUsingItem(),"on_ground",mc.player.onGround(),"flying",mc.player.getAbilities().flying,"in_water",mc.player.isInWater(),"in_lava",mc.player.isInLava(),"riding",mc.player.isPassenger(),"crouching",mc.player.isCrouching(),"sprinting",mc.player.isSprinting()),
                 "inventory",inventory,"entities",entities,"blocks",blocks,"context",object("raining",mc.level.isRaining(),"day_time",mc.level.getDefaultClockTime(),"menu_id",mc.player.containerMenu.containerId,"menu_revision",mc.player.containerMenu.getStateId(),"menu_slots",menu,"cursor",stack(mc.player.containerMenu.getCarried()),"source","client_engine","coordinate_system","world_xyz_blocks","telemetry",telemetry));
     }
     boolean visible(Entity entity){return mc.level.clip(new ClipContext(mc.player.getEyePosition(),entity.getBoundingBox().getCenter(),ClipContext.Block.COLLIDER,ClipContext.Fluid.NONE,mc.player)).getType()==HitResult.Type.MISS;}
@@ -107,8 +112,18 @@ final class MinecraftWorld implements WorldAccess {
     private Vec3 point(JsonObject p){double x=number(p,"x",Double.NaN),y=number(p,"y",Double.NaN),z=number(p,"z",Double.NaN);if(!Double.isFinite(x+y+z)||Math.abs(x)>30000000||Math.abs(z)>30000000||Math.abs(y)>2048)throw new BridgeException("invalid_request","Invalid world position");return new Vec3(x,y,z);}
     private BlockPos block(JsonObject p){Vec3 v=point(p);if(v.x!=Math.rint(v.x)||v.y!=Math.rint(v.y)||v.z!=Math.rint(v.z))throw new BridgeException("invalid_request","Block coordinates must be integers");return BlockPos.containing(v);}
     private Entity entity(JsonObject p){String target=string(p,"entity_id");for(Entity e:mc.level.entitiesForRendering())if(e.getUUID().toString().equals(target) && visible(e) && !e.isInvisibleTo(mc.player))return e;throw new BridgeException("target_lost","Target is no longer observed",true);}
-    private void hold(net.minecraft.client.KeyMapping k,boolean down){k.setDown(down);if(down)held.add(k);else held.remove(k);}
-    @Override public void releaseControls(){for(var k:held)k.setDown(false);held.clear();if(mc.gameMode!=null)mc.gameMode.stopDestroyBlock();if(mc.player!=null && mc.player.isUsingItem())mc.gameMode.releaseUsingItem(mc.player);routes.clear();}
+    private void hold(net.minecraft.client.KeyMapping k,boolean down){
+        // Toggle mappings invert setDown(true) and ignore setDown(false). Force the requested
+        // state briefly in hold mode; restore the owner's preference without saving options.
+        var toggle=k==mc.options.keyShift?mc.options.toggleCrouch():k==mc.options.keySprint?mc.options.toggleSprint():null;
+        if(toggle!=null && toggle.get()) {toggle.set(false);try{k.setDown(down);}finally{toggle.set(true);}}
+        else k.setDown(down);
+        // A screen can remember a toggle key and restore it when closed. Cancelling an AI
+        // hold must also clear that remembered state, or F9 in F7 would re-enable crouching.
+        if(!down && k instanceof net.minecraft.client.ToggleKeyMapping mapping)mapping.shouldRestoreStateOnScreenClosed();
+        if(down)held.add(k);else held.remove(k);
+    }
+    @Override public void releaseControls(){for(var k:Set.copyOf(held))hold(k,false);held.clear();if(mc.gameMode!=null)mc.gameMode.stopDestroyBlock();if(mc.gameMode!=null && mc.player!=null && mc.player.isUsingItem())mc.gameMode.releaseUsingItem(mc.player);routes.clear();crouches.values().forEach(CrouchSequence::released);}
     private void look(Vec3 target){Vec3 d=target.subtract(mc.player.getEyePosition());mc.player.setYRot((float)Math.toDegrees(Math.atan2(-d.x,d.z)));mc.player.setXRot((float)-Math.toDegrees(Math.atan2(d.y,Math.sqrt(d.x*d.x+d.z*d.z))));}
     private void checkArea(Vec3 p){if(!policy.areas.isEmpty())policy.checkPoint(vector(p),dimension());}
     private void reach(BlockPos pos){if(!mc.level.hasChunkAt(pos))throw new BridgeException("chunk_unavailable","Target chunk is not loaded",true);checkArea(Vec3.atCenterOf(pos));if(mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(pos))>mc.player.blockInteractionRange())throw new BridgeException("out_of_reach","Target block is out of reach",true);}
@@ -122,6 +137,8 @@ final class MinecraftWorld implements WorldAccess {
                 if(level==null || actor==null)throw new BridgeException("disconnected","Actor unavailable");
                 JsonObject view=object("source","integrated_server","tick",level.getGameTime(),"health",actor.getHealth(),"menu_id",actor.containerMenu.containerId,"cursor",stack(actor.containerMenu.getCarried()));
                 view.add("position",vector(actor.position()));view.addProperty("on_ground",actor.onGround());
+                view.addProperty("crouching",actor.isCrouching());view.addProperty("sprinting",actor.isSprinting());
+                view.addProperty("yaw",actor.getYRot());view.addProperty("pitch",actor.getXRot());
                 view.addProperty("selected_slot",actor.getInventory().getSelectedSlot());
                 JsonArray slots=new JsonArray();for(Slot s:actor.containerMenu.slots){JsonObject item=stack(s.getItem());item.addProperty("slot",s.index);slots.add(item);}view.add("slots",slots);
                 Map<String,Integer> counts=new HashMap<>();for(int i=0;i<actor.getInventory().getContainerSize();i++){ItemStack s=actor.getInventory().getItem(i);if(!s.isEmpty())counts.merge(itemId(s),s.getCount(),Integer::sum);}view.add("inventory_counts",GSON.toJsonTree(counts));
@@ -137,11 +154,26 @@ final class MinecraftWorld implements WorldAccess {
         if(!mc.hasSingleplayerServer() || mc.player.isSpectator())throw new BridgeException("permission_denied","Singleplayer controllable actor required");
         if(mc.player.isDeadOrDying())return Step.failure("actor_dead","Actor is dead",object());
         if(mc.player.getHealth()<=number(t.parameters,"stop_health",4)){releaseControls();return Step.failure("critical_health","Actor health reached stop threshold",object("health",mc.player.getHealth()));}
-        if(bool(t.context,"revalidate",false)){t.context.remove("revalidate");routes.remove(t.id);confirmations.remove(t.id);if(t.action.equals("build.execute")){t.context.addProperty("build_index",0);t.context.remove("placing");}}
+        if(bool(t.context,"revalidate",false)){t.context.remove("revalidate");routes.remove(t.id);confirmations.remove(t.id);if(t.action.equals("look.turn"))t.context.addProperty("turn_sent",tick());if(t.action.equals("build.execute")){t.context.addProperty("build_index",0);t.context.remove("placing");}}
+        if(mc.screen instanceof ModelScreen){
+            releaseControls();confirmations.remove(t.id);
+            t.context.addProperty("owner_panel_waiting",true);
+            return Step.waiting(object("stage","owner_panel_open"));
+        }
+        if(bool(t.context,"owner_panel_waiting",false)){
+            t.context.remove("owner_panel_waiting");
+            // The panel is an observation pause, not evidence of being stuck. Keep the
+            // original targets and owner deadline, but restart short confirmation timers.
+            t.context.remove("last_position");t.context.remove("last_moved");
+            if(t.action.equals("look.turn"))t.context.addProperty("turn_sent",tick());
+        }
         return switch(t.action) {
             case "move.to" -> move(t,point(child(t.parameters,"target")),number(t.parameters,"tolerance",0.7),false);
             case "move.follow" -> move(t,entity(t.parameters).position(),number(t.parameters,"distance",3),true);
+            case "move.relative" -> relative(t);
+            case "move.crouch" -> crouch(t);
             case "move.jump" -> jump(t);
+            case "look.turn" -> turn(t);
             case "look.at" -> {Vec3 target=t.parameters.has("entity_id")?entity(t.parameters).getBoundingBox().getCenter():point(child(t.parameters,"target"));look(target);t.actions++;yield Step.success(object("yaw",mc.player.getYRot(),"pitch",mc.player.getXRot()));}
             case "combat.attack" -> attack(t);
             case "block.break" -> breakBlock(t,block(child(t.parameters,"position")));
@@ -174,9 +206,19 @@ final class MinecraftWorld implements WorldAccess {
     private static Pathfinder.Cell cell(Vec3 v){return new Pathfinder.Cell((int)Math.floor(v.x),(int)Math.floor(v.y),(int)Math.floor(v.z));}
     private List<Pathfinder.Cell> path(Vec3 target){return new Pathfinder().plan(this::terrain,cell(mc.player.position()),cell(target),8192).cells();}
     private Step move(Task t,Vec3 target,double tolerance,boolean follow) {
-        if(tolerance<0.3||tolerance>16)throw new BridgeException("invalid_request","Movement tolerance must be 0.3..16");checkArea(target);
+        if(tolerance<0.3||tolerance>16)throw new BridgeException("invalid_request","Movement tolerance must be 0.3..16");
+        if(bool(t.parameters,"sprint",false) && bool(t.parameters,"crouch",false))throw new BridgeException("invalid_request","Sprint and crouch cannot be combined");
+        checkArea(target);
         double distance=mc.player.position().distanceTo(target);
-        if(distance<=tolerance){hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);return follow?Step.waiting(object("stage","following","distance",distance)):Step.success(object("position",vector(mc.player.position()),"remaining_distance",distance));}
+        if(distance<=tolerance){
+            hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);hold(mc.options.keySprint,false);hold(mc.options.keyShift,false);
+            if(follow)return Step.waiting(object("stage","following","distance",distance));
+            JsonObject view=serverView(t,null,null);
+            if(view==null)return Step.waiting(object("stage","confirming_position","position",vector(mc.player.position()),"remaining_distance",distance));
+            double actual=point(child(view,"position")).distanceTo(target);
+            if(actual<=tolerance){t.confirmed.add("position",view.get("position"));return Step.success(object("position",view.get("position"),"target",vector(target),"remaining_distance",actual,"source","integrated_server"));}
+            return Step.waiting(object("stage","confirming_position","position",view.get("position"),"remaining_distance",actual));
+        }
         if(mc.screen!=null && mc.player.containerMenu.containerId!=0)throw new BridgeException("interface_open","Close container before moving");
         List<Pathfinder.Cell> route=routes.get(t.id);
         if(route==null || (follow && tick()%20==0)) {route=path(target);routes.put(t.id,route);t.context.addProperty("waypoint",0);}
@@ -184,12 +226,54 @@ final class MinecraftWorld implements WorldAccess {
         while(idx<route.size()-1 && mc.player.position().distanceTo(new Vec3(route.get(idx).x()+0.5,route.get(idx).y(),route.get(idx).z()+0.5))<0.65)idx++;
         t.context.addProperty("waypoint",idx);Pathfinder.Cell next=route.get(Math.min(idx,route.size()-1));
         if(terrain(next)!=Pathfinder.Terrain.WALKABLE){routes.remove(t.id);releaseControls();return Step.waiting(object("stage","replanning"));}
-        Vec3 waypoint=new Vec3(next.x()+0.5,next.y(),next.z()+0.5);look(waypoint.add(0,mc.player.getEyeHeight(),0));
-        hold(mc.options.keyUp,true);hold(mc.options.keyJump,next.y()>mc.player.getY()+0.1);hold(mc.options.keySprint,bool(t.parameters,"sprint",false));t.actions++;
+        // A tight tolerance can exclude the goal cell's centre. Finish at the actual
+        // requested point instead of repeatedly steering back to the voxel centre.
+        boolean finalCell=idx>=route.size()-1 && next.equals(cell(target));
+        Vec3 waypoint=finalCell?target:new Vec3(next.x()+0.5,next.y(),next.z()+0.5);
+        look(waypoint.add(0,mc.player.getEyeHeight(),0));
+        hold(mc.options.keyUp,true);hold(mc.options.keyJump,next.y()>mc.player.getY()+0.1);hold(mc.options.keySprint,bool(t.parameters,"sprint",false));hold(mc.options.keyShift,bool(t.parameters,"crouch",false));t.actions++;
         if(!t.context.has("last_position")){t.context.add("last_position",vector(mc.player.position()));t.context.addProperty("last_moved",tick());}
         if(mc.player.position().distanceTo(point(child(t.context,"last_position")))>0.25){t.context.add("last_position",vector(mc.player.position()));t.context.addProperty("last_moved",tick());}
         if(tick()-number(t.context,"last_moved",tick())>40){int retries=integer(t.context,"replans",0,0,3);if(retries>=3)return Step.failure("path_unreachable","Actor is stuck",object("position",vector(mc.player.position()),"remaining_distance",distance));t.context.addProperty("replans",retries+1);t.context.addProperty("last_moved",tick());routes.remove(t.id);}
         return Step.waiting(object("stage","walking","position",vector(mc.player.position()),"remaining_distance",distance,"waypoint",idx,"route_length",route.size()));
+    }
+    private Step relative(Task t) {
+        if(!t.context.has("relative_target")){
+            var delta=MovementCommands.relative(t.parameters,mc.player.getYRot());
+            Vec3 target=mc.player.position().add(delta.x(),0,delta.z());checkArea(target);
+            t.context.add("relative_target",vector(target));
+        }
+        return move(t,point(child(t.context,"relative_target")),number(t.parameters,"tolerance",0.7),false);
+    }
+    private Step crouch(Task t) {
+        hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);hold(mc.options.keySprint,false);
+        if(mc.screen!=null)return Step.failure("interface_open","Close interfaces before crouching",t.result);
+        if(!mc.player.onGround() || mc.player.getAbilities().flying || mc.player.isPassenger() || mc.player.isInWater() || mc.player.isInLava() || mc.player.isFallFlying())
+            return Step.failure("crouch_unavailable","Crouching requires a standing player outside water, lava, vehicles and flight",t.result);
+        checkArea(mc.player.position());
+        var sequence=crouches.computeIfAbsent(t.id,key->new CrouchSequence(MovementCommands.crouchTicks(t.parameters)));
+        JsonObject view=serverView(t,null,null);
+        var sample=view==null?null:new CrouchSequence.Sample((long)number(view,"tick",0),bool(view,"crouching",false));
+        var update=sequence.observe(tick(),sample);hold(mc.options.keyShift,update.holdCrouch());
+        t.confirmed.addProperty("crouch_ticks",update.progress().get("confirmed_crouch_ticks").getAsLong());
+        if(update.error()!=null)return Step.failure(update.error(),"Server did not confirm the requested crouch state",update.progress());
+        if(update.done()){t.actions++;return Step.success(update.progress());}
+        return Step.waiting(update.progress());
+    }
+    private Step turn(Task t) {
+        if(!t.context.has("turn_target")){
+            var target=MovementCommands.turn(t.parameters,mc.player.getYRot(),mc.player.getXRot());
+            t.context.add("turn_target",object("yaw",target.yaw(),"pitch",target.pitch()));
+            t.context.addProperty("turn_sent",tick());
+        }
+        JsonObject target=child(t.context,"turn_target");
+        mc.player.setYRot((float)number(target,"yaw",0));mc.player.setXRot((float)number(target,"pitch",0));
+        JsonObject view=serverView(t,null,null);
+        if(view!=null && Math.abs(MovementCommands.wrapYaw(number(view,"yaw",0)-number(target,"yaw",0)))<=0.1 && Math.abs(number(view,"pitch",0)-number(target,"pitch",0))<=0.1){
+            t.actions++;t.confirmed.add("look",target.deepCopy());return Step.success(object("yaw",view.get("yaw"),"pitch",view.get("pitch"),"source","integrated_server"));
+        }
+        if(tick()-number(t.context,"turn_sent",tick())>20)return Step.failure("look_unconfirmed","Server did not confirm the requested camera direction",target);
+        return Step.waiting(object("stage","confirming_look","target",target));
     }
     private Step jump(Task t) {
         // A pulse lasts one client tick. Holding jump through a server poll can start an extra jump.

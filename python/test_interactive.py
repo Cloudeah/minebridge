@@ -88,6 +88,8 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(status["state"], "executing")
                     self.assertEqual(data["model_goal_id"], status["goal_id"])
                     self.assertEqual(data["expected_control_epoch"], 7)
+                    self.assertEqual(data["timeout_ticks"], 600)
+                    self.assertEqual(data["max_actions"], 17)
                     submitted.append(dict(data))
                     value = {"status": "accepted", "task_id": "task-" + status["goal_id"]}
                 elif operation == "task.status":
@@ -118,7 +120,8 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                 owner = Path(directory) / "owner.json"
                 owner.write_text(json.dumps({"token": "fixture-owner-token", "port": 8765}))
                 args = controller.parser().parse_args(["--config", str(owner), "--interactive", "--relay-port", "0",
-                    "--relay-config", str(Path(directory) / "relay.json"), "--model-timeout", "5"])
+                    "--relay-config", str(Path(directory) / "relay.json"), "--model-timeout", "5",
+                    "--task-ticks", "600", "--max-actions", "17"])
                 args.compact_observations = True
                 actual_relay = controller.RelayServer
 
@@ -159,6 +162,10 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                         with self.assertRaises(asyncio.CancelledError):
                             await task
             self.assertEqual(len(model.payloads), 3 if malformed_first else 2)
+            for payload in model.payloads:
+                user_content = payload["messages"][1]["content"]
+                user_content = user_content[-1]["text"] if isinstance(user_content, list) else user_content
+                self.assertEqual(json.loads(user_content)["task_limits"], {"timeout_ticks": 600, "max_actions": 17})
             self.assertEqual([item["model_goal_id"] for item in submitted], ["second"] if cancel_first else ["first", "second"])
             self.assertIn("compact", observed_profiles)
             if vision:

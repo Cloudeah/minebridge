@@ -206,7 +206,11 @@ public final class BridgeEngine {
     }
     private void requireActor(JsonObject m) { if(!actorId.equals(string(m,"actor_id"))) throw new BridgeException("actor_mismatch","actor_id required for actions"); }
     private void requireArmed() { if(!armed || stopped) throw new BridgeException("permission_denied","Owner must arm control in game (F8)"); }
-    private void requireCapability(String action) { if(!world.capabilities().contains(action)) throw new BridgeException("unsupported_capability",action); }
+    private void requireCapability(String action) {
+        if(!world.capabilities().contains(action)) throw new BridgeException("unsupported_capability",action);
+        if(!policy.allowedActions.isEmpty() && !policy.allowedActions.contains(action))
+            throw new BridgeException("permission_denied","Action disabled by owner");
+    }
     private JsonObject submit(String action,JsonObject parameters,JsonObject options) {
         requireArmed();requireControlEpoch(options);
         if(options.has("model_goal_id"))model.requireActive(string(options,"model_goal_id"));
@@ -254,7 +258,9 @@ public final class BridgeEngine {
     }
     private void stopAll(String reason) { world.releaseControls();for(Task t:tasks.values()) if(!t.terminal()) finish(t,Task.State.cancelled,reason,"Control stopped",t.result);active=null; }
     public JsonObject capabilities() {
-        return object("actions",world.capabilities(),"vision",world.visionAvailable(),"formats",List.of("MBV1/png/float32-le"),"actor_id",world.actorId(),"profile",policy.publicProfile(),"armed",armed,
+        Set<String> actions=new TreeSet<>(world.capabilities());
+        if(!policy.allowedActions.isEmpty())actions.retainAll(policy.allowedActions);
+        return object("actions",actions,"vision",world.visionAvailable(),"formats",List.of("MBV1/png/float32-le"),"actor_id",world.actorId(),"profile",policy.publicProfile(),"armed",armed,
                 "deduplication_window_ms",DEDUP_MS,"deduplication_capacity",4096,"event_history",512,"max_tasks",256,"vision_max_fps",5,"vision_max_resolution",List.of(640,360),"movement_modes",world.movementModes(),
                 "observation_profiles",ObservationProfiles.NAMES,"decision_guards",List.of("control_epoch","model_goal_id"),"model_control",true);
     }

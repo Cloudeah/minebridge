@@ -12,9 +12,10 @@ class BridgeEngineTest {
     @TempDir Path directory;
     FakeWorld world;OwnerPolicy owner;BridgeEngine engine;Peer peer;
     static final class FakeWorld implements WorldAccess {
-        long tick;int steps,releases;double health=20;boolean done;String dim="minecraft:overworld";
+        long tick;int steps,releases,queries;double health=20;boolean done;String dim="minecraft:overworld";
         public String actorId(){return "player";} public String worldId(){return "world";} public String dimension(){return dim;} public long tick(){return tick;}
-        public Set<String> capabilities(){return Set.of("move.to","block.break");}
+        public Set<String> capabilities(){return Set.of("move.to","block.break","inventory.inspect");}
+        public JsonObject query(String operation,JsonObject parameters){queries++;return object("inventory",List.of());}
         public JsonObject snapshot(int radius,boolean telemetry){return object("actor",object("health",health),"blocks",List.of(),"entities",List.of());}
         public Step step(Task t){steps++;t.actions++;t.confirmed.addProperty("steps",steps);return done?Step.success(object("steps",steps)):Step.waiting(object("steps",steps));}
         public void releaseControls(){releases++;}
@@ -34,6 +35,26 @@ class BridgeEngineTest {
     @Test void helloRejectsCompanion(){assertEquals("unsupported_capability",send("session.hello","a",object("actor_mode","companion")).get("code").getAsString());}
     @Test void ownerMustArmBeforeMutation(){send("session.authenticate","auth",object("token",owner.token));assertEquals("permission_denied",send("move.to","a",object("target",object("x",0,"y",0,"z",0))).get("code").getAsString());}
     @Test void unsupportedIsRejectedBeforeAcceptance(){auth();assertEquals("unsupported_capability",send("fly.to","a",object()).get("code").getAsString());assertEquals(0,world.steps);}
+    @Test void capabilitiesExposeOnlySupportedActionsAllowedByOwner(){
+        owner.allowedActions.addAll(Set.of("move.to","fly.to"));auth();
+        assertEquals(List.of("move.to"),engine.capabilities().getAsJsonArray("actions").asList().stream().map(JsonElement::getAsString).toList());
+        assertEquals("permission_denied",send("block.break","blocked",object()).get("code").getAsString());
+        assertEquals(0,world.steps);
+        assertEquals("unsupported_capability",send("fly.to","unsupported",object()).get("code").getAsString());
+        submit("allowed");assertEquals(1,world.steps);
+    }
+    @Test void emptyOwnerAllowlistPreservesAllSupportedCapabilities(){
+        auth();JsonArray actions=send("session.capabilities","caps",object()).getAsJsonArray("actions");
+        assertEquals(Set.of("move.to","block.break","inventory.inspect"),new HashSet<>(actions.asList().stream().map(JsonElement::getAsString).toList()));
+    }
+    @Test void ownerAllowlistAlsoAppliesToAdvertisedQueries(){
+        owner.allowedActions.add("move.to");auth();
+        assertEquals("permission_denied",send("inventory.inspect","blocked-query",object()).get("code").getAsString());
+        assertEquals(0,world.queries);
+        owner.allowedActions.add("inventory.inspect");
+        assertTrue(send("session.capabilities","refreshed-caps",object()).getAsJsonArray("actions").toString().contains("inventory.inspect"));
+        assertTrue(send("inventory.inspect","allowed-query",object()).has("inventory"));assertEquals(1,world.queries);
+    }
     @Test void acceptedIsNotSuccess(){auth();String task=submit("a");assertEquals("running",send("task.status","s",object("task_id",task)).get("state").getAsString());}
     @Test void duplicateSubmitReturnsSameTask(){auth();String first=submit("a"),second=submit("a");assertEquals(first,second);assertEquals(1,send("task.list","list",object()).getAsJsonArray("tasks").size());}
     @Test void duplicateWithDifferentParametersIsRejected(){auth();submit("a");assertEquals("request_id_conflict",send("move.to","a",object("target",object("x",9,"y",0,"z",0))).get("code").getAsString());}

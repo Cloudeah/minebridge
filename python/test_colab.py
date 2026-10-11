@@ -10,7 +10,7 @@ import math
 import os
 from pathlib import Path
 import struct
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import tempfile
 import threading
 import time
@@ -23,7 +23,7 @@ from websockets.asyncio.server import serve
 from colab_relay import RelayServer, load_relay_config
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("ollama_controller", ROOT / "examples/ollama_colab.py")
+spec = importlib.util.spec_from_file_location("vllm_controller", ROOT / "examples/vllm_colab.py")
 controller = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(controller)
 TOKEN = "test-relay-token-" + "x" * 32
@@ -95,6 +95,61 @@ class RelayTest(unittest.TestCase):
 
 
 class DecisionTest(unittest.TestCase):
+    def test_compact_prompt_keeps_goal_totals_and_initial_view_when_recent_history_is_truncated(self):
+        initial_actor = {"position": {"x": 0, "y": 64, "z": 0}, "yaw": 90, "pitch": 10, "health": 20}
+        current = snapshot()
+        current["actor"].update(position={"x": 8, "y": 64, "z": 0}, yaw=-90, pitch=-10)
+        first = {"result": {"task_id": "jump-1", "state": "succeeded", "confirmed_changes": {"jumps": 3}}}
+        second = {"result": {"task_id": "jump-2", "state": "succeeded", "confirmed_changes": {"jumps": 4}}}
+        history = [first, second, second]
+        payload = controller.model_payload("Прыгни десять раз", current, ["move.jump"], history,
+                                           compact=True, initial_actor=initial_actor)
+        user = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(user["recent_results"], [{"state": "succeeded", "confirmed_changes": {"jumps": 4}}])
+        self.assertEqual(user["goal_progress"], {
+            "initial_actor": {"position": {"x": 0, "y": 64, "z": 0}, "yaw": 90, "pitch": 10},
+            "completed_steps": 2, "confirmed_jumps": 7})
+        self.assertEqual(user["observation"]["actor"]["position"]["x"], 8)
+
+    def test_goal_progress_uses_server_confirmations_even_after_partial_failure(self):
+        history = [
+            {"decision": {"parameters": {"count": 30}}, "result": {
+                "task_id": "partial", "state": "failed", "confirmed_changes": {"jumps": 2}}},
+            {"result": {"task_id": "unconfirmed", "state": "failed", "result": {"completed": 30}}},
+            {"result": {"task_id": "invalid", "state": "failed", "confirmed_changes": {"jumps": "30"}}},
+        ]
+        progress = controller.goal_progress(snapshot(), history)
+        self.assertEqual(progress["confirmed_jumps"], 2)
+        self.assertEqual(progress["completed_steps"], 0)
+
+    def test_compact_result_preserves_confirmation_and_failure_without_task_boilerplate(self):
+        history = [{"decision": {"action": "move.jump", "parameters": {"count": 10}, "reason": "repeat me"},
+                    "result": {"task_id": "actual-task", "action": "move.jump", "priority": 99,
+                               "depends_on": [], "deadline_tick": 1000, "actions": 3, "state": "failed",
+                               "error": "timeout", "detail": "Deadline exceeded",
+                               "result": {"completed": 3, "source": "integrated_server"},
+                               "confirmed_changes": {"jumps": 3}}}]
+        original = json.dumps(history, sort_keys=True)
+        payload = controller.model_payload("Прыгни десять раз", snapshot(), ["move.jump"], history, compact=True)
+        user = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(user["recent_results"], [{
+            "action": "move.jump", "parameters": {"count": 10}, "state": "failed",
+            "error": "timeout", "detail": "Deadline exceeded",
+            "result": {"completed": 3, "source": "integrated_server"}, "confirmed_changes": {"jumps": 3}}])
+        self.assertEqual(user["goal_progress"]["confirmed_jumps"], 3)
+        self.assertEqual(json.dumps(history, sort_keys=True), original)
+        user["recent_results"][0]["confirmed_changes"]["jumps"] = 99
+        self.assertEqual(history[0]["result"]["confirmed_changes"]["jumps"], 3)
+
+    def test_owner_allowlist_filters_model_actions_and_empty_list_keeps_supported_actions(self):
+        capabilities = {"actions": ["look.at", "move.jump", "unknown.action"],
+                        "profile": {"allowed_actions": ["move.jump"]}}
+        self.assertEqual(controller.available_actions(capabilities), ["move.jump"])
+        capabilities["profile"]["allowed_actions"] = []
+        self.assertEqual(controller.available_actions(capabilities), ["look.at", "move.jump"])
+        capabilities["profile"]["allowed_actions"] = ["combat.attack"]
+        self.assertEqual(controller.available_actions(capabilities), [])
+
     def test_owner_epoch_is_checked_and_passed_to_mod_without_requiring_stable_world_revision(self):
         observed = {**snapshot(), "control_epoch": 7}
         current = {**observed, "revision": 99, "game_tick": 999}
@@ -125,7 +180,9 @@ class DecisionTest(unittest.TestCase):
             {"slot": i, "type": "minecraft:stick" if i in (8, 50) else "minecraft:air",
              "count": 2 if i in (8, 50) else 0, "player_inventory": i >= 27}
             for i in range(60)]
-        payload = controller.model_payload("look east", state, ["look.at"], [1, 2, 3], compact=True)
+        history = [{"decision": {"action": "look.at", "parameters": {}},
+                    "result": {"state": "succeeded", "result": {"step": step}}} for step in (1, 2, 3)]
+        payload = controller.model_payload("look east", state, ["look.at"], history, compact=True)
         user = json.loads(payload["messages"][1]["content"])
         observed = user["observation"]
         self.assertEqual([b["x"] for b in observed["blocks"]], [1, 2, 3, 4, 5, 6])
@@ -136,7 +193,93 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(observed["context"]["menu_id"], 7)
         self.assertEqual(observed["context"]["menu_revision"], 42)
         self.assertIn("Missing data is unknown", observed["observation_limits"])
-        self.assertEqual(user["recent_results"], [3])
+        self.assertEqual(user["recent_results"], [{"action": "look.at", "parameters": {},
+                                                 "state": "succeeded", "result": {"step": 3}}])
+
+
+class ColabRelaySettingsTest(unittest.TestCase):
+    """Run the actual notebook connection cell against an authenticated relay."""
+    def setUp(self):
+        notebook = json.loads((ROOT / "examples/vllm_tpu_colab.ipynb").read_text())
+        self.source = next("".join(cell["source"]) for cell in notebook["cells"]
+                           if cell["cell_type"] == "code" and "def relay_setting(" in "".join(cell["source"]))
+        self.relay = RelayServer(TOKEN, 0)
+        self.relay.start()
+        self.local_url = f"http://127.0.0.1:{self.relay.port}"
+        self.public_url = "https://fixture.ngrok-free.dev"
+        self.sessions = []
+
+    def tearDown(self):
+        for session in self.sessions:
+            session.close()
+        self.relay.close()
+
+    def connect(self, secrets, *, namespace=None):
+        namespace = namespace if namespace is not None else {"requests": requests}
+        userdata = SimpleNamespace(get=MagicMock(side_effect=lambda name: secrets[name]))
+        google, colab = ModuleType("google"), ModuleType("google.colab")
+        google.colab, colab.userdata = colab, userdata
+        session_class = requests.Session
+
+        def new_session():
+            session = session_class()
+            session.trust_env = False
+            original_get = session.get
+            # The notebook requires HTTPS; map the tunnel URL onto the real local test relay.
+            session.get = MagicMock(side_effect=lambda url, **kwargs: original_get(
+                url.replace(self.public_url, self.local_url, 1), **kwargs))
+            self.sessions.append(session)
+            return session
+
+        output = io.StringIO()
+        error = None
+        with patch.dict("sys.modules", {"google": google, "google.colab": colab}), \
+                patch("builtins.input", return_value=self.public_url) as manual_url, \
+                patch("getpass.getpass", return_value=TOKEN) as manual_token, \
+                patch.object(requests, "Session", side_effect=new_session), contextlib.redirect_stdout(output):
+            try:
+                exec(compile(self.source, "notebook-relay-settings", "exec"), namespace)
+            except ValueError as caught:
+                error = caught
+        self.assertNotIn(TOKEN, output.getvalue())
+        self.assertNotIn(TOKEN, str(error))
+        return namespace, manual_url, manual_token, error
+
+    def test_stored_secrets_connect_again_without_prompting_or_printing_token(self):
+        secrets = {"MINEBRIDGE_RELAY_URL": " " + self.public_url + "/ ",
+                   "MINEBRIDGE_RELAY_TOKEN": " " + TOKEN + " "}
+        namespace, manual_url, manual_token, error = self.connect(secrets)
+        self.assertIsNone(error)
+        manual_url.assert_not_called()
+        manual_token.assert_not_called()
+        self.assertEqual(namespace["relay_session"].headers["Authorization"], "Bearer " + TOKEN)
+        self.assertEqual(namespace["relay_session"].get.call_args.args[0], self.public_url + "/health")
+        first_session = namespace["relay_session"]
+        with patch.object(first_session, "close", wraps=first_session.close) as close:
+            namespace, manual_url, manual_token, error = self.connect(secrets, namespace=namespace)
+            close.assert_called_once()
+        self.assertIsNone(error)
+        manual_url.assert_not_called()
+        manual_token.assert_not_called()
+        self.assertIsNot(namespace["relay_session"], first_session)
+
+    def test_missing_token_uses_hidden_input_and_keeps_saved_url(self):
+        namespace, manual_url, manual_token, error = self.connect({"MINEBRIDGE_RELAY_URL": self.public_url})
+        self.assertIsNone(error)
+        manual_url.assert_not_called()
+        manual_token.assert_called_once()
+        self.assertEqual(namespace["relay_session"].headers["Authorization"], "Bearer " + TOKEN)
+
+    def test_wrong_saved_token_reports_relay_file_without_exposing_credentials(self):
+        wrong_token = TOKEN + "-wrong"
+        _, manual_url, manual_token, error = self.connect({"MINEBRIDGE_RELAY_URL": self.public_url,
+                                                          "MINEBRIDGE_RELAY_TOKEN": wrong_token})
+        manual_url.assert_not_called()
+        manual_token.assert_not_called()
+        self.assertIsInstance(error, ValueError)
+        self.assertIn("Windows-контроллера", str(error))
+        self.assertIn("relay-файла", str(error))
+        self.assertNotIn(wrong_token, str(error))
 
 
 def snapshot():
@@ -144,35 +287,6 @@ def snapshot():
             "actor": {"position": {"x": 0, "y": 64, "z": 0}, "health": 20},
             "inventory": [], "blocks": [], "entities": [],
             "context": {"menu_id": 0, "menu_revision": 0, "menu_slots": [], "cursor": {"type": "minecraft:air", "count": 0}}}
-
-
-class FakeOllama:
-    def __init__(self):
-        self.payloads = []
-        owner = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def do_POST(self):
-                value = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                owner.payloads.append(value)
-                data = json.dumps({"message": {"role": "assistant", "content": json.dumps(DECISION)}}).encode()
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-
-    def close(self):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2)
 
 
 class FakeVllm:
@@ -221,7 +335,7 @@ class FakeVllm:
         self.thread.join(timeout=2)
 
 
-def notebook_function(namespace, filename="ollama_colab.ipynb"):
+def notebook_function(namespace, filename="vllm_tpu_colab.ipynb"):
     notebook = json.loads((ROOT / "examples" / filename).read_text())
     functions = [node for cell in notebook["cells"] if cell["cell_type"] == "code"
                  for node in ast.parse("".join(cell["source"])).body if isinstance(node, ast.FunctionDef)]
@@ -457,6 +571,59 @@ class VllmAdapterTest(unittest.TestCase):
         self.model.content = json.dumps(decision)
         self.assertEqual(self.namespace["infer_decision"](payload), decision)
 
+    def test_new_game_actions_pass_through_vllm_without_parameter_rewriting(self):
+        cases = [
+            ("move.relative", {"forward": 2, "right": -1, "crouch": True}),
+            ("move.crouch", {"ticks": 40}),
+            ("look.turn", {"delta_yaw": 90, "delta_pitch": -15}),
+        ]
+        for action, parameters in cases:
+            with self.subTest(action=action):
+                payload = controller.model_payload("test new game action", snapshot(), [action], [], compact=True)
+                decision = {"action": action, "parameters": parameters, "reason": "documented action"}
+                self.model.content = json.dumps(decision)
+                self.assertEqual(self.namespace["infer_decision"](payload), decision)
+
+    def test_relative_movement_rejects_invalid_numbers_flags_and_distances(self):
+        cases = [
+            {}, {"forward": "3"}, {"forward": True}, {"forward": 17},
+            {"forward": 12, "right": 12}, {"forward": 1, "sprint": "true"},
+            {"forward": 1, "crouch": 1}, {"forward": 1, "sprint": True, "crouch": True},
+        ]
+        schema = controller.model_payload("move", snapshot(), ["move.relative"], [], compact=True)["format"]
+        for parameters in cases:
+            with self.subTest(parameters=parameters):
+                value = {"action": "move.relative", "parameters": parameters, "reason": "move"}
+                response = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(value)}}]}
+                with self.assertRaises(ValueError):
+                    self.namespace["parse_decision"](response, schema)
+
+    def test_crouch_duration_and_relative_turn_are_strictly_bounded(self):
+        cases = [
+            ("move.crouch", {"ticks": "20"}), ("move.crouch", {"ticks": True}),
+            ("move.crouch", {"ticks": 0}), ("move.crouch", {"ticks": 201}),
+            ("move.crouch", {"ticks": 1.5}), ("look.turn", {}),
+            ("look.turn", {"delta_yaw": "90"}), ("look.turn", {"delta_pitch": False}),
+            ("look.turn", {"delta_yaw": 181}), ("look.turn", {"delta_pitch": -91}),
+        ]
+        schema = controller.model_payload("turn/crouch", snapshot(), ["move.crouch", "look.turn"], [], compact=True)["format"]
+        for action, parameters in cases:
+            with self.subTest(action=action, parameters=parameters):
+                value = {"action": action, "parameters": parameters, "reason": "bounded action"}
+                response = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(value)}}]}
+                with self.assertRaises(ValueError):
+                    self.namespace["parse_decision"](response, schema)
+
+    def test_move_to_rejects_invalid_crouch_sprint_combination(self):
+        target = {"x": 1, "y": 64, "z": 0}
+        schema = controller.model_payload("walk", snapshot(), ["move.to"], [], compact=True)["format"]
+        for flags in ({"crouch": "true"}, {"sprint": 1}, {"sprint": True, "crouch": True}):
+            with self.subTest(flags=flags):
+                value = {"action": "move.to", "parameters": {"target": target, **flags}, "reason": "walk"}
+                response = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(value)}}]}
+                with self.assertRaises(ValueError):
+                    self.namespace["parse_decision"](response, schema)
+
     def test_disabled_vision_is_rejected_before_request(self):
         png = (ROOT / "docs/media/native-frame.png").read_bytes()
         payload = controller.model_payload("look east", snapshot(), ["look.at"], [], png, compact=True)
@@ -529,9 +696,12 @@ class VllmAdapterTest(unittest.TestCase):
 
 
 class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
-    async def integration(self, execute=False, vision=False, vllm=False, model_error=False, decision=DECISION):
+    async def integration(self, execute=False, vision=False, model_error=False, decision=DECISION, task_ticks=200, max_actions=4096, owner_restrictions=False):
         submitted = []
         capabilities = {"actions": [decision["action"]], "actor_id": "test-actor", "armed": True}
+        if owner_restrictions:
+            capabilities["actions"].append("combat.attack")
+            capabilities["profile"] = {"allowed_actions": [decision["action"]]}
 
         async def bridge_handler(socket):
             async for raw in socket:
@@ -568,7 +738,7 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
             args = controller.parser().parse_args(["--config", str(owner), "--relay-config", str(Path(directory) / "relay.json"),
                                                    "--relay-port", "0", "--goal", "look east", "--model-timeout", "5"])
             args.execute, args.vision = execute, vision
-            args.compact_observations = vllm
+            args.task_ticks, args.max_actions = task_ticks, max_actions
             async with serve(bridge_handler, "127.0.0.1", 0) as bridge_server:
                 args.url = f"ws://127.0.0.1:{bridge_server.sockets[0].getsockname()[1]}/bridge"
                 ready = asyncio.Event()
@@ -581,8 +751,8 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     ready.set()
                     return relay
 
-                model = FakeVllm(error=model_error) if vllm else FakeOllama()
-                if vllm:model.content=json.dumps(decision)
+                model = FakeVllm(error=model_error)
+                model.content = json.dumps(decision)
                 session = requests.Session()
                 session.trust_env = False
                 try:
@@ -593,12 +763,12 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
                         with requests.Session() as model_session:
                             model_session.trust_env = False
                             namespace = {"requests": requests, "json": json, "time": time, "base64": base64,
-                                         "MODEL": "fixture-model", "OLLAMA_URL": model.url, "MODEL_URL": model.url,
+                                         "MODEL": "fixture-model", "MODEL_URL": model.url,
                                          "MAX_MODEL_LEN": 2048, "MAX_NEW_TOKENS": 256, "MODEL_TIMEOUT": 5,
                                          "ENABLE_VISION": vision, "USE_STRUCTURED_OUTPUTS": False,
                                          "model_session": model_session,
                                          "RELAY_URL": f"http://127.0.0.1:{holder['relay'].port}", "relay_session": session}
-                            worker = notebook_function(namespace, "vllm_tpu_colab.ipynb" if vllm else "ollama_colab.ipynb")
+                            worker = notebook_function(namespace)
                             with patch.dict("os.environ", {"NO_PROXY": "127.0.0.1,localhost"}):
                                 outcomes = await asyncio.wait_for(asyncio.gather(
                                     task, asyncio.to_thread(worker, 1), return_exceptions=model_error), 15)
@@ -607,53 +777,48 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
                                 self.assertIn("vLLM", str(outcomes[0]))
                     self.assertEqual(len(model.payloads), 1)
                     self.assertEqual(model.payloads[0]["model"], "fixture-model")
-                    if vllm:
-                        self.assertEqual(len(model.token_requests), 1)
-                        self.assertNotIn("Authorization", model.headers[0])
-                        self.assertNotIn(holder["token"], json.dumps(model.payloads[0]))
-                        self.assertIn(json.dumps([decision["action"],"wait","finish"],separators=(",",":")), model.payloads[0]["messages"][0]["content"])
-                    else:
-                        self.assertEqual(model.payloads[0]["format"]["properties"]["action"]["enum"], ["look.at", "wait", "finish"])
+                    self.assertEqual(len(model.token_requests), 1)
+                    self.assertNotIn("Authorization", model.headers[0])
+                    self.assertNotIn(holder["token"], json.dumps(model.payloads[0]))
+                    self.assertIn(json.dumps([decision["action"], "wait", "finish"], separators=(",", ":")), model.payloads[0]["messages"][0]["content"])
+                    model_input = json.loads(model.payloads[0]["messages"][1]["content"]) if not vision else json.loads(model.payloads[0]["messages"][1]["content"][-1]["text"])
+                    self.assertEqual(model_input["task_limits"], {"timeout_ticks": task_ticks, "max_actions": max_actions})
                     self.assertEqual(len(submitted), 1 if execute and not model_error else 0)
                     if execute and not model_error:
                         self.assertEqual(submitted[0]["action"], decision["action"])
                         self.assertEqual(submitted[0]["parameters"], decision["parameters"])
+                        self.assertEqual(submitted[0]["timeout_ticks"], task_ticks)
+                        self.assertEqual(submitted[0]["max_actions"], max_actions)
                     if vision:
-                        if vllm:
-                            image = model.payloads[0]["messages"][1]["content"][0]
-                            self.assertEqual(image["type"], "image_url")
-                            encoded = image["image_url"]["url"].removeprefix("data:image/png;base64,")
-                            self.assertEqual(base64.b64decode(encoded), (ROOT / "docs/media/native-frame.png").read_bytes())
-                        else:
-                            self.assertIn("images", model.payloads[0]["messages"][1])
+                        image = model.payloads[0]["messages"][1]["content"][0]
+                        self.assertEqual(image["type"], "image_url")
+                        encoded = image["image_url"]["url"].removeprefix("data:image/png;base64,")
+                        self.assertEqual(base64.b64decode(encoded), (ROOT / "docs/media/native-frame.png").read_bytes())
                 finally:
                     session.close()
                     model.close()
 
-    async def test_preview_calls_notebook_and_ollama_without_submitting_game_action(self):
+    async def test_vllm_preview_uses_openai_api_without_submitting_game_action(self):
         await self.integration()
 
-    async def test_execution_submits_decision_and_reads_terminal_result(self):
+    async def test_vllm_execution_submits_decision_and_reads_result(self):
         await self.integration(execute=True)
 
-    async def test_vision_sends_native_png_to_notebook_model_call(self):
-        await self.integration(vision=True)
+    async def test_owner_restrictions_are_applied_to_the_model_action_schema(self):
+        await self.integration(execute=True, owner_restrictions=True)
 
-    async def test_vllm_preview_uses_openai_api_without_submitting_game_action(self):
-        await self.integration(vllm=True)
-
-    async def test_vllm_execution_submits_decision_and_reads_result(self):
-        await self.integration(execute=True, vllm=True)
+    async def test_explicit_task_budget_is_sent_to_model_and_preserved_on_submission(self):
+        await self.integration(execute=True, task_ticks=60, max_actions=1)
 
     async def test_vllm_jump_count_is_submitted_as_one_task(self):
-        await self.integration(execute=True,vllm=True,decision={
+        await self.integration(execute=True,decision={
             "action":"move.jump","parameters":{"count":10},"reason":"Jump ten times"})
 
     async def test_vllm_vision_preserves_png_in_openai_image_message(self):
-        await self.integration(vision=True, vllm=True)
+        await self.integration(vision=True)
 
     async def test_vllm_failure_never_submits_game_action(self):
-        await self.integration(execute=True, vllm=True, model_error=True)
+        await self.integration(execute=True, model_error=True)
 
     async def test_interrupt_before_colab_connects_releases_startup_waiter(self):
         with tempfile.TemporaryDirectory() as directory:
