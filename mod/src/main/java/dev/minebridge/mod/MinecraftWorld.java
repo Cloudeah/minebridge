@@ -23,6 +23,7 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.phys.*;
+import net.minecraft.world.phys.shapes.CollisionContext;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -228,7 +229,7 @@ final class MinecraftWorld implements WorldAccess {
         return Set.of("move.to","move.follow","move.jump","move.relative","move.crouch","route.plan","look.at","look.turn","combat.attack","combat.ranged","item.use","item.drop","item.pickup","world.interact","block.break","block.place",
                 "inventory.inspect","inventory.select","inventory.select_item","inventory.transfer","inventory.equip","inventory.swap","container.open","container.close","craft.plan","craft.execute","build.plan","build.execute");
     }
-    @Override public Set<String> actionFeatures(String action){if(!mc.hasSingleplayerServer())return Set.of();return switch(action){case "combat.attack"->Set.of("confirmed_melee_v1");case "craft.execute"->Set.of("craft_station_v1");case "block.place","build.execute"->Set.of("confirmed_placement_v1");default->Set.of();};}
+    @Override public Set<String> actionFeatures(String action){if(!mc.hasSingleplayerServer())return Set.of();return switch(action){case "combat.attack"->Set.of("confirmed_melee_v1");case "craft.execute"->Set.of("craft_station_v1");case "block.place"->Set.of("confirmed_placement_v1");case "build.execute"->Set.of("confirmed_placement_v1","multiblock_blueprint_v1");default->Set.of();};}
     @Override public void validate(String action,JsonObject p) {
         switch(action) {
             case "move.to"->{point(child(p,"target"));MovementCommands.validateTravel(p);}
@@ -263,7 +264,7 @@ final class MinecraftWorld implements WorldAccess {
                 if(p.has("menu_revision"))integer(p,"menu_revision",0,0,Integer.MAX_VALUE);
             }
             case "craft.execute"->{Identifier.parse(string(p,"item"));integer(p,"count",1,1,4096);CraftSequence.validate(p);}
-            case "build.execute"->{var plan=new BuildPlanner().plan(p);for(var b:plan.blocks())checkArea(new Vec3(b.x()+0.5,b.y()+0.5,b.z()+0.5));}
+            case "build.execute"->{var plan=buildPlan(p);for(var b:plan.blocks())checkArea(new Vec3(b.x()+0.5,b.y()+0.5,b.z()+0.5));}
             case "item.use"->{String hand=string(p,"hand","main");if(!hand.equals("main")&&!hand.equals("off"))throw new BridgeException("invalid_request","hand must be main/off");integer(p,"duration_ticks",40,1,1200);if(p.has("target"))point(child(p,"target"));}
             case "item.drop"->{ItemDropSequence.count(p);if(!string(p,"hand","main").equals("main"))throw new BridgeException("invalid_request","item.drop supports only the selected main hand");if(p.has("expected_item"))Identifier.parse(string(p,"expected_item"));}
             case "item.pickup"->{UUID.fromString(string(p,"entity_id"));if(p.has("count"))throw new BridgeException("invalid_request","item.pickup collects the whole ground stack; count is not supported");}
@@ -840,11 +841,16 @@ final class MinecraftWorld implements WorldAccess {
     private void updatePlacementReceipt(Task task,JsonObject receipt) {
         if(receipt==null || string(task.context,"placement_receipt","").equals(string(receipt,"receipt_id")))return;
         task.context.addProperty("placement_receipt",string(receipt,"receipt_id"));task.confirmed.add("placement",receipt);
-        int changed=0;
+        int changed=0;JsonArray placed=task.context.has("placed_cells")?task.context.getAsJsonArray("placed_cells"):new JsonArray();
         for(JsonElement element:receipt.getAsJsonArray("cells")) {
             JsonObject cell=element.getAsJsonObject();if(cell.get("before").equals(cell.get("after")))continue;
             changed++;confirmBlock(task,block(child(cell,"position")),object("block",cell.get("after"),"tick",receipt.get("tick")));
+            if(task.action.equals("build.execute")){
+                for(int i=placed.size()-1;i>=0;i--)if(child(placed.get(i).getAsJsonObject(),"position").equals(child(cell,"position")))placed.remove(i);
+                placed.add(object("position",cell.get("position").deepCopy(),"after",cell.get("after").deepCopy()));
+            }
         }
+        if(task.action.equals("build.execute"))task.context.add("placed_cells",placed);
         task.confirmed.addProperty("placed_blocks",integer(task.confirmed,"placed_blocks",0,0,Integer.MAX_VALUE)+changed);
         task.confirmed.add("placed",receipt.get("position"));
     }
@@ -885,7 +891,9 @@ final class MinecraftWorld implements WorldAccess {
         if(view!=null && matches(child(view,"block"),type,wanted)){
             confirmBlock(t,p,view);t.context.remove("material_sent");placementMaterials.remove(t.id);
             JsonArray matched=t.context.has("matched_cells")?t.context.getAsJsonArray("matched_cells"):new JsonArray();JsonObject position=position(p);
-            if(!matched.contains(position)){matched.add(position);t.context.add("matched_cells",matched);t.confirmed.addProperty("matched_blocks",matched.size());}
+            boolean placedHere=false;
+            if(t.context.has("placed_cells"))for(JsonElement element:t.context.getAsJsonArray("placed_cells")){JsonObject cell=element.getAsJsonObject();if(child(cell,"position").equals(position) && child(cell,"after").equals(child(view,"block"))){placedHere=true;break;}}
+            if(!placedHere && !matched.contains(position)){matched.add(position);t.context.add("matched_cells",matched);t.confirmed.addProperty("matched_blocks",matched.size());}
             return Step.success(object("position",position,"state",view.get("block"),"outcome","already_present","source","integrated_server"));
         }
         if(matches(mc.level.getBlockState(p),type,wanted))return Step.waiting(object("waiting","server_confirmation_of_existing_block"));
@@ -919,12 +927,16 @@ final class MinecraftWorld implements WorldAccess {
         if(number(view,"menu_id",-1)!=0 || integer(child(view,"cursor"),"count",0,0,64)!=0 || bool(view,"using_item",false))throw new BridgeException("item_busy","Server actor is not ready to place blocks");
         if(!child(view,"block").equals(blockSample(mc.level.getBlockState(p))))throw new BridgeException("target_changed","Placement cell changed between client and server");
         look(hit.getLocation());
-        if(wanted.has("facing")){String face=wanted.get("facing").getAsString();switch(face){case "north"->mc.player.setYRot(0);case "south"->mc.player.setYRot(180);case "east"->mc.player.setYRot(90);case "west"->mc.player.setYRot(-90);default->{}}}
+        if(wanted.has("facing")){String face=wanted.get("facing").getAsString();boolean direct=placementKind(type)!=BuildPlanner.Kind.SINGLE;switch(face){case "north"->mc.player.setYRot(direct?180:0);case "south"->mc.player.setYRot(direct?0:180);case "east"->mc.player.setYRot(direct?-90:90);case "west"->mc.player.setYRot(direct?90:-90);default->{}}}
         if(!t.context.has("placement_look_started")){t.context.addProperty("placement_look_started",tick());return Step.waiting(object("stage","server_placement_orientation"));}
         if(Math.abs(MovementCommands.wrapYaw(number(view,"yaw",0)-mc.player.getYRot()))>0.1 || Math.abs(number(view,"pitch",0)-mc.player.getXRot())>0.1){
             if(tick()-number(t.context,"placement_look_started",tick())>20)throw new BridgeException("look_unconfirmed","Server did not confirm placement orientation before click");
             return Step.waiting(object("stage","server_placement_orientation"));
         }
+        var placementContext=new net.minecraft.world.item.context.BlockPlaceContext(mc.player,InteractionHand.MAIN_HAND,mc.player.getMainHandItem(),hit);
+        BlockState preview=((BlockItem)material).getBlock().getStateForPlacement(placementContext);
+        if(preview==null || !preview.canSurvive(mc.level,p))throw new BridgeException("missing_support","Block cannot be placed with the current support or adjacent cells",true);
+        if(!mc.level.isUnobstructed(preview,p,CollisionContext.placementContext(mc.player)))throw new BridgeException("placement_obstructed","An entity obstructs this placement; move it before a new task",true);
         ActionBudget.require(t,1);
         placement.begin(t.id,position(p),child(view,"block"),type,wanted,position(hit.getBlockPos()),hit.getDirection().getName(),heldStack(materialSnapshot.stack()),materialSnapshot.selected(),(long)number(view,"tick",tick()));
         mc.gameMode.useItemOn(mc.player,InteractionHand.MAIN_HAND,hit);t.context.addProperty("placing",tick());t.actions++;return Step.waiting(object("stage","placing","position",position(p)));
@@ -1375,8 +1387,50 @@ final class MinecraftWorld implements WorldAccess {
         t.context.addProperty("craft_before",integer(child(baseline,"inventory_counts"),step.item(),0,0,Integer.MAX_VALUE));sequence.begin(CraftSequence.Operation.OUTPUT,tick());click(menu.getResultSlot().index,0,ContainerInput.QUICK_MOVE);t.actions++;t.context.addProperty("craft_sent",tick());t.context.remove("grid_cleared");
         return Step.waiting(object("stage","crafting","recipe",step.recipe()));
     }
+    private BuildPlanner.Kind placementKind(String type) {
+        Identifier id=Identifier.parse(type);if(!id.getNamespace().equals("minecraft"))return BuildPlanner.Kind.SINGLE;
+        var block=BuiltInRegistries.BLOCK.getValue(id);
+        if(block instanceof net.minecraft.world.level.block.DoorBlock)return BuildPlanner.Kind.DOOR;
+        if(block instanceof net.minecraft.world.level.block.BedBlock)return BuildPlanner.Kind.BED;
+        return BuildPlanner.Kind.SINGLE;
+    }
+    private BuildPlanner.Plan buildPlan(JsonObject data){return new BuildPlanner().plan(data,this::placementKind);}
+    private BuildPlanner.Placement buildPlacement(BuildPlanner.Plan plan,BuildPlanner.Block block) {
+        return plan.placements().stream().filter(p->p.cells().contains(block)).findFirst().orElseThrow();
+    }
+    private boolean buildOccupiesPlayer(BuildPlanner.Placement placement) {
+        return placement.cells().stream().anyMatch(b->mc.player.getBoundingBox().intersects(new AABB(new BlockPos(b.x(),b.y(),b.z()))));
+    }
+    private boolean visibleBuildSupport(Vec3 eye,BlockPos p,JsonObject wanted) {
+        for(Direction face:Direction.values()) {
+            if(wanted.has("axis") && !face.getAxis().getName().equals(wanted.get("axis").getAsString()))continue;
+            BlockPos support=p.relative(face.getOpposite());BlockState state=mc.level.getBlockState(support);if(state.canBeReplaced() || state.getCollisionShape(mc.level,support).isEmpty())continue;
+            Vec3 aim=Vec3.atCenterOf(support).add(Vec3.atLowerCornerOf(face.getUnitVec3i()).scale(0.49));
+            BlockHitResult ray=mc.level.clip(new ClipContext(eye,aim,ClipContext.Block.OUTLINE,ClipContext.Fluid.NONE,mc.player));
+            if(ray.getType()==HitResult.Type.BLOCK&&ray.getBlockPos().equals(support)&&ray.getDirection()==face)return true;
+        }
+        return false;
+    }
+    private Vec3 buildStand(BuildPlanner.Plan plan,BlockPos p,JsonObject wanted,boolean requireVisible) {
+        List<Vec3> candidates=new ArrayList<>();int feet=mc.player.blockPosition().getY();
+        for(int y=feet-1;y<=feet+1;y++)for(int dx=-3;dx<=3;dx++)for(int dz=-3;dz<=3;dz++) {
+            Pathfinder.Cell c=new Pathfinder.Cell(p.getX()+dx,y,p.getZ()+dz);if(terrain(c)!=Pathfinder.Terrain.WALKABLE)continue;
+            Vec3 at=new Vec3(c.x()+0.5,c.y(),c.z()+0.5),eye=at.add(0,mc.player.getEyeHeight(),0);if(at.distanceTo(mc.player.position())<0.5 || eye.distanceTo(Vec3.atCenterOf(p))>mc.player.blockInteractionRange())continue;
+            AABB standing=mc.player.getDimensions(Pose.STANDING).makeBoundingBox(at).inflate(0.05);
+            if(plan.blocks().stream().anyMatch(b->standing.intersects(new AABB(new BlockPos(b.x(),b.y(),b.z())))))continue;
+            if(requireVisible && !visibleBuildSupport(eye,p,wanted))continue;candidates.add(at);
+        }
+        candidates.sort(Comparator.comparingDouble(at->at.distanceToSqr(mc.player.position())));
+        for(Vec3 at:candidates)try{path(at);return at;}catch(BridgeException blocked){if(!Set.of("path_unreachable","chunk_unavailable").contains(blocked.code))throw blocked;}
+        return null;
+    }
+    private Step buildReposition(Task t,Vec3 stand,String stage,int index) {
+        if(stand==null)throw new BridgeException("path_unreachable","No reachable standing place outside the blueprint",true);
+        t.context.add("build_stand",vector(stand));routes.remove(t.id);t.context.remove("material_sent");t.context.remove("placement_look_started");placementMaterials.remove(t.id);
+        return Step.waiting(object("stage",stage,"confirmed_blocks",index));
+    }
     private Step build(Task t) {
-        BuildPlanner.Plan plan=builds.computeIfAbsent(t.id,key->new BuildPlanner().plan(t.parameters));
+        BuildPlanner.Plan plan=builds.computeIfAbsent(t.id,key->buildPlan(t.parameters));
         if(bool(t.parameters,"replace",false))throw new BridgeException("unsupported_capability","Automatic replacement is disabled; authorize block.break separately");
         int index=integer(t.context,"build_index",0,0,4096);
         if(index>=plan.blocks().size()){
@@ -1394,34 +1448,22 @@ final class MinecraftWorld implements WorldAccess {
             if(approaching.done()){t.context.remove("build_stand");routes.remove(t.id);hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);}
             return approaching.error()!=null?approaching:Step.waiting(object("stage","finding_visible_build_face","movement",approaching.result()));
         }
+        var structure=buildPlacement(plan,b);
+        if(!structure.primary().equals(b))throw new BridgeException("build_conflict","A structure part is missing; inspect both parts and authorize removal separately");
+        for(var part:structure.cells()){BlockPos pos=new BlockPos(part.x(),part.y(),part.z());if(!clientChunkLoaded(pos))throw new BridgeException("chunk_unavailable","Structure crosses unloaded chunk",true);if(!mc.level.getBlockState(pos).canBeReplaced())throw new BridgeException("build_conflict","A structure cell is protected; partial structures are not overwritten");}
+        if(buildOccupiesPlayer(structure))return buildReposition(t,buildStand(plan,p,b.properties(),true),"clearing_build_cell",index);
         if(mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(p))>mc.player.blockInteractionRange()) {
-            Vec3 stand=null;double best=Double.MAX_VALUE;
-            for(int dx=-2;dx<=2;dx++)for(int dz=-2;dz<=2;dz++){Pathfinder.Cell c=new Pathfinder.Cell(b.x()+dx,b.y(),b.z()+dz);Vec3 v=new Vec3(c.x()+0.5,c.y(),c.z()+0.5);if((dx!=0||dz!=0)&&terrain(c)==Pathfinder.Terrain.WALKABLE && v.distanceTo(mc.player.position())<best){best=v.distanceTo(mc.player.position());stand=v;}}
-            if(stand==null)throw new BridgeException("path_unreachable","No standing place near build cell");Step approach=move(t,stand,0.65,false);return approach.error()!=null?approach:Step.waiting(object("stage","approaching_build_cell","movement",approach.result()));
+            return buildReposition(t,buildStand(plan,p,b.properties(),false),"approaching_build_cell",index);
         }
         hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);
         Step placed;
         try {placed=placeBlock(t,p,b.type(),b.properties());}
         catch(BridgeException e) {
             if(!e.code.equals("missing_support") || integer(t.context,"reposition_count",0,0,3)>=3)throw e;
-            Vec3 standing=null;double best=Double.MAX_VALUE;
-            for(int dx=-2;dx<=2;dx++)for(int dz=-2;dz<=2;dz++) {
-                if(dx==0&&dz==0)continue;Pathfinder.Cell candidate=new Pathfinder.Cell(p.getX()+dx,p.getY(),p.getZ()+dz);if(terrain(candidate)!=Pathfinder.Terrain.WALKABLE)continue;
-                Vec3 at=new Vec3(candidate.x()+0.5,candidate.y(),candidate.z()+0.5),eye=at.add(0,mc.player.getEyeHeight(),0);
-                if(at.distanceTo(mc.player.position())<0.5)continue;
-                if(eye.distanceTo(Vec3.atCenterOf(p))>mc.player.blockInteractionRange())continue;
-                boolean supportVisible=false;
-                for(Direction face:Direction.values()) {
-                    BlockPos support=p.relative(face.getOpposite());if(mc.level.getBlockState(support).getCollisionShape(mc.level,support).isEmpty())continue;
-                    Vec3 aim=Vec3.atCenterOf(support).add(Vec3.atLowerCornerOf(face.getUnitVec3i()).scale(0.49));
-                    BlockHitResult ray=mc.level.clip(new ClipContext(eye,aim,ClipContext.Block.OUTLINE,ClipContext.Fluid.NONE,mc.player));
-                    if(ray.getType()==HitResult.Type.BLOCK&&ray.getBlockPos().equals(support)&&ray.getDirection()==face){supportVisible=true;break;}
-                }
-                if(supportVisible && at.distanceTo(mc.player.position())<best){try{path(at);}catch(BridgeException blocked){continue;}best=at.distanceTo(mc.player.position());standing=at;}
-            }
+            Vec3 standing=buildStand(plan,p,b.properties(),true);
             if(standing==null)throw e;
-            t.context.add("build_stand",vector(standing));t.context.addProperty("reposition_count",integer(t.context,"reposition_count",0,0,3)+1);routes.remove(t.id);
-            return Step.waiting(object("stage","repositioning_for_support","confirmed_blocks",index));
+            t.context.addProperty("reposition_count",integer(t.context,"reposition_count",0,0,3)+1);
+            return buildReposition(t,standing,"repositioning_for_support",index);
         }
         return buildPlacementProgress(t,plan,index,placed);
     }
@@ -1450,10 +1492,15 @@ final class MinecraftWorld implements WorldAccess {
             case "route.plan" -> object("path",path(point(child(d,"target"))),"modes",List.of("walk","jump"),"unknown_cells","excluded");
             case "craft.plan" -> craftPlan(d);
             case "build.plan" -> {
-                var plan=new BuildPlanner().plan(d);JsonArray conflicts=new JsonArray();Map<String,Integer> needed=new HashMap<>();
-                for(var b:plan.blocks()){BlockPos p=new BlockPos(b.x(),b.y(),b.z());checkArea(Vec3.atCenterOf(p));if(!clientChunkLoaded(p))throw new BridgeException("chunk_unavailable","Blueprint crosses unloaded chunk");BlockState actual=mc.level.getBlockState(p);if(matches(actual,b.type(),b.properties()))continue;if(!actual.canBeReplaced())conflicts.add(position(p));needed.merge(b.type(),1,Integer::sum);}
+                var plan=buildPlan(d);JsonArray conflicts=new JsonArray();Map<String,Integer> needed=new HashMap<>();int placements=0;
+                for(var b:plan.blocks()){BlockPos p=new BlockPos(b.x(),b.y(),b.z());checkArea(Vec3.atCenterOf(p));if(!clientChunkLoaded(p))throw new BridgeException("chunk_unavailable","Blueprint crosses unloaded chunk");}
+                for(var placement:plan.placements()){
+                    boolean ready=placement.cells().stream().allMatch(b->matches(mc.level.getBlockState(new BlockPos(b.x(),b.y(),b.z())),b.type(),b.properties()));if(ready)continue;
+                    placements++;needed.merge(placement.primary().type(),1,Integer::sum);
+                    for(var b:placement.cells()){BlockPos pos=new BlockPos(b.x(),b.y(),b.z());if(!mc.level.getBlockState(pos).canBeReplaced())conflicts.add(position(pos));}
+                }
                 Map<String,Integer> missing=new HashMap<>(),counts=counts();needed.forEach((k,v)->{int m=v-counts.getOrDefault(k,0);if(m>0)missing.put(k,m);});
-                yield object("blocks",plan.blocks(),"materials",needed,"missing",missing,"conflicts",conflicts,"replacement","explicit_break_required","supports","verified_during_execution");
+                yield object("blocks",plan.blocks(),"materials",needed,"missing",missing,"conflicts",conflicts,"required_placements",placements,"executable",missing.isEmpty()&&conflicts.isEmpty(),"replacement","explicit_break_required","supports","verified_during_execution");
             }
             default -> throw new BridgeException("unsupported_capability",operation);
         };

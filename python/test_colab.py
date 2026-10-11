@@ -1204,6 +1204,8 @@ class InventoryDecisionTest(unittest.TestCase):
         caps['action_features'] = {"block.place": ['confirmed_placement_v1']}
         self.assertEqual(controller.available_actions(caps), ['block.place', 'look.at'])
         caps['action_features']['build.execute'] = ['confirmed_placement_v1']
+        self.assertEqual(controller.available_actions(caps), ['block.place', 'look.at'])
+        caps['action_features']['build.execute'].append('multiblock_blueprint_v1')
         self.assertEqual(controller.available_actions(caps), ['block.place', 'build.execute', 'look.at'])
         for features in (None, [], {'block.place': 'confirmed_placement_v1'}, {'build.execute': True}):
             caps['action_features'] = features

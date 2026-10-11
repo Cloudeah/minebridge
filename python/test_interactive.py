@@ -58,7 +58,7 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
         if craft:
             model.content = json.dumps(craft_decision)
         placement_decision = {"action": "build.execute" if build else "block.place", "parameters":
-                              {"origin": {"x": 0, "y": 56, "z": 2}, "rotation": 90, "replace": False, "blocks": [{"x": 0, "y": 0, "z": 0, "type": "minecraft:oak_log", "properties": {"axis": "y"}}]} if build else
+                              {"origin": {"x": 0, "y": 56, "z": 2}, "rotation": 90, "replace": False, "blocks": [{"x": 1, "y": 0, "z": 0, "type": "minecraft:red_bed", "properties": {"part": "head", "facing": "east"}}, {"x": 0, "y": 0, "z": 0, "type": "minecraft:red_bed", "properties": {"part": "foot", "facing": "east"}}]} if build else
                               {"position": {"x": 0, "y": 56, "z": 2}, "block": "minecraft:oak_log", "properties": {"axis": "y"}}, "reason": "place observed material"}
         if placement:
             model.content = json.dumps(placement_decision)
@@ -93,6 +93,8 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
         if placement:
             capabilities['actions'] = [placement_decision['action']]
             capabilities['action_features'] = {placement_decision['action']: ['confirmed_placement_v1']}
+            if build:
+                capabilities['action_features']['build.execute'].append('multiblock_blueprint_v1')
 
         if query_first:
             capabilities["queries"] = ["craft.plan"]

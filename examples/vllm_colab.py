@@ -38,7 +38,7 @@ ACTION_HELP = {
     "inventory.equip": "from_slot:observed menu slot,equipment_slot:head/chest/legs/feet/offhand; whole stack (armor max1), old gear returns to source; close container; needs 1 or 3 actions",
     "inventory.swap": "from_slot,to_slot:observed player-menu slots; exchange whole stacks; close container; needs 1 or 3 actions",
     "craft.execute": "item:namespace:id,count:1..4096 total,auto_station:bool(defaulttrue),station_position:{x,y,z} optional; opens visible in-reach vanilla table if 3x3 needed,1 extra action; no walking or mining",
-    "build.execute": "origin:{x,y,z},rotation:0/90/180/270,replace:false,blocks:[{x,y,z,type,properties:{}}]; placed_blocks counts changed cells,matched_blocks counts already matching cells",
+    "build.execute": "origin:{x,y,z},rotation:0/90/180/270,replace:false,blocks:[{x,y,z,type,properties:{}}]; door half:lower/upper,bed part:foot/head + facing; paired cells use 1 item; clears player from build cells",
 }
 
 
@@ -47,7 +47,7 @@ QUERY_HELP = {
     "map.query": "x,y,z,radius:1..64,block/blocks optional,limit:1..128",
     "memory.query": "same as map.query; observed facts and separate AI notes",
     "craft.plan": "same parameters as craft.execute; recipe chain, missing materials/stations,chosen station and opening cost",
-    "build.plan": "same parameters as build.execute; materials/conflicts",
+    "build.plan": "same as build.execute; expanded cells,materials,missing,conflicts,required_placements",
     "route.plan": "target:{x,y,z}; safe loaded route",
     "inventory.inspect": "item:namespace:id optional; current inventory/menu",
 }
@@ -213,6 +213,8 @@ def available_actions(capabilities):
     for action in ("block.place", "build.execute"):
         placement = features.get(action, []) if isinstance(features, dict) else []
         if not isinstance(placement, list) or "confirmed_placement_v1" not in placement:
+            allowed.discard(action)
+        if action == "build.execute" and (not isinstance(placement, list) or "multiblock_blueprint_v1" not in placement):
             allowed.discard(action)
     owner_actions = capabilities.get("profile", {}).get("allowed_actions", [])
     if owner_actions:
