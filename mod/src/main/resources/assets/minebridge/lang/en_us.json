@@ -64,5 +64,7 @@
   "screen.minebridge.progress.interactions": "interactions: %s",
   "screen.minebridge.action.inventory.swap": "Swap stacks",
   "screen.minebridge.progress.inventory_swaps": "swaps: %s",
-  "screen.minebridge.progress.equips": "equipped: %s"
+  "screen.minebridge.progress.equips": "equipped: %s",
+  "screen.minebridge.progress.placed_blocks": "placed: %s",
+  "screen.minebridge.progress.matched_blocks": "matched: %s"
 }

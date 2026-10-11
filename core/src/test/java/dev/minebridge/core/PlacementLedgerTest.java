@@ -1,0 +1,28 @@
+package dev.minebridge.core;
+
+import com.google.gson.*;
+import org.junit.jupiter.api.Test;
+import static dev.minebridge.core.Json.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+class PlacementLedgerTest {
+    final JsonObject pos=object("x",0,"y",64,"z",2),support=object("x",0,"y",63,"z",2),air=state("air"),stone=state("stone"),material=object("type","minecraft:stone","count",8,"damage",0);
+    JsonObject state(String type){return object("type","minecraft:"+type,"properties",object());}
+    JsonArray cells(){JsonArray cells=new JsonArray();cells.add(object("position",pos,"before",air,"after",stone));return cells;}
+    PlacementLedger ledger(){var l=new PlacementLedger("actor","dimension");l.begin("task",pos,air,"minecraft:stone",object(),support,"up",material,0,10);return l;}
+    void click(PlacementLedger l){assertEquals("task",l.clicked("actor","dimension","main",support,"up",material,0,11));}
+    void attempt(PlacementLedger l){click(l);assertEquals("task",l.attempt("actor","dimension",cells(),11));}
+    boolean complete(PlacementLedger l,JsonArray actual,boolean canceled,boolean exact){return l.complete("task","actor","dimension",actual,object("type","minecraft:stone","count",7,"damage",0),0,12,canceled,exact);}
+    @Test void matchingClickEventAndDeferredStateConfirmOnePlacement(){var l=ledger();attempt(l);assertTrue(complete(l,cells(),false,true));assertEquals("integrated_server_block_place",string(l.peek("task"),"source"));assertFalse(complete(l,cells(),false,true));}
+    @Test void worldStateWithoutTheClickAndPlacementEventCannotConfirm(){var l=ledger();assertNull(l.attempt("actor","dimension",cells(),11));assertFalse(complete(l,cells(),false,true));click(l);assertFalse(complete(l,cells(),false,true));assertNull(l.peek("task"));}
+    @Test void wrongActorDimensionHandFaceMaterialSlotAndOldClickCannotBind(){var l=ledger();assertNull(l.clicked("other","dimension","main",support,"up",material,0,11));assertNull(l.clicked("actor","other","main",support,"up",material,0,11));assertNull(l.clicked("actor","dimension","off",support,"up",material,0,11));assertNull(l.clicked("actor","dimension","main",support,"down",material,0,11));assertNull(l.clicked("actor","dimension","main",pos,"up",material,0,11));assertNull(l.clicked("actor","dimension","main",support,"up",object("type","minecraft:stone","count",7),0,11));assertNull(l.clicked("actor","dimension","main",support,"up",material,1,11));assertNull(l.clicked("actor","dimension","main",support,"up",material,0,9));assertNull(l.clicked("actor","dimension","main",support,"up",material,0,31));click(l);}
+    @Test void wrongTargetOriginalStateAndDuplicateCellsCannotBind(){var l=ledger();click(l);var c=cells();c.get(0).getAsJsonObject().add("position",support);assertNull(l.attempt("actor","dimension",c,11));c=cells();c.get(0).getAsJsonObject().add("before",stone);assertNull(l.attempt("actor","dimension",c,11));c=cells();c.add(c.get(0).deepCopy());assertNull(l.attempt("actor","dimension",c,11));assertEquals("task",l.attempt("actor","dimension",cells(),11));}
+    @Test void canceledPlacementCannotConfirmEvenIfTargetWasFilledLater(){var l=ledger();attempt(l);assertFalse(complete(l,cells(),true,true));assertEquals("permission_denied",l.error("task"));assertNull(l.peek("task"));}
+    @Test void changedMaterialOrChangedActualStateIsUnconfirmed(){for(boolean materialChanged:new boolean[]{false,true}){var l=ledger();attempt(l);JsonArray actual=cells();if(!materialChanged)actual.get(0).getAsJsonObject().add("after",air);assertFalse(complete(l,actual,false,!materialChanged));assertEquals("placement_unconfirmed",l.error("task"));}}
+    @Test void pauseBeforeCompletionPreventsAttributionAndNeverRearms(){var l=ledger();attempt(l);l.suspend();assertFalse(complete(l,cells(),false,true));assertTrue(l.interrupted("task"));assertNull(l.clicked("actor","dimension","main",support,"up",material,0,12));}
+    @Test void confirmedResultSurvivesPauseAndIsDefensivelyCopied(){var l=ledger();attempt(l);complete(l,cells(),false,true);l.suspend();var receipt=l.peek("task");receipt.addProperty("source","invented");assertEquals("integrated_server_block_place",string(l.finish("task"),"source"));assertNull(l.peek("task"));}
+    @Test void lateOrForeignCompletionCannotConfirm(){var l=ledger();attempt(l);assertFalse(l.complete("task","actor","other",cells(),material,0,12,false,true));assertFalse(l.complete("task","other","dimension",cells(),material,0,12,false,true));assertFalse(l.complete("task","actor","dimension",cells(),material,1,12,false,true));assertEquals("placement_unconfirmed",l.error("task"));l=ledger();attempt(l);assertFalse(l.complete("task","actor","dimension",cells(),material,0,32,false,true));assertNull(l.peek("task"));}
+    @Test void ambiguousClicksAndDuplicateEventsCannotBind(){var l=ledger();l.begin("second",pos,air,"minecraft:stone",object(),support,"up",material,0,10);assertNull(l.clicked("actor","dimension","main",support,"up",material,0,11));l.end("second");attempt(l);assertNull(l.attempt("actor","dimension",cells(),11));}
+    @Test void multiCellPlacementRetainsEveryActualChangedCell(){var l=ledger();click(l);JsonArray c=cells();c.add(object("position",object("x",0,"y",65,"z",2),"before",air,"after",stone));assertEquals("task",l.attempt("actor","dimension",c,11));assertTrue(complete(l,c,false,true));assertEquals(2,l.peek("task").getAsJsonArray("cells").size());}
+    @Test void wrongPropertiesRetainTheRealEffectWithoutClaimingTaskSuccess(){var l=new PlacementLedger("actor","dimension");l.begin("task",pos,air,"minecraft:stone",object("axis","y"),support,"up",material,0,10);attempt(l);assertTrue(complete(l,cells(),false,true));assertEquals("placement_mismatch",l.error("task"));assertNotNull(l.peek("task"));}
+}

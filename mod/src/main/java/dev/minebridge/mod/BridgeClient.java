@@ -57,6 +57,7 @@ public final class BridgeClient {
         NeoForge.EVENT_BUS.addListener(this::entityInteractSpecific);
         NeoForge.EVENT_BUS.addListener(this::blockInteract);
         NeoForge.EVENT_BUS.addListener(net.neoforged.bus.api.EventPriority.LOWEST,true,this::blockBreak);
+        NeoForge.EVENT_BUS.addListener(net.neoforged.bus.api.EventPriority.LOWEST,true,this::blockPlace);
     }
     private void pickup(net.neoforged.neoforge.event.entity.player.ItemEntityPickupEvent.Post event){
         MinecraftWorld activeWorld=world;
@@ -72,6 +73,7 @@ public final class BridgeClient {
     private void entityInteract(net.neoforged.neoforge.event.entity.player.PlayerInteractEvent.EntityInteract event){MinecraftWorld w=world;if(w!=null)w.recordInteraction(event,"entity:"+event.getTarget().getUUID());}
     private void entityInteractSpecific(net.neoforged.neoforge.event.entity.player.PlayerInteractEvent.EntityInteractSpecific event){MinecraftWorld w=world;if(w!=null)w.recordInteraction(event,"entity:"+event.getTarget().getUUID());}
     private void blockBreak(net.neoforged.neoforge.event.level.block.BreakBlockEvent event){MinecraftWorld w=world;if(w!=null)w.recordBlockBreak(event);}
+    private void blockPlace(net.neoforged.neoforge.event.level.BlockEvent.EntityPlaceEvent event){MinecraftWorld w=world;if(w!=null)w.recordBlockPlace(event);}
     private void blockInteract(net.neoforged.neoforge.event.entity.player.PlayerInteractEvent.RightClickBlock event){MinecraftWorld w=world;if(w!=null){var p=event.getPos();w.recordInteraction(event,"block:"+p.getX()+","+p.getY()+","+p.getZ());}}
     private void projectileTick(net.neoforged.neoforge.event.tick.EntityTickEvent.Pre event){
         MinecraftWorld activeWorld=world;if(activeWorld!=null)activeWorld.recordProjectile(event.getEntity());

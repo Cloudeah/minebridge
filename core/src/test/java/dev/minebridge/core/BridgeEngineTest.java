@@ -147,6 +147,14 @@ class BridgeEngineTest {
         JsonObject summary=engine.modelStatus().getAsJsonObject("recent_task").getAsJsonObject("confirmed_changes");
         assertEquals(1,summary.get("shots").getAsInt());assertEquals(1,summary.get("hits").getAsInt());assertEquals(3.5,summary.get("damage").getAsDouble());assertFalse(summary.has("combat"));
     }
+    @Test void ownerGoalSummaryKeepsPlacementCountersWithoutConfusingBlueprintCells(){
+        auth();engine.ownerModelStart("build wall",2,false);String goal=engine.modelStatus().get("goal_id").getAsString();send("model.claim","claim-build",object("goal_id",goal));
+        String task=send("task.submit","build",object("action","move.to","parameters",object(),"model_goal_id",goal)).get("task_id").getAsString();
+        world.finalConfirmed=object("blocks",3,"placed_blocks",2,"matched_blocks",1,"placement",object("cells",List.of(object("before","air","after","stone"))));
+        send("task.cancel","cancel-build",object("task_id",task));
+        JsonObject summary=engine.modelStatus().getAsJsonObject("recent_task").getAsJsonObject("confirmed_changes");
+        assertEquals(3,summary.get("blocks").getAsInt());assertEquals(2,summary.get("placed_blocks").getAsInt());assertEquals(1,summary.get("matched_blocks").getAsInt());assertFalse(summary.has("placement"));
+    }
     @Test void ownerGoalSummaryKeepsEquipmentCountersAndOmitsDetailedStackReceipts(){
         auth();engine.ownerModelStart("equip helmet",2,false);String goal=engine.modelStatus().get("goal_id").getAsString();send("model.claim","claim",object("goal_id",goal));
         String task=send("task.submit","equipment",object("action","move.to","parameters",object(),"model_goal_id",goal)).get("task_id").getAsString();

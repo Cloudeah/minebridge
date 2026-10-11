@@ -276,6 +276,8 @@ public final class BridgeEngine {
         JsonObject summary=new JsonObject();
         addNonNegativeCounter(summary,"jumps",source,"jumps");
         addNonNegativeCounter(summary,"blocks",source,"blocks");
+        addNonNegativeCounter(summary,"placed_blocks",source,"placed_blocks");
+        addNonNegativeCounter(summary,"matched_blocks",source,"matched_blocks");
         addNonNegativeCounter(summary,"crafts_confirmed",source,"crafts_confirmed");
         addNonNegativeCounter(summary,"follow_ticks",source,"follow_ticks");
         addNonNegativeCounter(summary,"crossbow_loads",source,"crossbow_loads");

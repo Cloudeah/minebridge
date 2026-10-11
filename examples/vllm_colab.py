@@ -28,7 +28,7 @@ ACTION_HELP = {
     "item.drop": "count:1..64(default1),expected_item:namespace:id optional; selected main hand",
     "item.pickup": "entity_id of observed minecraft:item; approach and collect whole stack; partial count possible",
     "block.break": "position:{x,y,z} integers,auto_tool:bool(defaulttrue),require_tool:bool(defaulttrue); selects suitable main-inventory tool,confirms server break,not collected drops",
-    "block.place": "position:{x,y,z} integers,block:namespace:id,properties:{}; prepares main-inventory material",
+    "block.place": "position:{x,y,z} integers,block:namespace:id,properties:{}; main-inventory material,server placement receipt; already matching cell uses zero actions",
     "world.interact": "position:{x,y,z} integers OR entity_id,hand:main/off(defaultmain); one targeted click,1 action; feed/shear/milk use selected item",
     "container.open": "position:{x,y,z} integers OR entity_id,hand:main/off; must open a new menu",
     "container.close": "{}",
@@ -38,7 +38,7 @@ ACTION_HELP = {
     "inventory.equip": "from_slot:observed menu slot,equipment_slot:head/chest/legs/feet/offhand; whole stack (armor max1), old gear returns to source; close container; needs 1 or 3 actions",
     "inventory.swap": "from_slot,to_slot:observed player-menu slots; exchange whole stacks; close container; needs 1 or 3 actions",
     "craft.execute": "item:namespace:id,count:1..4096 total,auto_station:bool(defaulttrue),station_position:{x,y,z} optional; opens visible in-reach vanilla table if 3x3 needed,1 extra action; no walking or mining",
-    "build.execute": "origin:{x,y,z},rotation:0/90/180/270,replace:false,blocks:[{x,y,z,type,properties:{}}]",
+    "build.execute": "origin:{x,y,z},rotation:0/90/180/270,replace:false,blocks:[{x,y,z,type,properties:{}}]; placed_blocks counts changed cells,matched_blocks counts already matching cells",
 }
 
 
@@ -101,7 +101,7 @@ def compact_result(result):
                     if len(receipts) > 1:
                         facts["craft_stages_omitted"] = len(receipts) - 1
         if isinstance(facts, dict):
-            for proof in ("interaction", "inventory_swap", "transfer", "mining"):
+            for proof in ("interaction", "inventory_swap", "transfer", "mining", "placement"):
                 if facts.get(proof) == data:
                     facts.pop(proof)  # Keep the identical proof once, alongside its counter.
         if result.get("operation") == "inventory.inspect" and isinstance(data.get("menu"), dict):
@@ -122,6 +122,22 @@ def compact_result(result):
             data["destination"] = path[-1] if path else None
         if "blocks" in data:
             data["block_count"] = len(data["blocks"])
+    # A placement's primary cell is already described by position/before/after.
+    # Keep other affected cells and their count without copying that state twice.
+    for proof in (data, facts.get("placement") if isinstance(facts, dict) else None):
+        if not isinstance(proof, dict) or proof.get("source") != "integrated_server_block_place":
+            continue
+        proof.pop("receipt_id", None)  # Task IDs deduplicate full history before compaction.
+        if isinstance(facts, dict) and facts.get("placed") == proof.get("position"):
+            facts.pop("placed", None)
+        cells = proof.get("cells")
+        if isinstance(cells, list) and all(key in proof for key in ("position", "before", "after")):
+            primary = {key: proof[key] for key in ("position", "before", "after")}
+            other = [cell for cell in cells if cell != primary]
+            proof.pop("cells")
+            proof["changed_cells"] = sum(isinstance(cell, dict) and cell.get("before") != cell.get("after") for cell in cells)
+            if other:
+                proof["additional_cells"] = other
     return bounded_data(result)
 
 
@@ -194,6 +210,10 @@ def available_actions(capabilities):
     melee = features.get("combat.attack", []) if isinstance(features, dict) else []
     if not isinstance(melee, list) or "confirmed_melee_v1" not in melee:
         allowed.discard("combat.attack")
+    for action in ("block.place", "build.execute"):
+        placement = features.get(action, []) if isinstance(features, dict) else []
+        if not isinstance(placement, list) or "confirmed_placement_v1" not in placement:
+            allowed.discard(action)
     owner_actions = capabilities.get("profile", {}).get("allowed_actions", [])
     if owner_actions:
         allowed &= set(owner_actions)
@@ -230,7 +250,7 @@ def goal_progress(snapshot, history, initial_actor=None):
         interactions = facts.get("interactions", 0)
         if type(interactions) is int and interactions > 0:
             progress["confirmed_interactions"] = progress.get("confirmed_interactions", 0) + interactions
-        for key in ("inventory_swaps", "equips", "mined_blocks"):
+        for key in ("inventory_swaps", "equips", "mined_blocks", "placed_blocks", "matched_blocks"):
             value = facts.get(key, 0)
             if type(value) is int and value > 0:
                 progress["confirmed_" + key] = progress.get("confirmed_" + key, 0) + value
@@ -377,6 +397,16 @@ def validate_item_parameters(action, parameters):
         for key in ("auto_tool", "require_tool"):
             if type(parameters.get(key, True)) is not bool:
                 raise ValueError("block.break: " + key + " must be boolean")
+    if action == "block.place":
+        position = parameters.get("position")
+        if not isinstance(position, dict) or any(type(position.get(axis)) is not int or abs(position[axis]) > (2048 if axis == "y" else 30000000) for axis in ("x", "y", "z")):
+            raise ValueError("block.place: position must contain bounded integer x/y/z")
+        block = parameters.get("block")
+        if not isinstance(block, str) or not re.fullmatch(r"[a-z0-9_.-]+:[a-z0-9/._-]+", block):
+            raise ValueError("block.place: block must be namespace:id")
+        properties = parameters.get("properties", {})
+        if not isinstance(properties, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in properties.items()):
+            raise ValueError("block.place: properties must map names to string values")
     if action in ("world.interact", "container.open"):
         if ("entity_id" in parameters) == ("position" in parameters):
             raise ValueError(action + ": choose exactly one position or entity_id")

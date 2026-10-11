@@ -1198,6 +1198,65 @@ class InventoryDecisionTest(unittest.TestCase):
         self.assertEqual(compact['confirmed_changes'], {"mined_blocks": 1})
         self.assertIn('mining', full['confirmed_changes'])
 
+    def test_placement_actions_require_their_server_receipt_feature(self):
+        caps = {"actions": ["block.place", "build.execute", "look.at"]}
+        self.assertEqual(controller.available_actions(caps), ['look.at'])
+        caps['action_features'] = {"block.place": ['confirmed_placement_v1']}
+        self.assertEqual(controller.available_actions(caps), ['block.place', 'look.at'])
+        caps['action_features']['build.execute'] = ['confirmed_placement_v1']
+        self.assertEqual(controller.available_actions(caps), ['block.place', 'build.execute', 'look.at'])
+        for features in (None, [], {'block.place': 'confirmed_placement_v1'}, {'build.execute': True}):
+            caps['action_features'] = features
+            self.assertEqual(controller.available_actions(caps), ['look.at'])
+
+    def test_placement_parameters_match_in_notebook_and_controller(self):
+        good = {'position': {'x': 0, 'y': 56, 'z': 2}, 'block': 'minecraft:oak_log', 'properties': {'axis': 'y'}}
+        invalid = ({}, {**good, 'block': 'oak_log'}, {**good, 'properties': []}, {**good, 'properties': {'lit': False}},
+                   {**good, 'position': {'x': True, 'y': 56, 'z': 2}}, {**good, 'position': {'x': 0, 'y': 56.5, 'z': 2}},
+                   {**good, 'position': {'x': 0, 'y': 2049, 'z': 2}})
+        for validate in self.validators:
+            original = deepcopy(good)
+            validate('block.place', good)
+            self.assertEqual(good, original)
+            for parameters in invalid:
+                with self.subTest(parameters=parameters), self.assertRaises(ValueError):
+                    validate('block.place', parameters)
+
+    def test_build_progress_distinguishes_placed_cells_from_matching_blueprint_cells(self):
+        partial = {'task_id': 'partial', 'state': 'failed', 'confirmed_changes': {'blocks': 3, 'placed_blocks': 2, 'matched_blocks': 1}}
+        existing = {'task_id': 'existing', 'state': 'succeeded', 'confirmed_changes': {'blocks': 20, 'matched_blocks': 20}}
+        invalid = {'task_id': 'invalid', 'state': 'cancelled', 'confirmed_changes': {'placed_blocks': True, 'matched_blocks': -1}}
+        progress = controller.goal_progress(snapshot(), [{'result': r} for r in (partial, partial, existing, invalid)])
+        self.assertEqual(progress['confirmed_placed_blocks'], 2)
+        self.assertEqual(progress['confirmed_matched_blocks'], 21)
+        self.assertEqual(progress['completed_steps'], 1)
+        self.assertNotIn('confirmed_blocks', progress)
+
+    def test_placement_history_keeps_one_proof_and_partial_counters_without_mutating_api_result(self):
+        proof = {'source': 'integrated_server_block_place', 'cells': [{'position': {'x': 0, 'y': 56, 'z': 2}, 'before': {'type': 'minecraft:air'}, 'after': {'type': 'minecraft:oak_door'}}]}
+        full = {'result': proof, 'confirmed_changes': {'placement': proof, 'placed_blocks': 2, 'matched_blocks': 1}}
+        original = deepcopy(full)
+        compact = controller.compact_result(full)
+        self.assertEqual(compact['result'], proof)
+        self.assertEqual(compact['confirmed_changes'], {'placed_blocks': 2, 'matched_blocks': 1})
+        self.assertEqual(full, original)
+
+    def test_multi_cell_placement_compaction_preserves_secondary_effect_without_duplicate_primary(self):
+        primary = {'position': {'x': 0, 'y': 56, 'z': 2}, 'before': {'type': 'minecraft:air'}, 'after': {'type': 'minecraft:oak_door'}}
+        secondary = {**deepcopy(primary), 'position': {'x': 0, 'y': 57, 'z': 2}}
+        proof = {**primary, 'cells': [primary, secondary], 'source': 'integrated_server_block_place', 'receipt_id': 'fixture-receipt'}
+        full = {'result': proof, 'confirmed_changes': {'placement': proof, 'placed_blocks': 2, 'placed': primary['position']}}
+        original = deepcopy(full)
+        compact = controller.compact_result(full)
+        self.assertNotIn('cells', compact['result'])
+        self.assertNotIn('receipt_id', compact['result'])
+        self.assertEqual(compact['result']['additional_cells'], [secondary])
+        self.assertEqual(compact['result']['changed_cells'], 2)
+        for key in ('position', 'before', 'after', 'source'):
+            self.assertEqual(compact['result'][key], proof[key])
+        self.assertEqual(compact['confirmed_changes'], {'placed_blocks': 2})
+        self.assertEqual(full, original)
+
     def test_named_equipment_and_whole_stack_swaps_keep_observed_slot_numbers(self):
         cases = [('inventory.equip', {'from_slot': 12, 'equipment_slot': 'head', 'menu_id': 0, 'menu_revision': 42}),
                  ('inventory.equip', {'from_slot': 17, 'equipment_slot': 'offhand'}),

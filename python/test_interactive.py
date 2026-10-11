@@ -33,7 +33,13 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
     async def test_craft_station_parameters_reach_notebook_relay_and_guarded_task(self):
         await self.integration(craft=True)
 
-    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False, ranged=False, follow=False, crossbow=False, interaction=False, craft=False):
+    async def test_block_placement_reaches_notebook_relay_and_guarded_task_unchanged(self):
+        await self.integration(placement=True)
+
+    async def test_blueprint_reaches_notebook_relay_and_guarded_task_unchanged(self):
+        await self.integration(placement=True, build=True)
+
+    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False, ranged=False, follow=False, crossbow=False, interaction=False, craft=False, placement=False, build=False):
         submitted, observed_profiles, reports, queries = [], [], [], []
         terminal = asyncio.Event()
         holder = {}
@@ -51,6 +57,11 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
         craft_decision = {"action": "craft.execute", "parameters": {"item": "minecraft:wooden_pickaxe", "count": 1, "auto_station": False, "station_position": {"x": 0, "y": 56, "z": 2}}, "reason": "craft at observed table"}
         if craft:
             model.content = json.dumps(craft_decision)
+        placement_decision = {"action": "build.execute" if build else "block.place", "parameters":
+                              {"origin": {"x": 0, "y": 56, "z": 2}, "rotation": 90, "replace": False, "blocks": [{"x": 0, "y": 0, "z": 0, "type": "minecraft:oak_log", "properties": {"axis": "y"}}]} if build else
+                              {"position": {"x": 0, "y": 56, "z": 2}, "block": "minecraft:oak_log", "properties": {"axis": "y"}}, "reason": "place observed material"}
+        if placement:
+            model.content = json.dumps(placement_decision)
         if malformed_first:
             def reply():
                 model.content = EXPRESSION_REPLY if len(model.payloads) == 1 else json.dumps(DECISION)
@@ -79,6 +90,9 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
         status = goal("first")
         capabilities = {"actions": ["craft.execute"] if craft else ["world.interact"] if interaction else ["move.follow"] if follow else ["combat.ranged"] if ranged else ["look.at"], "actor_id": "test-actor", "armed": True,
                         "model_control": True, "observation_profiles": ["full", "compact"]}
+        if placement:
+            capabilities['actions'] = [placement_decision['action']]
+            capabilities['action_features'] = {placement_decision['action']: ['confirmed_placement_v1']}
 
         if query_first:
             capabilities["queries"] = ["craft.plan"]
@@ -238,6 +252,10 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                 for item in submitted:
                     self.assertEqual(item["action"], craft_decision["action"])
                     self.assertEqual(item["parameters"], craft_decision["parameters"])
+            if placement:
+                for item in submitted:
+                    self.assertEqual(item['action'], placement_decision['action'])
+                    self.assertEqual(item['parameters'], placement_decision['parameters'])
             self.assertIn("compact", observed_profiles)
             if vision:
                 image = model.payloads[0]["messages"][1]["content"][0]["image_url"]["url"]

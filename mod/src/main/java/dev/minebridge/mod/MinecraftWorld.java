@@ -58,6 +58,9 @@ final class MinecraftWorld implements WorldAccess {
     private final CombatLedger combat;
     private final InteractionLedger interactions;
     private final MiningLedger mining;
+    private final PlacementLedger placement;
+    private record PlacementMaterial(int selected,ItemStack stack,BlockPos support,BlockState supportState) {}
+    private final Map<String,PlacementMaterial> placementMaterials=new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<String,MeleeSequence> melees=new HashMap<>();
     private record MiningTool(int selected,ItemStack stack) {}
     private final Map<String,MiningTool> miningTools=new HashMap<>();
@@ -74,7 +77,7 @@ final class MinecraftWorld implements WorldAccess {
         this.mc=mc;this.policy=policy;actor=mc.player.getUUID().toString();initialDimension=mc.level.dimension().identifier().toString();
         pickups=new PickupLedger(actor,initialDimension);
         combat=new CombatLedger(actor,initialDimension);
-        interactions=new InteractionLedger(actor,initialDimension);mining=new MiningLedger(actor,initialDimension);
+        interactions=new InteractionLedger(actor,initialDimension);mining=new MiningLedger(actor,initialDimension);placement=new PlacementLedger(actor,initialDimension);
         if(mc.hasSingleplayerServer()) {
             Path marker=mc.getSingleplayerServer().getWorldPath(LevelResource.ROOT).resolve("minebridge-world-id.txt");
             if(!Files.exists(marker))Files.writeString(marker,id(),StandardOpenOption.CREATE_NEW);
@@ -91,10 +94,11 @@ final class MinecraftWorld implements WorldAccess {
     @Override public long tick(){if(mc.level!=null)lastTick=mc.level.getGameTime();return lastTick;}
     @Override public boolean visionAvailable(){return mc.hasSingleplayerServer() && mc.getMainRenderTarget().getColorTexture() instanceof com.mojang.blaze3d.opengl.GlTexture && mc.getMainRenderTarget().getDepthTexture() instanceof com.mojang.blaze3d.opengl.GlTexture;}
     @Override public List<String> movementModes(){return mc.hasSingleplayerServer()?List.of("walk","sprint","jump","crouch"):List.of();}
-    @Override public void taskFinished(Task t){melees.remove(t.id);mining.end(t.id);miningTools.remove(t.id);confirmations.remove(t.id);inventoryChanges.remove(t.id);craftSequences.remove(t.id);craftStations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);crossbows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);interactions.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
+    @Override public void taskFinished(Task t){melees.remove(t.id);mining.end(t.id);miningTools.remove(t.id);placement.end(t.id);placementMaterials.remove(t.id);confirmations.remove(t.id);inventoryChanges.remove(t.id);craftSequences.remove(t.id);craftStations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);crossbows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);interactions.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
     @Override public void collectConfirmed(Task t) {
         updateCombatReceipt(t,combat.finish(t.id));
         updateInteractionReceipt(t,interactions.finish(t.id));updateMiningReceipt(t,mining.finish(t.id));
+        updatePlacementReceipt(t,placement.finish(t.id));
     }
     private void updateInteractionReceipt(Task task,JsonObject receipt){if(receipt!=null){task.confirmed.addProperty("interactions",1);task.confirmed.add("interaction",receipt);}}
     private static String interactionKey(BlockPos pos){return "block:"+pos.getX()+","+pos.getY()+","+pos.getZ();}
@@ -115,6 +119,10 @@ final class MinecraftWorld implements WorldAccess {
     }
     void recordInteraction(net.neoforged.neoforge.event.entity.player.PlayerInteractEvent event,String target) {
         if(event.getLevel().isClientSide() || !(event.getEntity() instanceof net.minecraft.server.level.ServerPlayer player) || !actor.equals(player.getUUID().toString()))return;
+        if(event instanceof net.neoforged.neoforge.event.entity.player.PlayerInteractEvent.RightClickBlock click && click.getFace()!=null) {
+            String task=placement.clicked(actor,player.level().dimension().identifier().toString(),event.getHand()==InteractionHand.MAIN_HAND?"main":"off",position(click.getPos()),click.getFace().getName(),heldStack(player.getItemInHand(event.getHand())),player.getInventory().getSelectedSlot(),player.level().getGameTime());
+            if(task!=null){var material=placementMaterials.get(task);if(material==null || !ItemStack.matches(material.stack(),player.getItemInHand(event.getHand())))placement.reject(task,"target_changed");}
+        }
         JsonObject before=interactionSample(player,target);if(before==null)return;
         if(interactions.recordAttempt(actor,player.level().dimension().identifier().toString(),target,event.getHand()==InteractionHand.MAIN_HAND?"main":"off",player.level().getGameTime(),before)) {
             var server=player.level().getServer();
@@ -165,10 +173,22 @@ final class MinecraftWorld implements WorldAccess {
             case "block.place"->t.context.has("placing") || t.context.has("material_sent");
             case "world.interact", "container.open"->t.context.has("sent");
             case "craft.execute"->t.context.has("station_sent") || craftSequences.containsKey(t.id) && craftSequences.get(t.id).pending()!=null || crafts.containsKey(t.id) && integer(t.context,"craft_stage",0,0,10000)>=crafts.get(t.id).stages().size();
-            case "build.execute"->t.context.has("placing") || t.context.has("material_sent") || builds.containsKey(t.id) && integer(t.context,"build_index",0,0,4096)>=builds.get(t.id).blocks().size();
+            case "build.execute"->buildAwaitingConfirmation(t);
             case "container.close"->t.context.has("sent");
             default->false;
         };
+    }
+    private boolean buildAwaitingConfirmation(Task task) {
+        if(task.context.has("placing") || task.context.has("material_sent"))return true;
+        var plan=builds.get(task.id);if(plan==null)return false;int index=integer(task.context,"build_index",0,0,4096);
+        if(index>=plan.blocks().size())return true;
+        var next=plan.blocks().get(index);BlockPos pos=new BlockPos(next.x(),next.y(),next.z());
+        if(clientChunkLoaded(pos) && matches(mc.level.getBlockState(pos),next.type(),next.properties()))return true;
+        if(task.confirmed.has("block_updates"))for(JsonElement element:task.confirmed.getAsJsonArray("block_updates")){
+            JsonObject cell=element.getAsJsonObject();
+            if(number(cell,"x",Double.NaN)==pos.getX() && number(cell,"y",Double.NaN)==pos.getY() && number(cell,"z",Double.NaN)==pos.getZ() && matches(cell,next.type(),next.properties()))return true;
+        }
+        return false;
     }
     // NeoForge dispatches Post on the server thread, before an empty stack is discarded.
     void recordPickup(net.neoforged.neoforge.event.entity.player.ItemEntityPickupEvent.Post event){
@@ -208,7 +228,7 @@ final class MinecraftWorld implements WorldAccess {
         return Set.of("move.to","move.follow","move.jump","move.relative","move.crouch","route.plan","look.at","look.turn","combat.attack","combat.ranged","item.use","item.drop","item.pickup","world.interact","block.break","block.place",
                 "inventory.inspect","inventory.select","inventory.select_item","inventory.transfer","inventory.equip","inventory.swap","container.open","container.close","craft.plan","craft.execute","build.plan","build.execute");
     }
-    @Override public Set<String> actionFeatures(String action){if(!mc.hasSingleplayerServer())return Set.of();return switch(action){case "combat.attack"->Set.of("confirmed_melee_v1");case "craft.execute"->Set.of("craft_station_v1");default->Set.of();};}
+    @Override public Set<String> actionFeatures(String action){if(!mc.hasSingleplayerServer())return Set.of();return switch(action){case "combat.attack"->Set.of("confirmed_melee_v1");case "craft.execute"->Set.of("craft_station_v1");case "block.place","build.execute"->Set.of("confirmed_placement_v1");default->Set.of();};}
     @Override public void validate(String action,JsonObject p) {
         switch(action) {
             case "move.to"->{point(child(p,"target"));MovementCommands.validateTravel(p);}
@@ -285,7 +305,7 @@ final class MinecraftWorld implements WorldAccess {
         JsonArray blocks=new JsonArray();BlockPos center=mc.player.blockPosition();int count=0;
         for(BlockPos p:BlockPos.betweenClosed(center.offset(-radius,-4,-radius),center.offset(radius,4,radius))) {
             if(++count>6000)break;
-            if(!mc.level.hasChunkAt(p))continue;
+            if(!clientChunkLoaded(p))continue;
             BlockState state=mc.level.getBlockState(p);
             if(!telemetry && (state.isAir() || !blockVisible(p)))continue;
             JsonObject b=position(p);b.addProperty("dimension",dimension());b.addProperty("type",blockId(state));b.add("properties",properties(state));
@@ -323,7 +343,7 @@ final class MinecraftWorld implements WorldAccess {
     }
     @Override public void releaseControls(){
         combat.suspendMelee();melees.values().forEach(MeleeSequence::released);
-        interactions.suspend();mining.suspend();
+        interactions.suspend();mining.suspend();placement.suspend();
         craftSequences.values().forEach(CraftSequence::released);
         crossbows.values().forEach(CrossbowSequence::released);
         boolean cancelBow=bowDrawing || mc.player!=null && held.contains(mc.options.keyUse) && mc.player.getUseItem().is(Items.BOW) && mc.player.getUsedItemHand()==InteractionHand.MAIN_HAND;
@@ -344,7 +364,8 @@ final class MinecraftWorld implements WorldAccess {
     }
     private void look(Vec3 target){Vec3 d=target.subtract(mc.player.getEyePosition());mc.player.setYRot((float)Math.toDegrees(Math.atan2(-d.x,d.z)));mc.player.setXRot((float)-Math.toDegrees(Math.atan2(d.y,Math.sqrt(d.x*d.x+d.z*d.z))));}
     private void checkArea(Vec3 p){if(!policy.areas.isEmpty())policy.checkPoint(vector(p),dimension());}
-    private void reach(BlockPos pos){if(!mc.level.hasChunkAt(pos))throw new BridgeException("chunk_unavailable","Target chunk is not loaded",true);checkArea(Vec3.atCenterOf(pos));if(mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(pos))>mc.player.blockInteractionRange())throw new BridgeException("out_of_reach","Target block is out of reach",true);}
+    private boolean clientChunkLoaded(BlockPos pos){return mc.level.getChunkSource().getChunk(pos.getX()>>4,pos.getZ()>>4,net.minecraft.world.level.chunk.status.ChunkStatus.FULL,false)!=null;}
+    private void reach(BlockPos pos){if(!clientChunkLoaded(pos))throw new BridgeException("chunk_unavailable","Target chunk is not loaded",true);checkArea(Vec3.atCenterOf(pos));if(mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(pos))>mc.player.blockInteractionRange())throw new BridgeException("out_of_reach","Target block is out of reach",true);}
     private JsonObject serverView(Task task,BlockPos pos,String entity) {
         CompletableFuture<JsonObject> pending=confirmations.get(task.id);
         if(pending==null) {
@@ -353,12 +374,15 @@ final class MinecraftWorld implements WorldAccess {
             String usedItem=string(task.context,"use_item","minecraft:air"),craftedItem=string(task.context,"craft_item","minecraft:air");
             InventoryChange inventoryChange=inventoryChanges.get(task.id);
             MiningTool miningTool=miningTools.get(task.id);
+            PlacementMaterial placementMaterial=placementMaterials.get(task.id);
             pending=server.submit(()->{
                 var level=server.getLevel(dim);var actor=server.getPlayerList().getPlayer(player);
                 if(level==null || actor==null)throw new BridgeException("disconnected","Actor unavailable");
                 JsonObject view=object("source","integrated_server","tick",level.getGameTime(),"health",actor.getHealth(),"menu_id",actor.containerMenu.containerId,"cursor",stack(actor.containerMenu.getCarried()));
                 view.addProperty("menu_revision",actor.containerMenu.getStateId());
                 if(miningTool!=null)view.addProperty("mining_tool_matches",actor.getInventory().getSelectedSlot()==miningTool.selected() && ItemStack.matches(actor.getMainHandItem(),miningTool.stack()));
+                if(placementMaterial!=null){view.addProperty("placement_material_matches",actor.getInventory().getSelectedSlot()==placementMaterial.selected() && ItemStack.matches(actor.getMainHandItem(),placementMaterial.stack()));view.addProperty("placement_support_matches",level.hasChunkAt(placementMaterial.support()) && level.getBlockState(placementMaterial.support()).equals(placementMaterial.supportState()) && !level.getBlockState(placementMaterial.support()).canBeReplaced());}
+                view.addProperty("creative",actor.isCreative());
                 if(inventoryChange!=null){view.addProperty("inventory_before_matches",inventoryChange.matches(actor.containerMenu,false));view.addProperty("inventory_after_matches",inventoryChange.matches(actor.containerMenu,true));}
                 view.add("position",vector(actor.position()));view.addProperty("on_ground",actor.onGround());
                 view.addProperty("crouching",actor.isCrouching());view.addProperty("sprinting",actor.isSprinting());
@@ -409,6 +433,7 @@ final class MinecraftWorld implements WorldAccess {
             t.context.remove("last_position");t.context.remove("last_moved");
             if(drops.containsKey(t.id))drops.get(t.id).resumed(tick());
             if(t.action.equals("look.turn"))t.context.addProperty("turn_sent",tick());
+            if(!t.context.has("placing"))t.context.remove("placement_look_started");
         }
         return switch(t.action) {
             case "move.to" -> move(t,point(child(t.parameters,"target")),number(t.parameters,"tolerance",0.7),false);
@@ -445,7 +470,7 @@ final class MinecraftWorld implements WorldAccess {
         };
     }
     private Pathfinder.Terrain terrain(Pathfinder.Cell c) {
-        BlockPos p=new BlockPos(c.x(),c.y(),c.z());if(!mc.level.hasChunkAt(p))return Pathfinder.Terrain.UNKNOWN;
+        BlockPos p=new BlockPos(c.x(),c.y(),c.z());if(!clientChunkLoaded(p))return Pathfinder.Terrain.UNKNOWN;
         if(!policy.areas.isEmpty() && policy.areas.stream().noneMatch(a->a.contains(dimension(),c.x()+0.5,c.y(),c.z()+0.5)))return Pathfinder.Terrain.BLOCKED;
         BlockState feet=mc.level.getBlockState(p),head=mc.level.getBlockState(p.above()),floor=mc.level.getBlockState(p.below());
         if(!feet.getFluidState().isEmpty()||!head.getFluidState().isEmpty()||!feet.getCollisionShape(mc.level,p).isEmpty()||!head.getCollisionShape(mc.level,p.above()).isEmpty()||!floor.isCollisionShapeFullBlock(mc.level,p.below()))return Pathfinder.Terrain.BLOCKED;
@@ -458,7 +483,7 @@ final class MinecraftWorld implements WorldAccess {
         Vec3 start=new Vec3(from.x()+0.5,height,from.z()+0.5);
         AABB clearance=mc.player.getDimensions(Pose.STANDING).makeBoundingBox(start).expandTowards(to.x()-from.x(),0,to.z()-from.z());
         for(BlockPos p:BlockPos.betweenClosed(BlockPos.containing(clearance.minX,clearance.minY,clearance.minZ),BlockPos.containing(clearance.maxX,clearance.maxY,clearance.maxZ)))
-            if(!mc.level.hasChunkAt(p))return Pathfinder.Terrain.UNKNOWN;
+            if(!clientChunkLoaded(p))return Pathfinder.Terrain.UNKNOWN;
         return mc.level.getBlockCollisions(mc.player,clearance).iterator().hasNext()?Pathfinder.Terrain.BLOCKED:Pathfinder.Terrain.WALKABLE;
     }
     private List<Pathfinder.Cell> path(Vec3 target){
@@ -812,14 +837,62 @@ final class MinecraftWorld implements WorldAccess {
     }
     private boolean matches(BlockState actual,String type,JsonObject wanted){if(!blockId(actual).equals(type))return false;JsonObject props=properties(actual);for(var e:wanted.entrySet())if(!props.has(e.getKey())||!props.get(e.getKey()).getAsString().equals(e.getValue().getAsString()))return false;return true;}
     private boolean matches(JsonObject actual,String type,JsonObject wanted){if(!string(actual,"type").equals(type))return false;JsonObject props=child(actual,"properties");for(var e:wanted.entrySet())if(!props.has(e.getKey())||!props.get(e.getKey()).getAsString().equals(e.getValue().getAsString()))return false;return true;}
-    private Step placeBlock(Task t,BlockPos p,String type,JsonObject wanted) {
-        reach(p);JsonObject view=serverView(t,p,null);
-        if(view!=null && matches(child(view,"block"),type,wanted)){confirmBlock(t,p,view);t.context.remove("material_sent");t.confirmed.add("placed",position(p));return Step.success(object("position",position(p),"state",view.get("block")));}
-        if(matches(mc.level.getBlockState(p),type,wanted))return Step.waiting(object("waiting","server_confirmation_of_existing_block"));
-        if(t.context.has("placing")) {
-            if(tick()-number(t.context,"placing",tick())>20)throw new BridgeException("placement_failed","Server did not confirm requested block properties");
-            return Step.waiting(object("waiting","server_confirmation"));
+    private void updatePlacementReceipt(Task task,JsonObject receipt) {
+        if(receipt==null || string(task.context,"placement_receipt","").equals(string(receipt,"receipt_id")))return;
+        task.context.addProperty("placement_receipt",string(receipt,"receipt_id"));task.confirmed.add("placement",receipt);
+        int changed=0;
+        for(JsonElement element:receipt.getAsJsonArray("cells")) {
+            JsonObject cell=element.getAsJsonObject();if(cell.get("before").equals(cell.get("after")))continue;
+            changed++;confirmBlock(task,block(child(cell,"position")),object("block",cell.get("after"),"tick",receipt.get("tick")));
         }
+        task.confirmed.addProperty("placed_blocks",integer(task.confirmed,"placed_blocks",0,0,Integer.MAX_VALUE)+changed);
+        task.confirmed.add("placed",receipt.get("position"));
+    }
+    void recordBlockPlace(net.neoforged.neoforge.event.level.BlockEvent.EntityPlaceEvent event) {
+        if(!(event.getEntity() instanceof net.minecraft.server.level.ServerPlayer player) || !actor.equals(player.getUUID().toString()))return;
+        var level=player.level();String dim=level.dimension().identifier().toString();
+        var snapshots=event instanceof net.neoforged.neoforge.event.level.BlockEvent.EntityMultiPlaceEvent multi?multi.getReplacedBlockSnapshots():List.of(event.getBlockSnapshot());
+        JsonArray cells=new JsonArray();
+        for(var snapshot:snapshots)cells.add(object("position",position(snapshot.getPos()),"before",blockSample(snapshot.getState()),"after",blockSample(level.getBlockState(snapshot.getPos()))));
+        // Oversized effects are rejected after attribution, before vanilla commits them.
+        if(cells.size()>64){for(JsonElement cell:cells){JsonArray one=new JsonArray();one.add(cell);String task=placement.attempt(actor,dim,one,level.getGameTime());if(task!=null){event.setCanceled(true);placement.reject(task,"unsupported_capability");return;}}return;}
+        String task=placement.attempt(actor,dim,cells,level.getGameTime());if(task==null)return;
+        var material=placementMaterials.get(task);
+        if(material==null || player.getInventory().getSelectedSlot()!=material.selected() || !ItemStack.matches(material.stack(),player.getMainHandItem())){event.setCanceled(true);placement.reject(task,"target_changed");return;}
+        try {
+            for(var snapshot:snapshots){checkArea(Vec3.atCenterOf(snapshot.getPos()));if(!snapshot.getState().canBeReplaced()){event.setCanceled(true);placement.reject(task,"build_conflict");return;}}
+        } catch(BridgeException e){event.setCanceled(true);placement.reject(task,e.code);return;}
+        ItemStack expectedAfter=material.stack().copyWithCount(material.stack().getCount()-(player.isCreative()?0:1));
+        var server=level.getServer();JsonArray before=cells.deepCopy();
+        server.schedule(new net.minecraft.server.TickTask(server.getTickCount(),()->{
+            if(player.level()!=level)return;JsonArray actual=new JsonArray();
+            for(JsonElement element:before){JsonObject cell=element.getAsJsonObject();BlockPos pos=block(child(cell,"position"));if(!level.hasChunkAt(pos))return;actual.add(object("position",cell.get("position"),"before",cell.get("before"),"after",blockSample(level.getBlockState(pos))));}
+            placement.complete(task,actor,dim,actual,heldStack(player.getMainHandItem()),player.getInventory().getSelectedSlot(),level.getGameTime(),event.isCanceled(),ItemStack.matches(expectedAfter,player.getMainHandItem()));
+        }));
+    }
+    private Step placeBlock(Task t,BlockPos p,String type,JsonObject wanted) {
+        checkArea(Vec3.atCenterOf(p));
+        JsonObject receipt=placement.peek(t.id);updatePlacementReceipt(t,receipt);
+        if(placement.error(t.id)!=null)return Step.failure(placement.error(t.id),"Requested placement could not be verified; inspect the reported actual changes",receipt==null?object():receipt);
+        if(receipt!=null){placement.end(t.id);placementMaterials.remove(t.id);t.context.remove("material_sent");return Step.success(receipt);}
+        if(t.context.has("placing")) {
+            if(placement.interrupted(t.id))throw new BridgeException("placement_interrupted","Inspect actual blocks before a new task; the click is not repeated");
+            if(tick()-number(t.context,"placing",tick())>20)throw new BridgeException("placement_unconfirmed","No matching server placement receipt; the click is not repeated");
+            return Step.waiting(object("waiting","server_placement_event"));
+        }
+        if(!clientChunkLoaded(p))throw new BridgeException("chunk_unavailable","Target chunk is not loaded",true);
+        JsonObject view=serverView(t,p,null);
+        if(view!=null && matches(child(view,"block"),type,wanted)){
+            confirmBlock(t,p,view);t.context.remove("material_sent");placementMaterials.remove(t.id);
+            JsonArray matched=t.context.has("matched_cells")?t.context.getAsJsonArray("matched_cells"):new JsonArray();JsonObject position=position(p);
+            if(!matched.contains(position)){matched.add(position);t.context.add("matched_cells",matched);t.confirmed.addProperty("matched_blocks",matched.size());}
+            return Step.success(object("position",position,"state",view.get("block"),"outcome","already_present","source","integrated_server"));
+        }
+        if(matches(mc.level.getBlockState(p),type,wanted))return Step.waiting(object("waiting","server_confirmation_of_existing_block"));
+        reach(p);
+        if(mc.screen!=null || mc.player.containerMenu.containerId!=0)throw new BridgeException("interface_open","Close interfaces before placing blocks");
+        if(!mc.player.containerMenu.getCarried().isEmpty())throw new BridgeException("cursor_occupied","Clear cursor before placing blocks");
+        if(mc.player.isUsingItem())throw new BridgeException("item_busy","Finish item use before placing blocks");
         if(!mc.level.getBlockState(p).canBeReplaced())throw new BridgeException("build_conflict","Existing block is protected");
         Item material=BuiltInRegistries.ITEM.getValue(Identifier.parse(type));if(!(material instanceof BlockItem))throw new BridgeException("unsupported_capability","Only block items can be placed");
         BlockState desired=((BlockItem)material).getBlock().defaultBlockState();
@@ -830,16 +903,30 @@ final class MinecraftWorld implements WorldAccess {
         BlockHitResult hit=null;
         for(Direction face:Direction.values()) {
             if(wanted.has("axis") && !face.getAxis().getName().equals(wanted.get("axis").getAsString()))continue;
-            BlockPos support=p.relative(face.getOpposite());BlockState s=mc.level.getBlockState(support);if(s.getCollisionShape(mc.level,support).isEmpty())continue;
+            BlockPos support=p.relative(face.getOpposite());BlockState s=mc.level.getBlockState(support);if(s.canBeReplaced() || s.getCollisionShape(mc.level,support).isEmpty())continue;
             // Trace slightly through the surface: an endpoint exactly on a voxel boundary may be a MISS.
             Vec3 aim=Vec3.atCenterOf(support).add(Vec3.atLowerCornerOf(face.getUnitVec3i()).scale(0.49));
             BlockHitResult ray=mc.level.clip(new ClipContext(mc.player.getEyePosition(),aim,ClipContext.Block.OUTLINE,ClipContext.Fluid.NONE,mc.player));
             if(ray.getType()==HitResult.Type.BLOCK && ray.getBlockPos().equals(support) && ray.getDirection()==face){hit=ray;break;}
         }
         if(hit==null)throw new BridgeException("missing_support","No visible support face available",true);
+        checkArea(mc.player.position());checkArea(Vec3.atCenterOf(hit.getBlockPos()));
+        var materialSnapshot=placementMaterials.get(t.id);
+        if(materialSnapshot==null){placementMaterials.put(t.id,new PlacementMaterial(mc.player.getInventory().getSelectedSlot(),mc.player.getMainHandItem().copy(),hit.getBlockPos().immutable(),mc.level.getBlockState(hit.getBlockPos())));return Step.waiting(object("stage","server_placement_ready"));}
+        if(view==null || !view.has("placement_material_matches"))return Step.waiting(object("stage","server_placement_ready"));
+        if(!bool(view,"placement_material_matches",false) || !ItemStack.matches(materialSnapshot.stack(),mc.player.getMainHandItem()))throw new BridgeException("target_changed","Placement material or components changed");
+        if(!hit.getBlockPos().equals(materialSnapshot.support()) || !bool(view,"placement_support_matches",false))throw new BridgeException("target_changed","Placement support changed");
+        if(number(view,"menu_id",-1)!=0 || integer(child(view,"cursor"),"count",0,0,64)!=0 || bool(view,"using_item",false))throw new BridgeException("item_busy","Server actor is not ready to place blocks");
+        if(!child(view,"block").equals(blockSample(mc.level.getBlockState(p))))throw new BridgeException("target_changed","Placement cell changed between client and server");
         look(hit.getLocation());
         if(wanted.has("facing")){String face=wanted.get("facing").getAsString();switch(face){case "north"->mc.player.setYRot(0);case "south"->mc.player.setYRot(180);case "east"->mc.player.setYRot(90);case "west"->mc.player.setYRot(-90);default->{}}}
+        if(!t.context.has("placement_look_started")){t.context.addProperty("placement_look_started",tick());return Step.waiting(object("stage","server_placement_orientation"));}
+        if(Math.abs(MovementCommands.wrapYaw(number(view,"yaw",0)-mc.player.getYRot()))>0.1 || Math.abs(number(view,"pitch",0)-mc.player.getXRot())>0.1){
+            if(tick()-number(t.context,"placement_look_started",tick())>20)throw new BridgeException("look_unconfirmed","Server did not confirm placement orientation before click");
+            return Step.waiting(object("stage","server_placement_orientation"));
+        }
         ActionBudget.require(t,1);
+        placement.begin(t.id,position(p),child(view,"block"),type,wanted,position(hit.getBlockPos()),hit.getDirection().getName(),heldStack(materialSnapshot.stack()),materialSnapshot.selected(),(long)number(view,"tick",tick()));
         mc.gameMode.useItemOn(mc.player,InteractionHand.MAIN_HAND,hit);t.context.addProperty("placing",tick());t.actions++;return Step.waiting(object("stage","placing","position",position(p)));
     }
     private void confirmBlock(Task t,BlockPos p,JsonObject view) {
@@ -1146,7 +1233,7 @@ final class MinecraftWorld implements WorldAccess {
                 double best=Double.MAX_VALUE;int radius=Math.min(8,(int)Math.ceil(mc.player.blockInteractionRange())+1);BlockPos origin=mc.player.blockPosition();
                 for(BlockPos pos:BlockPos.betweenClosed(origin.offset(-radius,-radius,-radius),origin.offset(radius,radius,radius))) {
                     double distance=mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(pos));
-                    if(distance>=best || distance>mc.player.blockInteractionRange() || !mc.level.hasChunkAt(pos) || !mc.level.getBlockState(pos).is(Blocks.CRAFTING_TABLE))continue;
+                    if(distance>=best || distance>mc.player.blockInteractionRange() || !clientChunkLoaded(pos) || !mc.level.getBlockState(pos).is(Blocks.CRAFTING_TABLE))continue;
                     try{checkArea(Vec3.atCenterOf(pos));}catch(BridgeException e){if(e.code.equals("permission_denied"))continue;throw e;}
                     if(interactionHit(pos)!=null){target=pos.immutable();best=distance;}
                 }
@@ -1301,6 +1388,7 @@ final class MinecraftWorld implements WorldAccess {
             return Step.success(object("confirmed_blocks",plan.blocks().size(),"source","integrated_server"));
         }
         var b=plan.blocks().get(index);BlockPos p=new BlockPos(b.x(),b.y(),b.z());checkArea(Vec3.atCenterOf(p));
+        if(t.context.has("placing") || matches(mc.level.getBlockState(p),b.type(),b.properties()))return buildPlacementProgress(t,plan,index,placeBlock(t,p,b.type(),b.properties()));
         if(t.context.has("build_stand")) {
             Step approaching=move(t,point(child(t.context,"build_stand")),0.4,false);
             if(approaching.done()){t.context.remove("build_stand");routes.remove(t.id);hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);}
@@ -1335,7 +1423,10 @@ final class MinecraftWorld implements WorldAccess {
             t.context.add("build_stand",vector(standing));t.context.addProperty("reposition_count",integer(t.context,"reposition_count",0,0,3)+1);routes.remove(t.id);
             return Step.waiting(object("stage","repositioning_for_support","confirmed_blocks",index));
         }
-        if(placed.done() && placed.error()==null){t.context.addProperty("build_index",index+1);t.context.remove("placing");t.context.remove("reposition_count");routes.remove(t.id);t.confirmed.addProperty("blocks",index+1);return Step.waiting(object("confirmed_blocks",index+1,"total",plan.blocks().size()));}
+        return buildPlacementProgress(t,plan,index,placed);
+    }
+    private Step buildPlacementProgress(Task t,BuildPlanner.Plan plan,int index,Step placed) {
+        if(placed.done() && placed.error()==null){t.context.addProperty("build_index",index+1);t.context.remove("placing");t.context.remove("placement_look_started");t.context.remove("reposition_count");routes.remove(t.id);t.confirmed.addProperty("blocks",index+1);return Step.waiting(object("confirmed_blocks",index+1,"total",plan.blocks().size()));}
         return placed;
     }
     @Override public JsonObject query(String operation,JsonObject d) {
@@ -1360,7 +1451,7 @@ final class MinecraftWorld implements WorldAccess {
             case "craft.plan" -> craftPlan(d);
             case "build.plan" -> {
                 var plan=new BuildPlanner().plan(d);JsonArray conflicts=new JsonArray();Map<String,Integer> needed=new HashMap<>();
-                for(var b:plan.blocks()){BlockPos p=new BlockPos(b.x(),b.y(),b.z());checkArea(Vec3.atCenterOf(p));if(!mc.level.hasChunkAt(p))throw new BridgeException("chunk_unavailable","Blueprint crosses unloaded chunk");BlockState actual=mc.level.getBlockState(p);if(matches(actual,b.type(),b.properties()))continue;if(!actual.canBeReplaced())conflicts.add(position(p));needed.merge(b.type(),1,Integer::sum);}
+                for(var b:plan.blocks()){BlockPos p=new BlockPos(b.x(),b.y(),b.z());checkArea(Vec3.atCenterOf(p));if(!clientChunkLoaded(p))throw new BridgeException("chunk_unavailable","Blueprint crosses unloaded chunk");BlockState actual=mc.level.getBlockState(p);if(matches(actual,b.type(),b.properties()))continue;if(!actual.canBeReplaced())conflicts.add(position(p));needed.merge(b.type(),1,Integer::sum);}
                 Map<String,Integer> missing=new HashMap<>(),counts=counts();needed.forEach((k,v)->{int m=v-counts.getOrDefault(k,0);if(m>0)missing.put(k,m);});
                 yield object("blocks",plan.blocks(),"materials",needed,"missing",missing,"conflicts",conflicts,"replacement","explicit_break_required","supports","verified_during_execution");
             }

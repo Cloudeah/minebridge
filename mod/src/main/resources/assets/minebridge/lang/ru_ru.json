@@ -64,5 +64,7 @@
   "screen.minebridge.progress.interactions": "взаимодействий: %s",
   "screen.minebridge.action.inventory.swap": "Перестановка стопок",
   "screen.minebridge.progress.inventory_swaps": "перестановок: %s",
-  "screen.minebridge.progress.equips": "экипировано: %s"
+  "screen.minebridge.progress.equips": "экипировано: %s",
+  "screen.minebridge.progress.placed_blocks": "поставлено: %s",
+  "screen.minebridge.progress.matched_blocks": "совпало: %s"
 }
