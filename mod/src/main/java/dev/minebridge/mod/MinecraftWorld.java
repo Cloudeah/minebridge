@@ -19,6 +19,7 @@ import net.minecraft.world.item.component.ChargedProjectiles;
 import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.phys.*;
@@ -45,6 +46,8 @@ final class MinecraftWorld implements WorldAccess {
         }
     }
     private final Map<String,InventoryChange> inventoryChanges=new HashMap<>();
+    private final Map<String,CraftSequence> craftSequences=new HashMap<>();
+    private final Map<String,BlockPos> craftStations=new HashMap<>();
     private final Map<String,List<Pathfinder.Cell>> routes=new HashMap<>();
     private final Map<String,JumpSequence> jumps=new HashMap<>();
     private final Map<String,CrouchSequence> crouches=new HashMap<>();
@@ -88,7 +91,7 @@ final class MinecraftWorld implements WorldAccess {
     @Override public long tick(){if(mc.level!=null)lastTick=mc.level.getGameTime();return lastTick;}
     @Override public boolean visionAvailable(){return mc.hasSingleplayerServer() && mc.getMainRenderTarget().getColorTexture() instanceof com.mojang.blaze3d.opengl.GlTexture && mc.getMainRenderTarget().getDepthTexture() instanceof com.mojang.blaze3d.opengl.GlTexture;}
     @Override public List<String> movementModes(){return mc.hasSingleplayerServer()?List.of("walk","sprint","jump","crouch"):List.of();}
-    @Override public void taskFinished(Task t){melees.remove(t.id);mining.end(t.id);miningTools.remove(t.id);confirmations.remove(t.id);inventoryChanges.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);crossbows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);interactions.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
+    @Override public void taskFinished(Task t){melees.remove(t.id);mining.end(t.id);miningTools.remove(t.id);confirmations.remove(t.id);inventoryChanges.remove(t.id);craftSequences.remove(t.id);craftStations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);crossbows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);interactions.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
     @Override public void collectConfirmed(Task t) {
         updateCombatReceipt(t,combat.finish(t.id));
         updateInteractionReceipt(t,interactions.finish(t.id));updateMiningReceipt(t,mining.finish(t.id));
@@ -161,7 +164,7 @@ final class MinecraftWorld implements WorldAccess {
             case "block.break"->t.context.has("breaking") || t.context.has("material_sent");
             case "block.place"->t.context.has("placing") || t.context.has("material_sent");
             case "world.interact", "container.open"->t.context.has("sent");
-            case "craft.execute"->t.context.has("craft_sent") || crafts.containsKey(t.id) && integer(t.context,"craft_stage",0,0,10000)>=crafts.get(t.id).stages().size();
+            case "craft.execute"->t.context.has("station_sent") || craftSequences.containsKey(t.id) && craftSequences.get(t.id).pending()!=null || crafts.containsKey(t.id) && integer(t.context,"craft_stage",0,0,10000)>=crafts.get(t.id).stages().size();
             case "build.execute"->t.context.has("placing") || t.context.has("material_sent") || builds.containsKey(t.id) && integer(t.context,"build_index",0,0,4096)>=builds.get(t.id).blocks().size();
             case "container.close"->t.context.has("sent");
             default->false;
@@ -205,7 +208,7 @@ final class MinecraftWorld implements WorldAccess {
         return Set.of("move.to","move.follow","move.jump","move.relative","move.crouch","route.plan","look.at","look.turn","combat.attack","combat.ranged","item.use","item.drop","item.pickup","world.interact","block.break","block.place",
                 "inventory.inspect","inventory.select","inventory.select_item","inventory.transfer","inventory.equip","inventory.swap","container.open","container.close","craft.plan","craft.execute","build.plan","build.execute");
     }
-    @Override public Set<String> actionFeatures(String action){return action.equals("combat.attack") && mc.hasSingleplayerServer()?Set.of("confirmed_melee_v1"):Set.of();}
+    @Override public Set<String> actionFeatures(String action){if(!mc.hasSingleplayerServer())return Set.of();return switch(action){case "combat.attack"->Set.of("confirmed_melee_v1");case "craft.execute"->Set.of("craft_station_v1");default->Set.of();};}
     @Override public void validate(String action,JsonObject p) {
         switch(action) {
             case "move.to"->{point(child(p,"target"));MovementCommands.validateTravel(p);}
@@ -239,7 +242,7 @@ final class MinecraftWorld implements WorldAccess {
                 if(p.has("menu_id"))integer(p,"menu_id",0,0,10000);
                 if(p.has("menu_revision"))integer(p,"menu_revision",0,0,Integer.MAX_VALUE);
             }
-            case "craft.execute"->{Identifier.parse(string(p,"item"));integer(p,"count",1,1,4096);}
+            case "craft.execute"->{Identifier.parse(string(p,"item"));integer(p,"count",1,1,4096);CraftSequence.validate(p);}
             case "build.execute"->{var plan=new BuildPlanner().plan(p);for(var b:plan.blocks())checkArea(new Vec3(b.x()+0.5,b.y()+0.5,b.z()+0.5));}
             case "item.use"->{String hand=string(p,"hand","main");if(!hand.equals("main")&&!hand.equals("off"))throw new BridgeException("invalid_request","hand must be main/off");integer(p,"duration_ticks",40,1,1200);if(p.has("target"))point(child(p,"target"));}
             case "item.drop"->{ItemDropSequence.count(p);if(!string(p,"hand","main").equals("main"))throw new BridgeException("invalid_request","item.drop supports only the selected main hand");if(p.has("expected_item"))Identifier.parse(string(p,"expected_item"));}
@@ -321,6 +324,7 @@ final class MinecraftWorld implements WorldAccess {
     @Override public void releaseControls(){
         combat.suspendMelee();melees.values().forEach(MeleeSequence::released);
         interactions.suspend();mining.suspend();
+        craftSequences.values().forEach(CraftSequence::released);
         crossbows.values().forEach(CrossbowSequence::released);
         boolean cancelBow=bowDrawing || mc.player!=null && held.contains(mc.options.keyUse) && mc.player.getUseItem().is(Items.BOW) && mc.player.getUsedItemHand()==InteractionHand.MAIN_HAND;
         for(var k:Set.copyOf(held))hold(k,false);held.clear();if(mc.gameMode!=null)mc.gameMode.stopDestroyBlock();
@@ -371,11 +375,14 @@ final class MinecraftWorld implements WorldAccess {
                 view.addProperty("use_ticks",actor.getTicksUsingItem());
                 view.addProperty("item_uses",actor.getStats().getValue(Stats.ITEM_USED,BuiltInRegistries.ITEM.getValue(Identifier.parse(usedItem))));
                 view.addProperty("items_crafted",actor.getStats().getValue(Stats.ITEM_CRAFTED,BuiltInRegistries.ITEM.getValue(Identifier.parse(craftedItem))));
+                view.addProperty("crafting_table",actor.containerMenu instanceof CraftingMenu);
                 if(actor.containerMenu instanceof AbstractCraftingMenu crafting)view.add("craft_output",heldStack(crafting.getResultSlot().getItem()));
                 JsonArray slots=new JsonArray();for(Slot s:actor.containerMenu.slots){JsonObject item=stack(s.getItem());item.addProperty("slot",s.index);slots.add(item);}view.add("slots",slots);
-                Map<String,Integer> counts=new HashMap<>();for(int i=0;i<actor.getInventory().getContainerSize();i++){ItemStack s=actor.getInventory().getItem(i);if(!s.isEmpty())counts.merge(itemId(s),s.getCount(),Integer::sum);}view.add("inventory_counts",GSON.toJsonTree(counts));
+                Map<String,Integer> counts=new HashMap<>();for(int i=0;i<36;i++){ItemStack s=actor.getInventory().getItem(i);if(!s.isEmpty())counts.merge(itemId(s),s.getCount(),Integer::sum);}view.add("inventory_counts",GSON.toJsonTree(counts));
                 JsonArray inventorySlots=new JsonArray();for(int i=0;i<36;i++)inventorySlots.add(heldStack(actor.getInventory().getItem(i)));view.add("inventory_slots",inventorySlots);
-                if(pos!=null){if(!level.hasChunkAt(pos))throw new BridgeException("chunk_unavailable","Confirmation chunk is no longer loaded",true);BlockState state=level.getBlockState(pos);view.add("block",blockSample(state));view.addProperty("block_empty",state.isAir());if(miningTool!=null)view.addProperty("mining_correct_tool",!state.requiresCorrectToolForDrops() || state.canHarvestBlock(level,pos,actor));}
+                if(pos!=null){if(!level.hasChunkAt(pos))throw new BridgeException("chunk_unavailable","Confirmation chunk is no longer loaded",true);BlockState state=level.getBlockState(pos);view.add("block",blockSample(state));view.addProperty("block_empty",state.isAir());if(miningTool!=null)view.addProperty("mining_correct_tool",!state.requiresCorrectToolForDrops() || state.canHarvestBlock(level,pos,actor));
+                    if(task.action.equals("craft.execute")){view.addProperty("block_in_range",actor.getEyePosition().distanceTo(Vec3.atCenterOf(pos))<=actor.blockInteractionRange());var ray=level.clip(new ClipContext(actor.getEyePosition(),Vec3.atCenterOf(pos),ClipContext.Block.OUTLINE,ClipContext.Fluid.NONE,actor));view.addProperty("block_visible",ray.getType()==HitResult.Type.BLOCK && ray.getBlockPos().equals(pos));}
+                }
                 if(entity!=null){Entity e=level.getEntity(UUID.fromString(entity));view.add("entity",e==null?JsonNull.INSTANCE:object("alive",e.isAlive(),"health",e instanceof LivingEntity l?l.getHealth():-1,"position",vector(e.position())));
                     if(task.action.equals("combat.attack") && e!=null){view.addProperty("melee_in_range",actor.isWithinEntityInteractionRange(e,0));view.addProperty("melee_visible",actor.hasLineOfSight(e));view.addProperty("attack_strength",actor.getAttackStrengthScale(0));}
                 }
@@ -1122,57 +1129,163 @@ final class MinecraftWorld implements WorldAccess {
         return Step.waiting(result);
     }
     private void click(int slot,int button,ContainerInput action){mc.gameMode.handleContainerInput(mc.player.containerMenu.containerId,slot,button,action,mc.player);}
-    private Map<String,Integer> counts(){Map<String,Integer> counts=new HashMap<>();for(int i=0;i<mc.player.getInventory().getContainerSize();i++){ItemStack s=mc.player.getInventory().getItem(i);if(!s.isEmpty())counts.merge(itemId(s),s.getCount(),Integer::sum);}return counts;}
+    private Map<String,Integer> counts(){Map<String,Integer> counts=new HashMap<>();for(int i=0;i<36;i++){ItemStack s=mc.player.getInventory().getItem(i);if(!s.isEmpty())counts.merge(itemId(s),s.getCount(),Integer::sum);}return counts;}
     private RecipeCatalog catalog(){if(!catalogFuture.isDone())throw new BridgeException("busy","Recipe catalog is loading",true);return catalogFuture.join();}
     private Set<String> stations(){return mc.player.containerMenu instanceof CraftingMenu?Set.of("inventory","crafting_table"):Set.of("inventory");}
-    private CraftPlanner.Plan craftPlan(JsonObject d){return catalog().planner().plan(string(d,"item"),integer(d,"count",1,1,4096),counts(),stations());}
+    private record CraftPreparation(CraftPlanner.Plan plan,BlockPos station) {}
+    private CraftPreparation prepareCraft(JsonObject d) {
+        Identifier.parse(string(d,"item"));CraftSequence.validate(d);
+        var planner=catalog().planner();int count=integer(d,"count",1,1,4096);var amounts=counts();
+        var plan=planner.plan(string(d,"item"),count,amounts,stations());BlockPos target=null;
+        if(plan.missingStations().contains("crafting_table") && mc.player.containerMenu.containerId==0) {
+            if(d.has("station_position")) {
+                target=block(child(d,"station_position"));reach(target);
+                if(!mc.level.getBlockState(target).is(Blocks.CRAFTING_TABLE))throw new BridgeException("invalid_target","station_position must be a vanilla crafting table");
+                if(interactionHit(target)==null)throw new BridgeException("target_lost","Crafting table is occluded");
+            } else if(bool(d,"auto_station",true)) {
+                double best=Double.MAX_VALUE;int radius=Math.min(8,(int)Math.ceil(mc.player.blockInteractionRange())+1);BlockPos origin=mc.player.blockPosition();
+                for(BlockPos pos:BlockPos.betweenClosed(origin.offset(-radius,-radius,-radius),origin.offset(radius,radius,radius))) {
+                    double distance=mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(pos));
+                    if(distance>=best || distance>mc.player.blockInteractionRange() || !mc.level.hasChunkAt(pos) || !mc.level.getBlockState(pos).is(Blocks.CRAFTING_TABLE))continue;
+                    try{checkArea(Vec3.atCenterOf(pos));}catch(BridgeException e){if(e.code.equals("permission_denied"))continue;throw e;}
+                    if(interactionHit(pos)!=null){target=pos.immutable();best=distance;}
+                }
+            }
+            if(target!=null)plan=planner.plan(string(d,"item"),count,amounts,Set.of("inventory","crafting_table"));
+        }
+        return new CraftPreparation(plan,target);
+    }
+    private JsonObject craftPlan(JsonObject d) {
+        var prepared=prepareCraft(d);JsonObject result=GSON.toJsonTree(prepared.plan()).getAsJsonObject();
+        result.addProperty("station_open_actions",prepared.station()!=null?1:0);
+        if(prepared.station()!=null)result.add("station",object("type","minecraft:crafting_table","position",position(prepared.station()),"source","client_observation"));
+        return result;
+    }
+    private Step openCraftStation(Task t,BlockPos pos) {
+        if(!t.context.has("station_sent")) {
+            if(mc.screen!=null || mc.player.containerMenu.containerId!=0)throw new BridgeException("interface_open","Close the current interface before opening the crafting table");
+            if(mc.player.isUsingItem() || mc.player.isCrouching())throw new BridgeException("item_busy","Stop item use and crouching before opening the crafting table");
+            if(!mc.player.containerMenu.getCarried().isEmpty())throw new BridgeException("cursor_occupied","Clear cursor before opening the crafting table");
+            checkArea(mc.player.position());reach(pos);BlockHitResult hit=interactionHit(pos);
+            if(hit==null || !mc.level.getBlockState(pos).is(Blocks.CRAFTING_TABLE))throw new BridgeException("target_lost","Crafting table is no longer reachable and visible");
+            JsonObject before=serverView(t,pos,null);if(before==null)return Step.waiting(object("stage","server_station_ready"));
+            if(number(before,"menu_id",-1)!=0 || bool(before,"using_item",false) || bool(before,"crouching",false) || integer(child(before,"cursor"),"count",0,0,64)!=0)throw new BridgeException("item_busy","Server actor is not ready to open the crafting table");
+            if(!string(child(before,"block"),"type").equals("minecraft:crafting_table") || !bool(before,"block_in_range",false) || !bool(before,"block_visible",false))throw new BridgeException("target_lost","Server cannot interact with this crafting table");
+            if(!before.get("main_hand").equals(heldStack(mc.player.getMainHandItem())))return Step.waiting(object("stage","held_item_synchronization"));
+            ActionBudget.require(t,1);interactions.begin(t.id,interactionKey(pos),"main",before.get("tick").getAsLong());
+            look(hit.getLocation());mc.gameMode.useItemOn(mc.player,InteractionHand.MAIN_HAND,hit);t.actions++;t.context.addProperty("station_sent",tick());
+            return Step.waiting(object("stage","opening_crafting_table","position",position(pos)));
+        }
+        JsonObject receipt=interactions.peek(t.id);
+        if(receipt!=null && string(receipt,"outcome").equals("menu_opened")) {
+            int opened=integer(child(receipt,"after"),"menu_id",-1,0,10000);JsonObject view=serverView(t,pos,null);
+            if(view==null)return Step.waiting(object("stage","server_station_menu"));
+            if(number(view,"menu_id",-1)!=opened || !bool(view,"crafting_table",false))throw new BridgeException("interface_closed","Confirmed crafting table menu changed");
+            if(!(mc.player.containerMenu instanceof CraftingMenu) || mc.player.containerMenu.containerId!=opened)return Step.waiting(object("stage","client_station_menu"));
+            t.confirmed.add("craft_station",object("position",position(pos),"menu_id",opened,"source","integrated_server"));
+            craftSequences.put(t.id,new CraftSequence(opened));
+            craftStations.remove(t.id);t.context.remove("station_sent");interactions.end(t.id);return Step.waiting(object("stage","crafting_table_open","menu_id",opened));
+        }
+        if(interactions.interrupted(t.id))throw new BridgeException("craft_interrupted","Opening the crafting table was interrupted; inspect the actual menu before a new task");
+        if(tick()-number(t.context,"station_sent",tick())>20)throw new BridgeException("craft_unconfirmed","Crafting table did not confirm opening; the click is not repeated");
+        return Step.waiting(object("stage","opening_crafting_table"));
+    }
+    private InventoryChange craftChange(AbstractCraftingMenu menu,Slot source,Slot target,ItemStack targetAfter) {
+        List<SlotChange> changes=new ArrayList<>();
+        for(Slot slot:menu.getInputGridSlots()){ItemStack before=slot.getItem().copy();changes.add(new SlotChange(slot.index,before,slot==target?targetAfter:before.copy()));}
+        if(source!=null){ItemStack before=source.getItem().copy();changes.add(new SlotChange(source.index,before,before.copyWithCount(before.getCount()-1)));}
+        return new InventoryChange(menu.containerId,List.copyOf(changes),List.of());
+    }
+    private void checkCraftGrid(AbstractCraftingMenu menu,RecipeCatalog.Entry recipe,CraftPlanner.Stage step,int iteration,int cell) {
+        Map<Integer,String> expected=new HashMap<>();int ingredient=0;
+        for(int i=0;i<recipe.grid().size();i++)if(!recipe.grid().get(i).isEmpty()) {
+            String item=step.ingredients().get(iteration*recipe.recipe().ingredients().size()+ingredient++);
+            if(i<cell)expected.put((i/recipe.width())*menu.getGridWidth()+i%recipe.width(),item);
+        }
+        for(int i=0;i<menu.getInputGridSlots().size();i++) {
+            ItemStack actual=menu.getInputGridSlots().get(i).getItem();String item=expected.get(i);
+            if(item==null?!actual.isEmpty():!itemId(actual).equals(item) || actual.getCount()!=1)throw new BridgeException("stale_revision","Craft grid differs from the confirmed ingredient layout");
+        }
+    }
     private Step craft(Task t) {
-        CraftPlanner.Plan plan=crafts.computeIfAbsent(t.id,key->craftPlan(t.parameters));
-        if(!plan.executable())return Step.failure("missing_materials","Missing ingredients or open crafting station",GSON.toJsonTree(plan).getAsJsonObject());
-        if(!(mc.player.containerMenu instanceof AbstractCraftingMenu menu))throw new BridgeException("unsupported_capability","Open a vanilla crafting menu");
-        if(!menu.getCarried().isEmpty())throw new BridgeException("cursor_occupied","Clear cursor before crafting");
+        if(!crafts.containsKey(t.id)){var prepared=prepareCraft(t.parameters);crafts.put(t.id,prepared.plan());if(prepared.station()!=null)craftStations.put(t.id,prepared.station());}
+        CraftPlanner.Plan plan=crafts.get(t.id);
+        if(!plan.executable())return Step.failure(plan.missing().isEmpty()?"missing_station":"missing_materials","Missing ingredients or accessible crafting station",GSON.toJsonTree(plan).getAsJsonObject());
         int stage=integer(t.context,"craft_stage",0,0,10000),iteration=integer(t.context,"craft_iteration",0,0,4096);
-        if(stage>=plan.stages().size()){crafts.remove(t.id);return Step.success(object("item",string(t.parameters,"item"),"inventory",counts(),"stages",plan.stages()));}
+        if(stage>=plan.stages().size()) {
+            JsonObject view=serverView(t,null,null);if(view==null)return Step.waiting(object("stage","final_craft_verification"));
+            JsonObject amounts=child(view,"inventory_counts");String item=string(t.parameters,"item");
+            if(integer(amounts,item,0,0,Integer.MAX_VALUE)<integer(t.parameters,"count",1,1,4096))throw new BridgeException("craft_unconfirmed","Craft target is no longer present in server inventory");
+            return Step.success(object("item",item,"inventory",amounts,"stages",plan.stages(),"source","integrated_server"));
+        }
+        if(craftStations.containsKey(t.id))return openCraftStation(t,craftStations.get(t.id));
+        if(craftSequences.containsKey(t.id))craftSequences.get(t.id).checkMenu(mc.player.containerMenu.containerId);
+        if(!(mc.player.containerMenu instanceof AbstractCraftingMenu menu))throw new BridgeException("interface_open","Close unrelated interfaces before crafting");
+        CraftSequence sequence=craftSequences.computeIfAbsent(t.id,key->new CraftSequence(menu.containerId));sequence.checkMenu(menu.containerId);
+        if(!menu.getCarried().isEmpty())throw new BridgeException("cursor_occupied","Clear cursor before crafting");
         var step=plan.stages().get(stage);var recipe=catalog().entries.get(step.recipe());
         if(recipe.width()>menu.getGridWidth()||recipe.height()>menu.getGridHeight())throw new BridgeException("missing_station","A crafting table must be open");
+        if(sequence.pending()==CraftSequence.Operation.FILL || sequence.pending()==CraftSequence.Operation.CLEAR) {
+            JsonObject view=serverView(t,null,null);if(view==null)return Step.waiting(object("stage","server_craft_grid"));
+            boolean matched=bool(view,"inventory_after_matches",false) && inventoryChanges.get(t.id).matches(menu,true);
+            if(!sequence.confirm((int)number(view,"menu_id",-1),tick(),matched))return Step.waiting(object("stage","server_craft_grid"));
+            inventoryChanges.remove(t.id);if(t.context.has("craft_next_cell")){t.context.add("craft_cell",t.context.remove("craft_next_cell"));}
+            return Step.waiting(object("stage","craft_grid_confirmed"));
+        }
         if(t.context.has("craft_sent")) {
             JsonObject v=serverView(t,null,null);if(v==null)return Step.waiting(object("waiting","server_craft"));
             JsonObject amounts=child(v,"inventory_counts");int actual=amounts.has(step.item())?amounts.get(step.item()).getAsInt():0;
             if(!string(t.context,"craft_item").equals(step.item()))throw new BridgeException("stale_revision","Craft stage changed while awaiting output");
-            if(actual>=t.context.get("craft_before").getAsInt()+recipe.recipe().count() && v.get("items_crafted").getAsInt()>=t.context.get("craft_stats_before").getAsInt()+recipe.recipe().count()) {
+            if(sequence.confirm((int)number(v,"menu_id",-1),tick(),actual>=t.context.get("craft_before").getAsInt()+recipe.recipe().count() && v.get("items_crafted").getAsInt()>=t.context.get("craft_stats_before").getAsInt()+recipe.recipe().count())) {
                 t.confirmed.addProperty("crafts_confirmed",integer(t.confirmed,"crafts_confirmed",0,0,100000)+1);
+                if(!t.confirmed.has("craft_stages"))t.confirmed.add("craft_stages",new JsonArray());
+                t.confirmed.getAsJsonArray("craft_stages").add(object("stage",stage,"iteration",iteration,"recipe",step.recipe(),"item",step.item(),"output",recipe.recipe().count(),"source","integrated_server"));
+                inventoryChanges.remove(t.id);
                 t.context.remove("craft_sent");t.context.addProperty("craft_cell",0);iteration++;
                 if(iteration>=step.crafts()){stage++;iteration=0;}t.context.addProperty("craft_stage",stage);t.context.addProperty("craft_iteration",iteration);
                 return Step.waiting(object("stage",stage,"craft_iteration",iteration));
             }
-            if(tick()-number(t.context,"craft_sent",tick())>20)throw new BridgeException("craft_unconfirmed","Server did not confirm crafting output");return Step.waiting(object("waiting","server_craft"));
+            return Step.waiting(object("waiting","server_craft"));
         }
         int cell=integer(t.context,"craft_cell",0,0,9);
         if(cell==0 && !t.context.has("grid_cleared")) {
-            for(Slot grid:menu.getInputGridSlots())if(grid.hasItem()){ActionBudget.require(t,1);click(grid.index,0,ContainerInput.QUICK_MOVE);t.actions++;return Step.waiting(object("stage","clearing_grid"));}
+            for(Slot grid:menu.getInputGridSlots())if(grid.hasItem()){
+                inventoryChanges.computeIfAbsent(t.id,key->craftChange(menu,null,grid,ItemStack.EMPTY));
+                JsonObject view=serverView(t,null,null);if(view==null)return Step.waiting(object("stage","server_grid_clear_ready"));sequence.checkMenu((int)number(view,"menu_id",-1));
+                if(!bool(view,"inventory_before_matches",false) || !inventoryChanges.get(t.id).matches(menu,false))throw new BridgeException("stale_revision","Craft grid changed before clearing");
+                ActionBudget.require(t,1);sequence.begin(CraftSequence.Operation.CLEAR,tick());click(grid.index,0,ContainerInput.QUICK_MOVE);t.actions++;return Step.waiting(object("stage","clearing_grid"));
+            }
             t.context.addProperty("grid_cleared",true);
         }
         while(cell<recipe.grid().size() && recipe.grid().get(cell).isEmpty())cell++;
+        checkCraftGrid(menu,recipe,step,iteration,cell);
         if(cell<recipe.grid().size()) {
             int ingredientIndex=0;for(int previous=0;previous<cell;previous++)if(!recipe.grid().get(previous).isEmpty())ingredientIndex++;
             String planned=step.ingredients().get(iteration*recipe.recipe().ingredients().size()+ingredientIndex);
             List<String> alternatives=List.of(planned);Slot source=null;
-            for(Slot s:menu.slots)if(s.container==mc.player.getInventory() && alternatives.contains(itemId(s.getItem()))){source=s;break;}
+            for(Slot s:menu.slots)if(s.container==mc.player.getInventory() && s.getContainerSlot()<36 && alternatives.contains(itemId(s.getItem()))){source=s;break;}
             if(source==null)throw new BridgeException("missing_materials","Ingredient is unavailable: "+alternatives);
             int index=(cell/recipe.width())*menu.getGridWidth()+(cell%recipe.width());Slot target=menu.getInputGridSlots().get(index);
             if(target.hasItem())throw new BridgeException("stale_revision","Craft grid changed");
-            ActionBudget.require(t,3);click(source.index,0,ContainerInput.PICKUP);click(target.index,1,ContainerInput.PICKUP);click(source.index,0,ContainerInput.PICKUP);t.actions+=3;
-            t.context.addProperty("craft_cell",cell+1);return Step.waiting(object("stage","filling_grid","cell",cell));
+            if(!inventoryChanges.containsKey(t.id))inventoryChanges.put(t.id,craftChange(menu,source,target,source.getItem().copyWithCount(1)));
+            JsonObject view=serverView(t,null,null);if(view==null)return Step.waiting(object("stage","server_ingredient_ready"));sequence.checkMenu((int)number(view,"menu_id",-1));
+            if(bool(view,"using_item",false))throw new BridgeException("item_busy","Server actor is using an item");
+            if(!bool(view,"inventory_before_matches",false) || !inventoryChanges.get(t.id).matches(menu,false))throw new BridgeException("stale_revision","Craft ingredient, components, grid or cursor changed before input");
+            ActionBudget.require(t,3);sequence.begin(CraftSequence.Operation.FILL,tick());click(source.index,0,ContainerInput.PICKUP);click(target.index,1,ContainerInput.PICKUP);click(source.index,0,ContainerInput.PICKUP);t.actions+=3;
+            t.context.addProperty("craft_next_cell",cell+1);return Step.waiting(object("stage","filling_grid","cell",cell));
         }
         ItemStack result=menu.getResultSlot().getItem();
         if(!itemId(result).equals(step.item()))return Step.waiting(object("waiting","recipe_result"));
         boolean room=mc.player.getInventory().getFreeSlot()!=-1 || mc.player.getInventory().getSlotWithRemainingSpace(result)!=-1;
         if(!room)throw new BridgeException("inventory_full","No room for crafting output");
         ActionBudget.require(t,1);t.context.addProperty("craft_item",step.item());
+        inventoryChanges.computeIfAbsent(t.id,key->craftChange(menu,null,null,ItemStack.EMPTY));
         JsonObject baseline=serverView(t,null,null);if(baseline==null)return Step.waiting(object("waiting","server_recipe"));
+        sequence.checkMenu((int)number(baseline,"menu_id",-1));
+        if(!bool(baseline,"inventory_before_matches",false) || !inventoryChanges.get(t.id).matches(menu,false))throw new BridgeException("stale_revision","Craft grid changed before taking output");
         if(!baseline.has("craft_output") || !string(child(baseline,"craft_output"),"type").equals(step.item()))return Step.waiting(object("waiting","server_recipe"));
         t.context.addProperty("craft_stats_before",baseline.get("items_crafted").getAsInt());
-        t.context.addProperty("craft_before",integer(child(baseline,"inventory_counts"),step.item(),0,0,Integer.MAX_VALUE));click(menu.getResultSlot().index,0,ContainerInput.QUICK_MOVE);t.actions++;t.context.addProperty("craft_sent",tick());t.context.remove("grid_cleared");
+        t.context.addProperty("craft_before",integer(child(baseline,"inventory_counts"),step.item(),0,0,Integer.MAX_VALUE));sequence.begin(CraftSequence.Operation.OUTPUT,tick());click(menu.getResultSlot().index,0,ContainerInput.QUICK_MOVE);t.actions++;t.context.addProperty("craft_sent",tick());t.context.remove("grid_cleared");
         return Step.waiting(object("stage","crafting","recipe",step.recipe()));
     }
     private Step build(Task t) {
@@ -1244,7 +1357,7 @@ final class MinecraftWorld implements WorldAccess {
                 yield object("inventory",observed.get("inventory"),"menu",observed.get("context"));
             }
             case "route.plan" -> object("path",path(point(child(d,"target"))),"modes",List.of("walk","jump"),"unknown_cells","excluded");
-            case "craft.plan" -> GSON.toJsonTree(craftPlan(d)).getAsJsonObject();
+            case "craft.plan" -> craftPlan(d);
             case "build.plan" -> {
                 var plan=new BuildPlanner().plan(d);JsonArray conflicts=new JsonArray();Map<String,Integer> needed=new HashMap<>();
                 for(var b:plan.blocks()){BlockPos p=new BlockPos(b.x(),b.y(),b.z());checkArea(Vec3.atCenterOf(p));if(!mc.level.hasChunkAt(p))throw new BridgeException("chunk_unavailable","Blueprint crosses unloaded chunk");BlockState actual=mc.level.getBlockState(p);if(matches(actual,b.type(),b.properties()))continue;if(!actual.canBeReplaced())conflicts.add(position(p));needed.merge(b.type(),1,Integer::sum);}

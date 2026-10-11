@@ -43,6 +43,7 @@ public final class BridgeClient {
         NeoForge.EVENT_BUS.addListener(this::tick);
         NeoForge.EVENT_BUS.addListener(this::beforeTick);
         NeoForge.EVENT_BUS.addListener(this::keyInput);
+        NeoForge.EVENT_BUS.addListener(this::screenKeyInput);
         NeoForge.EVENT_BUS.addListener(this::mouseInput);
         NeoForge.EVENT_BUS.addListener(this::extract);
         NeoForge.EVENT_BUS.addListener(this::render);
@@ -98,7 +99,7 @@ public final class BridgeClient {
             if(!mc.hasSingleplayerServer() && !policy.allowMultiplayer){message("AI Bridge: разрешена только одиночная игра");continue;}
             engine.ownerArm();message("AI Bridge: управление разрешено; F9 — остановка");
         }
-        while(panelKey.consumeClick()){if(panel==null)panel=new ModelScreen(engine,arm,stop,panelKey);mc.setScreen(mc.screen==panel?null:panel);}
+        while(panelKey.consumeClick()){if(panel==null)panel=new ModelScreen(engine,arm,stop,panelKey);if(mc.screen==panel)panel.onClose();else panel.openFrom(mc.screen);}
         if(mc.isPaused()) {engine.manualInput();return;}
         boolean panelOpen=mc.screen instanceof ModelScreen;
         // GLFW recentres the cursor when the owner panel changes mouse capture.
@@ -131,6 +132,18 @@ public final class BridgeClient {
         } catch(IOException error){LOG.warn("AI Bridge audit persistence failed: {}",error.getClass().getSimpleName());}
     }
     private void keyInput(InputEvent.Key event){if(engine!=null && !(mc.screen instanceof ModelScreen) && event.getAction()==GLFW.GLFW_PRESS && event.getKey()!=arm.getKey().getValue() && event.getKey()!=stop.getKey().getValue() && event.getKey()!=panelKey.getKey().getValue())engine.manualInput();}
+    private void screenKeyInput(ScreenEvent.KeyPressed.Pre event) {
+        if(engine==null || mc.player==null || event.getScreen() instanceof ModelScreen)return;
+        int key=event.getKeyCode();
+        if(key==stop.getKey().getValue()){engine.ownerStop();message("AI Bridge: управление остановлено");event.setCanceled(true);}
+        else if(key==arm.getKey().getValue()){
+            if(mc.hasSingleplayerServer() || policy.allowMultiplayer){engine.ownerArm();message("AI Bridge: управление разрешено; F9 — остановка");}
+            event.setCanceled(true);
+        } else if(key==panelKey.getKey().getValue()){
+            if(panel==null)panel=new ModelScreen(engine,arm,stop,panelKey);
+            panel.openFrom(event.getScreen());event.setCanceled(true);
+        }
+    }
     private void mouseInput(InputEvent.MouseButton.Pre event){if(engine!=null && !(mc.screen instanceof ModelScreen) && event.getAction()==GLFW.GLFW_PRESS)engine.manualInput();}
     private void extract(ExtractLevelRenderStateEvent event){if(vision!=null)vision.extract(event);}
     private void render(RenderLevelStageEvent.AfterLevel event){if(vision!=null)vision.capture(event);}

@@ -13,6 +13,8 @@ import net.minecraft.network.chat.Component;
 final class ModelScreen extends Screen {
     private final BridgeEngine engine;
     private final KeyMapping armKey,stopKey,panelKey;
+    private Screen returnScreen;
+    private int returnMenu;
     private EditBox goal,steps;
     private Checkbox vision;
     private Button start;
@@ -52,6 +54,16 @@ final class ModelScreen extends Screen {
         start.active=engine.armed() && !java.util.Set.of("queued","thinking","executing").contains(state);
     }
     @Override public boolean isPauseScreen(){return false;}
+    void openFrom(Screen previous) {
+        var client=net.minecraft.client.Minecraft.getInstance();
+        returnScreen=previous instanceof net.minecraft.client.gui.screens.inventory.AbstractContainerScreen<?>?previous:null;
+        returnMenu=client.player==null?-1:client.player.containerMenu.containerId;
+        client.setScreen(this);
+    }
+    @Override public void onClose() {
+        Screen previous=returnScreen;returnScreen=null;
+        minecraft.setScreen(previous!=null && minecraft.player!=null && !minecraft.player.isDeadOrDying() && minecraft.player.containerMenu.containerId==returnMenu?previous:null);
+    }
     @Override public boolean keyPressed(KeyEvent event) {
         if(event.key()==stopKey.getKey().getValue()){engine.ownerStop();return true;}
         if(event.key()==armKey.getKey().getValue()){engine.ownerArm();return true;}

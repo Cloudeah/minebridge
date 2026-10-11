@@ -37,7 +37,7 @@ ACTION_HELP = {
     "inventory.transfer": "from_slot,to_slot,count,menu_id,menu_revision:current menu",
     "inventory.equip": "from_slot:observed menu slot,equipment_slot:head/chest/legs/feet/offhand; whole stack (armor max1), old gear returns to source; close container; needs 1 or 3 actions",
     "inventory.swap": "from_slot,to_slot:observed player-menu slots; exchange whole stacks; close container; needs 1 or 3 actions",
-    "craft.execute": "item:namespace:id,count:1..4096 total; 3x3 requires open crafting table",
+    "craft.execute": "item:namespace:id,count:1..4096 total,auto_station:bool(defaulttrue),station_position:{x,y,z} optional; opens visible in-reach vanilla table if 3x3 needed,1 extra action; no walking or mining",
     "build.execute": "origin:{x,y,z},rotation:0/90/180/270,replace:false,blocks:[{x,y,z,type,properties:{}}]",
 }
 
@@ -46,7 +46,7 @@ QUERY_HELP = {
     "map.nearest": "x,y,z,block OR blocks:[ids],radius:1..64,max_age_ticks optional",
     "map.query": "x,y,z,radius:1..64,block/blocks optional,limit:1..128",
     "memory.query": "same as map.query; observed facts and separate AI notes",
-    "craft.plan": "item:namespace:id,count; recipe chain, missing materials/stations",
+    "craft.plan": "same parameters as craft.execute; recipe chain, missing materials/stations,chosen station and opening cost",
     "build.plan": "same parameters as build.execute; materials/conflicts",
     "route.plan": "target:{x,y,z}; safe loaded route",
     "inventory.inspect": "item:namespace:id optional; current inventory/menu",
@@ -90,6 +90,16 @@ def compact_result(result):
         facts["verified_block_count"] = len(updates)
     data = result.get("result", {})
     if isinstance(data, dict):
+        if result.get("action") == "craft.execute":
+            stages = data.pop("stages", None)
+            if isinstance(stages, list):
+                data["planned_stage_count"] = len(stages)
+            if isinstance(facts, dict):
+                receipts = facts.pop("craft_stages", None)
+                if isinstance(receipts, list) and receipts:
+                    facts["last_craft"] = receipts[-1]
+                    if len(receipts) > 1:
+                        facts["craft_stages_omitted"] = len(receipts) - 1
         if isinstance(facts, dict):
             for proof in ("interaction", "inventory_swap", "transfer", "mining"):
                 if facts.get(proof) == data:
@@ -224,6 +234,9 @@ def goal_progress(snapshot, history, initial_actor=None):
             value = facts.get(key, 0)
             if type(value) is int and value > 0:
                 progress["confirmed_" + key] = progress.get("confirmed_" + key, 0) + value
+        crafts = facts.get("crafts_confirmed", 0)
+        if type(crafts) is int and crafts > 0:
+            progress["confirmed_crafts"] = progress.get("confirmed_crafts", 0) + crafts
         for key in ("shots", "hits", "damage"):
             value = facts.get(key, 0)
             if type(value) in (int, float) and value > 0:
@@ -248,7 +261,7 @@ def compact_recent_results(history):
         if not isinstance(decision, dict) or not isinstance(result, dict):
             continue
         recent.append(compact_result({**{key: deepcopy(decision[key]) for key in ("action", "parameters") if key in decision},
-                       **{key: deepcopy(result[key]) for key in ("state", "error", "detail", "result", "confirmed_changes")
+                       **{key: deepcopy(result[key]) for key in ("operation", "state", "error", "detail", "result", "confirmed_changes")
                           if key in result}}))
     return recent
 
@@ -322,6 +335,24 @@ def validate_decision(value, allowed):
 def validate_item_parameters(action, parameters):
     from uuid import UUID
     import re
+    if action == "query" and parameters.get("operation") == "craft.plan":
+        arguments = parameters.get("arguments")
+        if not isinstance(arguments, dict):
+            raise ValueError("craft.plan: arguments must be an object")
+        validate_item_parameters("craft.execute", arguments)
+    if action == "craft.execute":
+        item = parameters.get("item")
+        if not isinstance(item, str) or not re.fullmatch(r"[a-z0-9_.-]+:[a-z0-9/._-]+", item):
+            raise ValueError("craft.execute: item must be namespace:id")
+        count = parameters.get("count", 1)
+        if type(count) is not int or not 1 <= count <= 4096:
+            raise ValueError("craft.execute: count must be an integer 1..4096")
+        if type(parameters.get("auto_station", True)) is not bool:
+            raise ValueError("craft.execute: auto_station must be boolean")
+        if "station_position" in parameters:
+            position = parameters["station_position"]
+            if not isinstance(position, dict) or any(type(position.get(axis)) is not int or abs(position[axis]) > (2048 if axis == "y" else 30000000) for axis in ("x", "y", "z")):
+                raise ValueError("craft.execute: station_position must contain bounded integer x/y/z")
     if action == "combat.attack":
         entity_id = parameters.get("entity_id")
         if not isinstance(entity_id, str) or str(UUID(entity_id)).lower() != entity_id.lower():

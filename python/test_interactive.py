@@ -30,7 +30,10 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
     async def test_offhand_interaction_reaches_notebook_and_guarded_task_unchanged(self):
         await self.integration(interaction=True)
 
-    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False, ranged=False, follow=False, crossbow=False, interaction=False):
+    async def test_craft_station_parameters_reach_notebook_relay_and_guarded_task(self):
+        await self.integration(craft=True)
+
+    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False, ranged=False, follow=False, crossbow=False, interaction=False, craft=False):
         submitted, observed_profiles, reports, queries = [], [], [], []
         terminal = asyncio.Event()
         holder = {}
@@ -45,6 +48,9 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
         interaction_decision = {"action": "world.interact", "parameters": {"entity_id": bow_decision["parameters"]["entity_id"], "hand": "off"}, "reason": "milk the cow"}
         if interaction:
             model.content = json.dumps(interaction_decision)
+        craft_decision = {"action": "craft.execute", "parameters": {"item": "minecraft:wooden_pickaxe", "count": 1, "auto_station": False, "station_position": {"x": 0, "y": 56, "z": 2}}, "reason": "craft at observed table"}
+        if craft:
+            model.content = json.dumps(craft_decision)
         if malformed_first:
             def reply():
                 model.content = EXPRESSION_REPLY if len(model.payloads) == 1 else json.dumps(DECISION)
@@ -71,7 +77,7 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                     "state": "queued", "step": 0}
 
         status = goal("first")
-        capabilities = {"actions": ["world.interact"] if interaction else ["move.follow"] if follow else ["combat.ranged"] if ranged else ["look.at"], "actor_id": "test-actor", "armed": True,
+        capabilities = {"actions": ["craft.execute"] if craft else ["world.interact"] if interaction else ["move.follow"] if follow else ["combat.ranged"] if ranged else ["look.at"], "actor_id": "test-actor", "armed": True,
                         "model_control": True, "observation_profiles": ["full", "compact"]}
 
         if query_first:
@@ -228,6 +234,10 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                 for item in submitted:
                     self.assertEqual(item["action"], interaction_decision["action"])
                     self.assertEqual(item["parameters"], interaction_decision["parameters"])
+            if craft:
+                for item in submitted:
+                    self.assertEqual(item["action"], craft_decision["action"])
+                    self.assertEqual(item["parameters"], craft_decision["parameters"])
             self.assertIn("compact", observed_profiles)
             if vision:
                 image = model.payloads[0]["messages"][1]["content"][0]["image_url"]["url"]

@@ -1047,6 +1047,42 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
 
 class InventoryDecisionTest(unittest.TestCase):
+    def test_context_shrinking_keeps_recent_plan_and_station_intact(self):
+        notebook = json.loads((ROOT / 'examples/vllm_tpu_colab.ipynb').read_text())
+        source = next(''.join(c['source']) for c in notebook['cells'] if 'def shrink_observation(' in ''.join(c['source']))
+        function = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == 'shrink_observation')
+        namespace = {'json': json}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), '<notebook shrink>', 'exec'), namespace)
+        recent = [{"operation": "craft.plan", "result": {"station": {"position": {"x": 0, "y": 56, "z": 2}}, "stages": [{"ingredients": ["minecraft:oak_log"]}]*8}}]
+        data = {"goal": "craft pickaxe", "goal_progress": {"confirmed_crafts": 3}, "recent_results": recent, "observation": {"blocks": [1, 2]}}
+        body = {"messages": [{"role": "user", "content": json.dumps(data)}]}
+        self.assertTrue(namespace['shrink_observation'](body))
+        reduced = json.loads(body['messages'][0]['content'])
+        self.assertEqual(reduced['recent_results'], recent)
+        self.assertEqual(reduced['goal_progress'], data['goal_progress'])
+        self.assertFalse(namespace['shrink_observation'](body))
+
+    def test_query_history_preserves_operation_for_filtered_compaction(self):
+        history = [{"decision": {"action": "query", "parameters": {"operation": "craft.plan", "arguments": {"item": "minecraft:stick"}}},
+                    "result": {"operation": "craft.plan", "state": "queried", "result": {"station_open_actions": 1}}}]
+        self.assertEqual(controller.compact_recent_results(history)[0]['operation'], 'craft.plan')
+
+    def test_craft_progress_retains_confirmed_outputs_across_partial_results(self):
+        history = [{"result": {"task_id": state, "state": state, "confirmed_changes": {"crafts_confirmed": count}}}
+                   for state, count in (("failed", 1), ("succeeded", 4), ("cancelled", True))]
+        history.append(deepcopy(history[0]))
+        self.assertEqual(controller.goal_progress(snapshot(), history)["confirmed_crafts"], 5)
+
+    def test_craft_history_keeps_counter_last_receipt_and_preserves_full_api_result(self):
+        receipts = [{"stage": n, "item": "minecraft:oak_planks", "output": 4, "source": "integrated_server"} for n in range(16)]
+        full = {"action": "craft.execute", "state": "cancelled", "result": {"stages": [{"ingredients": ["minecraft:oak_log"]}]*8},
+                "confirmed_changes": {"crafts_confirmed": 16, "craft_stages": receipts}}
+        original = deepcopy(full)
+        compact = controller.compact_result(full)
+        self.assertEqual(compact["confirmed_changes"], {"crafts_confirmed": 16, "last_craft": receipts[-1], "craft_stages_omitted": 15})
+        self.assertEqual(compact["result"], {"planned_stage_count": 8})
+        self.assertEqual(full, original)
+
     def setUp(self):
         notebook = json.loads((ROOT / 'examples/vllm_tpu_colab.ipynb').read_text())
         source = next(''.join(cell['source']) for cell in notebook['cells'] if cell['cell_type'] == 'code' and 'def validate_item_parameters(' in ''.join(cell['source']))
@@ -1055,6 +1091,23 @@ class InventoryDecisionTest(unittest.TestCase):
         namespace = {}
         exec(compile(ast.Module(body=[function], type_ignores=[]), '<notebook inventory validator>', 'exec'), namespace)
         self.validators = [controller.validate_item_parameters, namespace['validate_item_parameters']]
+
+    def test_craft_station_and_plan_parameters_match_in_notebook_and_controller(self):
+        valid = {"item": "minecraft:wooden_pickaxe", "count": 1, "auto_station": False, "station_position": {"x": 0, "y": 56, "z": 2}}
+        invalid = ({}, {**valid, "item": "pickaxe"}, {**valid, "count": True}, {**valid, "count": 4097},
+                   {**valid, "auto_station": "true"}, {**valid, "station_position": {"x": 0, "y": 56}},
+                   {**valid, "station_position": {"x": True, "y": 56, "z": 2}},
+                   {**valid, "station_position": {"x": 0, "y": 2049, "z": 2}})
+        for validate in self.validators:
+            for action, parameters in (("craft.execute", valid), ("query", {"operation": "craft.plan", "arguments": valid})):
+                original = deepcopy(parameters)
+                validate(action, parameters)
+                self.assertEqual(parameters, original)
+            for parameters in invalid:
+                with self.subTest(parameters=parameters), self.assertRaises(ValueError):
+                    validate("craft.execute", parameters)
+                with self.subTest(query=parameters), self.assertRaises(ValueError):
+                    validate("query", {"operation": "craft.plan", "arguments": parameters})
 
     def test_inventory_proof_is_compacted_once_with_counter_and_full_source_untouched(self):
         proof = {"source": "integrated_server", "source_slot": {"slot": 9, "type": "minecraft:iron_helmet", "count": 1}, "target_slot": {"slot": 5, "type": "minecraft:diamond_helmet", "count": 1}}
