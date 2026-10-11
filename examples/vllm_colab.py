@@ -29,8 +29,8 @@ ACTION_HELP = {
     "item.pickup": "entity_id of observed minecraft:item; approach and collect whole stack; partial count possible",
     "block.break": "position:{x,y,z} integer, require_tool:true",
     "block.place": "position:{x,y,z} integers,block:namespace:id,properties:{}; prepares main-inventory material",
-    "world.interact": "position:{x,y,z} OR entity_id",
-    "container.open": "position:{x,y,z} OR entity_id",
+    "world.interact": "position:{x,y,z} integers OR entity_id,hand:main/off(defaultmain); one targeted click,1 action; feed/shear/milk use selected item",
+    "container.open": "position:{x,y,z} integers OR entity_id,hand:main/off; must open a new menu",
     "container.close": "{}",
     "inventory.select": "slot:0..8 hotbar",
     "inventory.select_item": "item:namespace:id,hotbar_slot:0..8 optional; main inventory to hand",
@@ -89,6 +89,8 @@ def compact_result(result):
         facts["verified_block_count"] = len(updates)
     data = result.get("result", {})
     if isinstance(data, dict):
+        if isinstance(facts, dict) and facts.get("interaction") == data:
+            facts.pop("interaction")  # Keep the identical proof once, alongside its counter.
         data.pop("server", None)
         data.pop("finalInventory", None)
         if "path" in data:
@@ -111,6 +113,31 @@ async def execute_query(bridge, decision, queries, context, goal_id=None):
     return {"state": "queried", "operation": parameters["operation"], "result": result}
 
 
+def select_entities(snapshot, limit):
+    origin = snapshot["actor"]["position"]
+    active = snapshot.get("active_task") or {}
+    target = active.get("parameters", {}).get("entity_id")
+    def kind(entity):
+        return entity.get("kind", "item" if entity.get("type") == "minecraft:item" else "other")
+    def priority(entity):
+        return (-1 if target and entity.get("entity_id") == target else
+                {"living": 0, "item": 1, "other": 2, "projectile": 3}.get(kind(entity), 2),
+                sum((entity["position"][axis] - origin[axis]) ** 2 for axis in ("x", "y", "z")))
+    entries = sorted(snapshot.get("entities", []), key=priority)
+    selected = []
+    if target:
+        selected = [entry for entry in entries if entry.get("entity_id") == target][:1]
+    for group in ("living", "item"):
+        if len(selected) < limit:
+            choice = next((entry for entry in entries if kind(entry) == group and entry not in selected), None)
+            if choice is not None:
+                selected.append(choice)
+    for entry in entries:
+        if len(selected) < limit and entry not in selected:
+            selected.append(entry)
+    return [entry for entry in entries if entry in selected]
+
+
 def compact_snapshot(snapshot, block_limit=64, entity_limit=24, compact_menu=False):
     snapshot = deepcopy(snapshot)
     actor = snapshot["actor"]
@@ -128,12 +155,10 @@ def compact_snapshot(snapshot, block_limit=64, entity_limit=24, compact_menu=Fal
         "revision": snapshot["revision"], "game_tick": snapshot["game_tick"],
         "actor": actor,
         "inventory": [{k: item[k] for k in ("slot", "type", "count")} for item in snapshot["inventory"] if item["count"]],
-        "entities": sorted(snapshot.get("entities", []), key=lambda e: sum(
-            (e["position"][k] - origin[k]) ** 2 for k in ("x", "y", "z")
-        ))[:entity_limit], "blocks": blocks,
+        "entities": select_entities(snapshot, entity_limit), "blocks": blocks,
         "context": {k: context.get(k) for k in ("menu_id", "menu_revision", "cursor")},
         "menu_slots": [{k: slot[k] for k in ("slot", "type", "count", "player_inventory", "role", "inventory_slot") if k in slot} for slot in slots],
-        "observation_limits": f"Only {block_limit} nearest observed blocks and {entity_limit} observed entities are included. "
+        "observation_limits": f"Only {block_limit} nearest observed blocks and {entity_limit} observed entities are included; active target and living/item diversity first, projectiles last. "
                               + ("Menu includes occupied slots and at most four empty slots. " if compact_menu else "")
                               + "Missing data is unknown.",
     }
@@ -175,6 +200,9 @@ def goal_progress(snapshot, history, initial_actor=None):
         loads = facts.get("crossbow_loads", 0)
         if type(loads) is int and loads > 0:
             progress["confirmed_crossbow_loads"] = progress.get("confirmed_crossbow_loads", 0) + loads
+        interactions = facts.get("interactions", 0)
+        if type(interactions) is int and interactions > 0:
+            progress["confirmed_interactions"] = progress.get("confirmed_interactions", 0) + interactions
         for key in ("shots", "hits", "damage"):
             value = facts.get(key, 0)
             if type(value) in (int, float) and value > 0:
@@ -273,6 +301,19 @@ def validate_decision(value, allowed):
 def validate_item_parameters(action, parameters):
     from uuid import UUID
     import re
+    if action in ("world.interact", "container.open"):
+        if ("entity_id" in parameters) == ("position" in parameters):
+            raise ValueError(action + ": choose exactly one position or entity_id")
+        if parameters.get("hand", "main") not in ("main", "off"):
+            raise ValueError(action + ": hand must be main/off")
+        if "entity_id" in parameters:
+            if not isinstance(parameters["entity_id"], str):
+                raise ValueError(action + ": entity_id must be an observed UUID")
+            UUID(parameters["entity_id"])
+        else:
+            position = parameters["position"]
+            if not isinstance(position, dict) or any(type(position.get(axis)) is not int for axis in ("x", "y", "z")):
+                raise ValueError(action + ": position must contain integer x/y/z")
     if action == "move.follow":
         if not isinstance(parameters.get("entity_id"), str):
             raise ValueError("move.follow: entity_id must be an observed UUID")

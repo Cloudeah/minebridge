@@ -60,5 +60,6 @@
   "screen.minebridge.progress.hits": "попаданий: %s",
   "screen.minebridge.progress.damage": "урон: %s",
   "screen.minebridge.progress.follow_ticks": "сопровождение: %s тиков",
-  "screen.minebridge.progress.crossbow_loads": "заряжено: %s"
+  "screen.minebridge.progress.crossbow_loads": "заряжено: %s",
+  "screen.minebridge.progress.interactions": "взаимодействий: %s"
 }

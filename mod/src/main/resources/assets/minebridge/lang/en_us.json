@@ -38,7 +38,7 @@
   "screen.minebridge.action.item.use": "Use item",
   "screen.minebridge.action.item.drop": "Drop",
   "screen.minebridge.action.item.pickup": "Pick up",
-  "screen.minebridge.action.world.interact": "Interact",
+  "screen.minebridge.action.world.interact": "Interaction",
   "screen.minebridge.action.container.open": "Open container",
   "screen.minebridge.action.container.close": "Close container",
   "screen.minebridge.action.inventory.select": "Select slot",
@@ -60,5 +60,6 @@
   "screen.minebridge.progress.hits": "hits: %s",
   "screen.minebridge.progress.damage": "damage: %s",
   "screen.minebridge.progress.follow_ticks": "followed: %s ticks",
-  "screen.minebridge.progress.crossbow_loads": "loaded: %s"
+  "screen.minebridge.progress.crossbow_loads": "loaded: %s",
+  "screen.minebridge.progress.interactions": "interactions: %s"
 }

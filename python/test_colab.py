@@ -3,6 +3,7 @@ import asyncio
 import base64
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 import importlib.util
 import io
 import json
@@ -206,6 +207,26 @@ class DecisionTest(unittest.TestCase):
         self.assertIn("Missing data is unknown", observed["observation_limits"])
         self.assertEqual(user["recent_results"], [{"action": "look.at", "parameters": {},
                                                  "state": "succeeded", "result": {"step": 3}}])
+
+
+    def test_compact_entities_preserve_living_and_items_despite_projectile_noise(self):
+        state = snapshot()
+        def entity(identifier, kind, distance):
+            return {"entity_id": identifier, "kind": kind, "position": {"x": distance, "y": 64, "z": 0}}
+        state["entities"] = [entity(f"arrow{i}", "projectile", .1 * i) for i in range(8)]
+        state["entities"] += [entity("cow", "living", 6), entity("sheep", "living", 7), entity("item", "item", 8), entity("pig", "living", 9)]
+        original = deepcopy(state)
+        observed = controller.compact_snapshot(state, entity_limit=4)
+        self.assertEqual([e["entity_id"] for e in observed["entities"]], ["cow", "sheep", "pig", "item"])
+        self.assertEqual(state, original)
+
+    def test_compact_pins_only_an_observed_active_target(self):
+        state = snapshot()
+        state["entities"] = [{"entity_id": str(i), "kind": "living", "position": {"x": i + 1, "y": 64, "z": 0}} for i in range(8)]
+        state["active_task"] = {"parameters": {"entity_id": "7"}}
+        self.assertEqual(controller.compact_snapshot(state, entity_limit=4)["entities"][0]["entity_id"], "7")
+        state["active_task"]["parameters"]["entity_id"] = "unknown"
+        self.assertNotIn("unknown", [e["entity_id"] for e in controller.compact_snapshot(state, entity_limit=4)["entities"]])
 
 
 class ColabRelaySettingsTest(unittest.TestCase):
@@ -669,6 +690,38 @@ class VllmAdapterTest(unittest.TestCase):
         progress = controller.goal_progress(snapshot(), [loaded, loaded, fired, invalid])
         self.assertEqual(progress["confirmed_crossbow_loads"], 1)
         self.assertEqual(progress["confirmed_shots"], 1)
+
+    def test_interaction_parameters_are_identical_in_notebook_and_controller(self):
+        namespace = {}
+        notebook_function(namespace)
+        validate = namespace["validate_item_parameters"]
+        entity_id = "418f10e9-bc78-4d9c-bb26-6a9cfa352b69"
+        for action in ("world.interact", "container.open"):
+            for function in (validate, controller.validate_item_parameters):
+                function(action, {"entity_id": entity_id, "hand": "off"})
+                function(action, {"position": {"x": 1, "y": 64, "z": -2}})
+                for bad in ({}, {"entity_id": entity_id, "position": {"x": 1, "y": 64, "z": 2}},
+                            {"entity_id": entity_id, "hand": "both"}, {"entity_id": "invented"},
+                            {"position": {"x": 1.5, "y": 64, "z": 2}}, {"position": {"x": True, "y": 64, "z": 2}}):
+                    with self.assertRaises(ValueError):
+                        function(action, bad)
+
+    def test_confirmed_interactions_are_deduplicated_and_booleans_are_rejected(self):
+        result = {"result": {"task_id": "fed", "state": "succeeded", "confirmed_changes": {"interactions": 1}}}
+        invalid = {"result": {"task_id": "invalid", "confirmed_changes": {"interactions": True}}}
+        progress = controller.goal_progress(snapshot(), [result, result, invalid])
+        self.assertEqual(progress["confirmed_interactions"], 1)
+        self.assertEqual(progress["completed_steps"], 1)
+
+    def test_compact_interaction_proof_is_kept_once_without_changing_the_full_result(self):
+        receipt = {"outcome": "entity_changed", "target": "entity:observed", "source": "integrated_server_interaction"}
+        result = {"state": "failed", "error": "interaction_unconfirmed", "result": receipt,
+                  "confirmed_changes": {"interactions": 1, "interaction": receipt}}
+        original = deepcopy(result)
+        compact = controller.compact_result(result)
+        self.assertEqual(compact["confirmed_changes"], {"interactions": 1})
+        self.assertEqual(compact["result"], receipt)
+        self.assertEqual(result, original)
 
     def test_follow_parameters_are_identical_in_controller_and_notebook(self):
         target = "418f10e9-bc78-4d9c-bb26-6a9cfa352b69"

@@ -41,6 +41,23 @@ class ObservationProfilesTest {
         assertEquals(39,compact.get(4).getAsJsonObject().get("inventory_slot").getAsInt());assertEquals(1,compact.get(4).getAsJsonObject().get("count").getAsInt());
     }
     @Test void fullProfileDoesNotChangeExistingShape(){JsonObject source=object("actor",object("health",20));assertEquals(source,ObservationProfiles.apply(source,"full"));}
+    @Test void CompactKeepsLivingTargetsAndAnItemDespiteNearbyProjectiles() {
+        JsonArray entities=new JsonArray();for(int i=0;i<8;i++)entities.add(entity("arrow"+i,"projectile",i*.1));
+        entities.add(entity("cow","living",6));entities.add(entity("sheep","living",7));entities.add(entity("item","item",8));entities.add(entity("pig","living",9));
+        JsonObject source=object("actor",object("position",object("x",0,"y",64,"z",0)),"entities",entities);
+        JsonArray selected=ObservationProfiles.apply(source,"compact").getAsJsonArray("entities");
+        assertEquals(4,selected.size());assertEquals("cow",string(selected.get(0).getAsJsonObject(),"entity_id"));
+        assertTrue(selected.asList().stream().anyMatch(e->string(e.getAsJsonObject(),"entity_id").equals("item")));
+        assertFalse(selected.asList().stream().anyMatch(e->string(e.getAsJsonObject(),"kind").equals("projectile")));
+    }
+    @Test void CompactPreservesAnObservedActiveTargetWithoutInventingMissingEntities() {
+        JsonArray entities=new JsonArray();for(int i=0;i<6;i++)entities.add(entity("cow"+i,"living",i+1));entities.add(entity("target","projectile",20));
+        JsonObject source=object("actor",object("position",object("x",0,"y",64,"z",0)),"entities",entities,"active_task",object("parameters",object("entity_id","target")));
+        assertEquals("target",string(ObservationProfiles.apply(source,"compact").getAsJsonArray("entities").get(0).getAsJsonObject(),"entity_id"));
+        child(child(source,"active_task"),"parameters").addProperty("entity_id","unobserved");
+        assertFalse(ObservationProfiles.apply(source,"compact").getAsJsonArray("entities").asList().stream().anyMatch(e->string(e.getAsJsonObject(),"entity_id").equals("unobserved")));
+    }
+    private static JsonObject entity(String id,String kind,double x){return object("entity_id",id,"kind",kind,"position",object("x",x,"y",64,"z",0));}
     @Test void unknownProfileIsRejected(){assertEquals("unsupported_capability",assertThrows(BridgeException.class,()->ObservationProfiles.apply(object(),"huge")).code);}
     private static JsonObject menuSlot(int index,String role,int count,String type,Integer inventorySlot){JsonObject slot=object("slot",index,"role",role,"count",count,"type",type);if(inventorySlot!=null)slot.addProperty("inventory_slot",inventorySlot);return slot;}
 }

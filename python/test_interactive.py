@@ -27,7 +27,10 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
     async def test_crossbow_decision_omits_bow_charge_ticks_through_guarded_submission(self):
         await self.integration(ranged=True, crossbow=True)
 
-    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False, ranged=False, follow=False, crossbow=False):
+    async def test_offhand_interaction_reaches_notebook_and_guarded_task_unchanged(self):
+        await self.integration(interaction=True)
+
+    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False, ranged=False, follow=False, crossbow=False, interaction=False):
         submitted, observed_profiles, reports, queries = [], [], [], []
         terminal = asyncio.Event()
         holder = {}
@@ -39,6 +42,9 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
         follow_decision = {"action": "move.follow", "parameters": {"entity_id": bow_decision["parameters"]["entity_id"], "ticks": 100, "distance": 3}, "reason": "follow five seconds"}
         if follow:
             model.content = json.dumps(follow_decision)
+        interaction_decision = {"action": "world.interact", "parameters": {"entity_id": bow_decision["parameters"]["entity_id"], "hand": "off"}, "reason": "milk the cow"}
+        if interaction:
+            model.content = json.dumps(interaction_decision)
         if malformed_first:
             def reply():
                 model.content = EXPRESSION_REPLY if len(model.payloads) == 1 else json.dumps(DECISION)
@@ -61,11 +67,11 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
             model.before_reply = delay_first_reply
 
         def goal(identifier):
-            return {"goal_id": identifier, "goal": "follow five seconds" if follow else "shoot once" if ranged else "look east", "steps": 2 if query_first else 1, "vision": vision,
+            return {"goal_id": identifier, "goal": "milk the cow" if interaction else "follow five seconds" if follow else "shoot once" if ranged else "look east", "steps": 2 if query_first else 1, "vision": vision,
                     "state": "queued", "step": 0}
 
         status = goal("first")
-        capabilities = {"actions": ["move.follow"] if follow else ["combat.ranged"] if ranged else ["look.at"], "actor_id": "test-actor", "armed": True,
+        capabilities = {"actions": ["world.interact"] if interaction else ["move.follow"] if follow else ["combat.ranged"] if ranged else ["look.at"], "actor_id": "test-actor", "armed": True,
                         "model_control": True, "observation_profiles": ["full", "compact"]}
 
         if query_first:
@@ -77,6 +83,9 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                 state["actor"]["main_hand"] = {"type": "minecraft:crossbow" if crossbow else "minecraft:bow", "count": 1, "damage": 0}
                 if crossbow:state["actor"]["main_hand"]["crossbow"] = {"charged": False, "projectiles": []}
                 state["entities"] = [{"entity_id": bow_decision["parameters"]["entity_id"], "type": "minecraft:pig", "position": {"x": 0, "y": 64, "z": 8}, "visible": True}]
+            if interaction:
+                state["actor"]["off_hand"] = {"type": "minecraft:bucket", "count": 1, "damage": 0}
+                state["entities"] = [{"entity_id": interaction_decision["parameters"]["entity_id"], "type": "minecraft:cow", "kind": "living", "position": {"x": 0, "y": 64, "z": 2}, "visible": True}]
             return state
 
         async def handler(socket):
@@ -127,7 +136,7 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                     submitted.append(dict(data))
                     value = {"status": "accepted", "task_id": "task-" + status["goal_id"]}
                 elif operation == "task.status":
-                    value = {"state": "succeeded", "task_id": data["task_id"], "result": {}, "confirmed_changes": {"follow_ticks": 100} if follow else {"shots": 1, "hits": 1, "damage": 6} if ranged else {}}
+                    value = {"state": "succeeded", "task_id": data["task_id"], "result": {}, "confirmed_changes": {"interactions": 1} if interaction else {"follow_ticks": 100} if follow else {"shots": 1, "hits": 1, "damage": 6} if ranged else {}}
                 elif operation == "vision.capture":
                     self.assertEqual(data["observation_profile"], "compact")
                     value = {"status": "accepted", "request_id": message["request_id"]}
@@ -215,6 +224,10 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                 for item in submitted:
                     self.assertEqual(item["action"], follow_decision["action"])
                     self.assertEqual(item["parameters"], follow_decision["parameters"])
+            if interaction:
+                for item in submitted:
+                    self.assertEqual(item["action"], interaction_decision["action"])
+                    self.assertEqual(item["parameters"], interaction_decision["parameters"])
             self.assertIn("compact", observed_profiles)
             if vision:
                 image = model.payloads[0]["messages"][1]["content"][0]["image_url"]["url"]
