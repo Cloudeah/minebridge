@@ -54,6 +54,9 @@ final class MinecraftWorld implements WorldAccess {
     private final PickupLedger pickups;
     private final CombatLedger combat;
     private final InteractionLedger interactions;
+    private final MiningLedger mining;
+    private record MiningTool(int selected,ItemStack stack) {}
+    private final Map<String,MiningTool> miningTools=new HashMap<>();
     // Only server-side join/tick callbacks access this bounded set.
     private final LinkedHashSet<String> freshArrows=new LinkedHashSet<>();
     private boolean bowDrawing;
@@ -67,7 +70,7 @@ final class MinecraftWorld implements WorldAccess {
         this.mc=mc;this.policy=policy;actor=mc.player.getUUID().toString();initialDimension=mc.level.dimension().identifier().toString();
         pickups=new PickupLedger(actor,initialDimension);
         combat=new CombatLedger(actor,initialDimension);
-        interactions=new InteractionLedger(actor,initialDimension);
+        interactions=new InteractionLedger(actor,initialDimension);mining=new MiningLedger(actor,initialDimension);
         if(mc.hasSingleplayerServer()) {
             Path marker=mc.getSingleplayerServer().getWorldPath(LevelResource.ROOT).resolve("minebridge-world-id.txt");
             if(!Files.exists(marker))Files.writeString(marker,id(),StandardOpenOption.CREATE_NEW);
@@ -84,10 +87,10 @@ final class MinecraftWorld implements WorldAccess {
     @Override public long tick(){if(mc.level!=null)lastTick=mc.level.getGameTime();return lastTick;}
     @Override public boolean visionAvailable(){return mc.hasSingleplayerServer() && mc.getMainRenderTarget().getColorTexture() instanceof com.mojang.blaze3d.opengl.GlTexture && mc.getMainRenderTarget().getDepthTexture() instanceof com.mojang.blaze3d.opengl.GlTexture;}
     @Override public List<String> movementModes(){return mc.hasSingleplayerServer()?List.of("walk","sprint","jump","crouch"):List.of();}
-    @Override public void taskFinished(Task t){confirmations.remove(t.id);inventoryChanges.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);crossbows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);interactions.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
+    @Override public void taskFinished(Task t){mining.end(t.id);miningTools.remove(t.id);confirmations.remove(t.id);inventoryChanges.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);crossbows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);interactions.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
     @Override public void collectConfirmed(Task t) {
         updateCombatReceipt(t,combat.finish(t.id));
-        updateInteractionReceipt(t,interactions.finish(t.id));
+        updateInteractionReceipt(t,interactions.finish(t.id));updateMiningReceipt(t,mining.finish(t.id));
     }
     private void updateInteractionReceipt(Task task,JsonObject receipt){if(receipt!=null){task.confirmed.addProperty("interactions",1);task.confirmed.add("interaction",receipt);}}
     private static String interactionKey(BlockPos pos){return "block:"+pos.getX()+","+pos.getY()+","+pos.getZ();}
@@ -154,7 +157,7 @@ final class MinecraftWorld implements WorldAccess {
             case "inventory.select"->t.context.has("selection_sent");
             case "inventory.select_item"->t.context.has("material_sent");
             case "inventory.transfer", "inventory.equip", "inventory.swap"->t.context.has("transfer_sent") || t.context.has("swap_sent");
-            case "block.break"->t.context.has("breaking");
+            case "block.break"->t.context.has("breaking") || t.context.has("material_sent");
             case "block.place"->t.context.has("placing") || t.context.has("material_sent");
             case "world.interact", "container.open"->t.context.has("sent");
             case "craft.execute"->t.context.has("craft_sent") || crafts.containsKey(t.id) && integer(t.context,"craft_stage",0,0,10000)>=crafts.get(t.id).stages().size();
@@ -218,7 +221,7 @@ final class MinecraftWorld implements WorldAccess {
                 if(mc.player.getMainHandItem().is(Items.CROSSBOW) && p.has("charge_ticks"))throw new BridgeException("invalid_request","charge_ticks applies to bows; crossbows use vanilla loading time");
             }
             case "move.jump"->JumpSequence.count(p);
-            case "block.break", "block.place"->{block(child(p,"position"));if(action.equals("block.place"))Identifier.parse(string(p,"block"));}
+            case "block.break", "block.place"->{block(child(p,"position"));if(action.equals("block.place"))Identifier.parse(string(p,"block"));else {bool(p,"require_tool",true);bool(p,"auto_tool",true);}}
             case "container.open", "world.interact"->{if(p.has("entity_id")==p.has("position"))throw new BridgeException("invalid_request","Choose position or entity_id");if(p.has("entity_id"))UUID.fromString(string(p,"entity_id"));else block(child(p,"position"));if(!Set.of("main","off").contains(string(p,"hand","main")))throw new BridgeException("invalid_request","hand must be main/off");}
             case "inventory.select"->integer(p,"slot",0,0,8);
             case "inventory.select_item"->{Identifier.parse(string(p,"item"));if(p.has("hotbar_slot"))integer(p,"hotbar_slot",0,0,8);}
@@ -315,7 +318,7 @@ final class MinecraftWorld implements WorldAccess {
     }
     @Override public void releaseControls(){
         combat.suspendMelee();
-        interactions.suspend();
+        interactions.suspend();mining.suspend();
         crossbows.values().forEach(CrossbowSequence::released);
         boolean cancelBow=bowDrawing || mc.player!=null && held.contains(mc.options.keyUse) && mc.player.getUseItem().is(Items.BOW) && mc.player.getUsedItemHand()==InteractionHand.MAIN_HAND;
         for(var k:Set.copyOf(held))hold(k,false);held.clear();if(mc.gameMode!=null)mc.gameMode.stopDestroyBlock();
@@ -343,11 +346,13 @@ final class MinecraftWorld implements WorldAccess {
             var dim=mc.level.dimension();UUID player=mc.player.getUUID();
             String usedItem=string(task.context,"use_item","minecraft:air"),craftedItem=string(task.context,"craft_item","minecraft:air");
             InventoryChange inventoryChange=inventoryChanges.get(task.id);
+            MiningTool miningTool=miningTools.get(task.id);
             pending=server.submit(()->{
                 var level=server.getLevel(dim);var actor=server.getPlayerList().getPlayer(player);
                 if(level==null || actor==null)throw new BridgeException("disconnected","Actor unavailable");
                 JsonObject view=object("source","integrated_server","tick",level.getGameTime(),"health",actor.getHealth(),"menu_id",actor.containerMenu.containerId,"cursor",stack(actor.containerMenu.getCarried()));
                 view.addProperty("menu_revision",actor.containerMenu.getStateId());
+                if(miningTool!=null)view.addProperty("mining_tool_matches",actor.getInventory().getSelectedSlot()==miningTool.selected() && ItemStack.matches(actor.getMainHandItem(),miningTool.stack()));
                 if(inventoryChange!=null){view.addProperty("inventory_before_matches",inventoryChange.matches(actor.containerMenu,false));view.addProperty("inventory_after_matches",inventoryChange.matches(actor.containerMenu,true));}
                 view.add("position",vector(actor.position()));view.addProperty("on_ground",actor.onGround());
                 view.addProperty("crouching",actor.isCrouching());view.addProperty("sprinting",actor.isSprinting());
@@ -368,7 +373,7 @@ final class MinecraftWorld implements WorldAccess {
                 JsonArray slots=new JsonArray();for(Slot s:actor.containerMenu.slots){JsonObject item=stack(s.getItem());item.addProperty("slot",s.index);slots.add(item);}view.add("slots",slots);
                 Map<String,Integer> counts=new HashMap<>();for(int i=0;i<actor.getInventory().getContainerSize();i++){ItemStack s=actor.getInventory().getItem(i);if(!s.isEmpty())counts.merge(itemId(s),s.getCount(),Integer::sum);}view.add("inventory_counts",GSON.toJsonTree(counts));
                 JsonArray inventorySlots=new JsonArray();for(int i=0;i<36;i++)inventorySlots.add(heldStack(actor.getInventory().getItem(i)));view.add("inventory_slots",inventorySlots);
-                if(pos!=null){if(!level.hasChunkAt(pos))throw new BridgeException("chunk_unavailable","Confirmation chunk is no longer loaded",true);BlockState state=level.getBlockState(pos);view.add("block",object("type",blockId(state),"properties",properties(state)));}
+                if(pos!=null){if(!level.hasChunkAt(pos))throw new BridgeException("chunk_unavailable","Confirmation chunk is no longer loaded",true);BlockState state=level.getBlockState(pos);view.add("block",blockSample(state));view.addProperty("block_empty",state.isAir());if(miningTool!=null)view.addProperty("mining_correct_tool",!state.requiresCorrectToolForDrops() || state.canHarvestBlock(level,pos,actor));}
                 if(entity!=null){Entity e=level.getEntity(UUID.fromString(entity));view.add("entity",e==null?JsonNull.INSTANCE:object("alive",e.isAlive(),"health",e instanceof LivingEntity l?l.getHealth():-1,"position",vector(e.position())));}
                 return view;
             });confirmations.put(task.id,pending);return null;
@@ -690,22 +695,84 @@ final class MinecraftWorld implements WorldAccess {
         double rise=(speedSquared-Math.sqrt(discriminant))/gravity;
         look(eye.add(d.x,rise,d.z));
     }
+    private static JsonObject blockSample(BlockState state){return object("type",blockId(state),"properties",properties(state));}
+    private void updateMiningReceipt(Task task,JsonObject receipt) {
+        if(receipt==null)return;
+        task.confirmed.addProperty("mined_blocks",1);task.confirmed.add("mining",receipt);task.confirmed.add("broken",receipt.get("position"));
+        BlockPos pos=block(child(receipt,"position"));confirmBlock(task,pos,object("block",receipt.get("after"),"tick",receipt.get("tick")));
+    }
+    void recordBlockBreak(net.neoforged.neoforge.event.level.block.BreakBlockEvent event) {
+        if(!(event.getPlayer() instanceof net.minecraft.server.level.ServerPlayer player) || !actor.equals(player.getUUID().toString()))return;
+        var level=player.level();var pos=event.getPos().immutable();String dim=level.dimension().identifier().toString();
+        String task=mining.attempt(actor,dim,position(pos),blockSample(event.getState()),heldStack(player.getMainHandItem()),player.getInventory().getSelectedSlot(),level.getGameTime());
+        if(task==null)return;
+        var server=level.getServer();
+        // The event precedes removal. Check its final cancellation and actual block after vanilla returns.
+        server.schedule(new net.minecraft.server.TickTask(server.getTickCount(),()->{
+            if(!level.hasChunkAt(pos) || player.level()!=level)return;
+            mining.complete(task,actor,dim,blockSample(level.getBlockState(pos)),heldStack(player.getMainHandItem()),player.getInventory().getSelectedSlot(),level.getGameTime(),event.isCanceled());
+        }));
+    }
     private Step breakBlock(Task t,BlockPos p) {
-        reach(p);JsonObject view=serverView(t,p,null);
-        if(view!=null && (string(child(view,"block"),"type").equals("minecraft:air") || t.context.has("break_expected")&&string(child(view,"block"),"type").equals(string(t.context,"break_expected")))){confirmBlock(t,p,view);t.confirmed.add("broken",position(p));return Step.success(object("position",position(p),"state",view.get("block")));}
-        BlockState state=mc.level.getBlockState(p);
-        if(state.isAir())return Step.waiting(object("waiting","server_confirmation"));
-        if(t.context.has("break_original")&&!state.toString().equals(string(t.context,"break_original")))throw new BridgeException("target_changed","Block changed while mining; inspect actual state");
-        if(state.getDestroySpeed(mc.level,p)<0)throw new BridgeException("permission_denied","Unbreakable block");
-        if(bool(t.parameters,"require_tool",true) && state.requiresCorrectToolForDrops() && !mc.player.getMainHandItem().isCorrectToolForDrops(state))throw new BridgeException("missing_tool","Selected tool cannot harvest block");
-        if(!blockVisible(p))throw new BridgeException("target_lost","Block is occluded",true);look(Vec3.atCenterOf(p));
-        if(t.actions>=t.maxActions && t.context.has("breaking")) {
-            if(tick()-number(t.context,"break_last_sent",tick())<=20)return Step.waiting(object("waiting","final_mining_confirmation"));
-            throw new BridgeException("action_limit","Mining action budget exhausted; last packet did not complete the block");
+        JsonObject receipt=mining.peek(t.id);updateMiningReceipt(t,receipt);
+        if(receipt!=null)return Step.success(receipt);
+        if(mining.interrupted(t.id))return Step.failure("mining_interrupted","Mining was stopped; inspect the block and start a new task",object("position",position(p)));
+        if(mining.error(t.id)!=null)return Step.failure(mining.error(t.id),"Server did not complete this player's block break; it will not be repeated",object("position",position(p)));
+        reach(p);
+        if(mc.screen!=null || mc.player.containerMenu!=mc.player.inventoryMenu)throw new BridgeException("interface_open","Close interfaces before mining");
+        if(!mc.player.containerMenu.getCarried().isEmpty())throw new BridgeException("cursor_occupied","Clear cursor before mining");
+        if(mc.player.isUsingItem())throw new BridgeException("busy","Stop using the held item before mining");
+        JsonObject view=serverView(t,p,null);if(view==null)return Step.waiting(object("stage","checking_mining"));
+        if(number(view,"menu_id",-1)!=0 || bool(view,"using_item",false) || number(child(view,"cursor"),"count",0)!=0)throw new BridgeException("busy","Server inventory or item use is not ready for mining");
+        BlockState state=mc.level.getBlockState(p);JsonObject actual=child(view,"block");
+        if(!t.context.has("mining_original")) {
+            if(bool(view,"block_empty",false))return Step.success(object("outcome","already_empty","position",position(p),"state",actual,"source","integrated_server"));
+            if(!actual.equals(blockSample(state)))return Step.waiting(object("stage","synchronizing_mining_target"));
+            if(state.getDestroySpeed(mc.level,p)<0)throw new BridgeException("permission_denied","Unbreakable block");
+            if(interactionHit(p)==null)throw new BridgeException("target_lost","Block is occluded",true);
+            boolean required=bool(t.parameters,"require_tool",true) && state.requiresCorrectToolForDrops();
+            List<MiningTools.Candidate> candidates=new ArrayList<>();int selected=mc.player.getInventory().getSelectedSlot();
+            for(int i=0;i<36;i++) {
+                ItemStack stack=mc.player.getInventory().getItem(i);
+                if(i!=selected && (stack.isEmpty() || !stack.has(DataComponents.TOOL)))continue;
+                if(!stack.canDestroyBlock(state,mc.level,p,mc.player))continue;
+                candidates.add(new MiningTools.Candidate(i,itemId(stack),stack.getCount(),stack.getDestroySpeed(state),stack.isCorrectToolForDrops(state),stack.isDamageableItem()?stack.getMaxDamage()-stack.getDamageValue():-1));
+            }
+            var chosen=MiningTools.choose(candidates,selected,required,bool(t.parameters,"auto_tool",true));
+            int target=chosen.slot()<9?chosen.slot():selected;
+            ActionBudget.require(t,(chosen.slot()==selected?0:1)+1);
+            miningTools.put(t.id,new MiningTool(target,mc.player.getInventory().getItem(chosen.slot()).copy()));
+            t.context.add("mining_original",actual.deepCopy());t.context.addProperty("mining_source",chosen.slot());t.context.addProperty("mining_slot",target);t.context.addProperty("mining_item",chosen.item());
+            if(chosen.slot()==selected)t.context.addProperty("mining_ready",true);
         }
-        ActionBudget.require(t,1);t.context.addProperty("break_last_sent",tick());
-        if(!t.context.has("breaking")){t.context.addProperty("break_original",state.toString());t.context.addProperty("break_expected",blockId(state.getFluidState().createLegacyBlock()));mc.gameMode.startDestroyBlock(p,Direction.UP);t.context.addProperty("breaking",true);}else mc.gameMode.continueDestroyBlock(p,Direction.UP);
-        mc.player.swing(InteractionHand.MAIN_HAND);t.actions++;return Step.waiting(object("stage","mining","position",position(p)));
+        boolean changed=!actual.equals(child(t.context,"mining_original")),clientChanged=!blockSample(state).equals(child(t.context,"mining_original"));
+        if(mining.pending(t.id) || (changed || clientChanged) && t.context.has("breaking")) {
+            if(tick()-number(t.context,"break_last_sent",tick())>20)return Step.failure(changed?"target_changed":"mining_unconfirmed","No completed block-break event for this actor and cell",object("position",position(p),"state",actual));
+            return Step.waiting(object("stage","confirming_mining","position",position(p)));
+        }
+        if(changed || clientChanged)throw new BridgeException("target_changed","Block changed before or during mining");
+        if(!t.context.has("mining_ready")) {
+            Step prepared=selectItem(t,string(t.context,"mining_item"),integer(t.context,"mining_slot",0,0,8),view,integer(t.context,"mining_source",0,0,35));
+            if(!prepared.done() || prepared.error()!=null)return prepared;
+            t.context.addProperty("mining_ready",true);return Step.waiting(object("stage","checking_selected_tool"));
+        }
+        if(!view.has("mining_tool_matches"))return Step.waiting(object("stage","checking_selected_tool"));
+        if(!bool(view,"mining_tool_matches",false))throw new BridgeException("target_changed","Selected mining tool or its components changed");
+        if(bool(t.parameters,"require_tool",true) && !bool(view,"mining_correct_tool",false))throw new BridgeException("missing_tool","Server tool cannot harvest this block");
+        BlockHitResult hit=interactionHit(p);if(hit==null)throw new BridgeException("target_lost","Block is occluded",true);look(hit.getLocation());
+        if(t.actions>=t.maxActions) {
+            if(tick()-number(t.context,"break_last_sent",-100)>20)throw new BridgeException("action_limit","Mining budget exhausted without a completed break event");
+            return Step.waiting(object("stage","final_mining_confirmation"));
+        }
+        ActionBudget.require(t,1);long serverTick=(long)number(view,"tick",tick());
+        if(!t.context.has("breaking")) {
+            mining.begin(t.id,position(p),actual,blockSample(state.getFluidState().createLegacyBlock()),serverTick);
+            t.context.addProperty("breaking",true);
+        }
+        if(!mining.arm(t.id,serverTick))return Step.waiting(object("stage","confirming_mining"));
+        if(!t.context.has("break_last_sent"))mc.gameMode.startDestroyBlock(p,hit.getDirection());else mc.gameMode.continueDestroyBlock(p,hit.getDirection());
+        t.context.addProperty("break_last_sent",tick());mc.player.swing(InteractionHand.MAIN_HAND);t.actions++;
+        return Step.waiting(object("stage","mining","position",position(p),"tool",string(t.context,"mining_item")));
     }
     private boolean matches(BlockState actual,String type,JsonObject wanted){if(!blockId(actual).equals(type))return false;JsonObject props=properties(actual);for(var e:wanted.entrySet())if(!props.has(e.getKey())||!props.get(e.getKey()).getAsString().equals(e.getValue().getAsString()))return false;return true;}
     private boolean matches(JsonObject actual,String type,JsonObject wanted){if(!string(actual,"type").equals(type))return false;JsonObject props=child(actual,"properties");for(var e:wanted.entrySet())if(!props.has(e.getKey())||!props.get(e.getKey()).getAsString().equals(e.getValue().getAsString()))return false;return true;}
@@ -748,10 +815,12 @@ final class MinecraftWorld implements WorldAccess {
         updates.add(actual);t.confirmed.add("block_updates",updates);
     }
     private Step selectItem(Task t,String type,int requestedSlot) {return selectItem(t,type,requestedSlot,null);}
-    private Step selectItem(Task t,String type,int requestedSlot,JsonObject observed) {
+    private Step selectItem(Task t,String type,int requestedSlot,JsonObject observed) {return selectItem(t,type,requestedSlot,observed,-1);}
+    private Step selectItem(Task t,String type,int requestedSlot,JsonObject observed,int exactSource) {
         if(!t.context.has("material_sent")) {
             int source=-1,target=requestedSlot;
-            for(int i=0;i<9;i++)if(itemId(mc.player.getInventory().getItem(i)).equals(type) && (requestedSlot<0 || i==requestedSlot)){source=i;target=i;break;}
+            if(exactSource>=0){source=exactSource;target=source<9?source:requestedSlot;if(!itemId(mc.player.getInventory().getItem(source)).equals(type))throw new BridgeException("target_changed","Mining source item changed");}
+            for(int i=0;source<0 && i<9;i++)if(itemId(mc.player.getInventory().getItem(i)).equals(type) && (requestedSlot<0 || i==requestedSlot)){source=i;target=i;break;}
             if(source<0)for(int i=0;i<36;i++)if(itemId(mc.player.getInventory().getItem(i)).equals(type)){source=i;break;}
             if(source<0)throw new BridgeException("missing_materials","Item is unavailable in the main inventory: "+type);
             if(target<0){for(int i=0;i<9;i++)if(mc.player.getInventory().getItem(i).isEmpty()){target=i;break;}if(target<0)target=mc.player.getInventory().getSelectedSlot();}

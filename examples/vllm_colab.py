@@ -27,7 +27,7 @@ ACTION_HELP = {
     "item.use": "hand:main/off,duration_ticks:1..1200(default40),target:{x,y,z} optional aim; held item only",
     "item.drop": "count:1..64(default1),expected_item:namespace:id optional; selected main hand",
     "item.pickup": "entity_id of observed minecraft:item; approach and collect whole stack; partial count possible",
-    "block.break": "position:{x,y,z} integer, require_tool:true",
+    "block.break": "position:{x,y,z} integers,auto_tool:bool(defaulttrue),require_tool:bool(defaulttrue); selects suitable main-inventory tool,confirms server break,not collected drops",
     "block.place": "position:{x,y,z} integers,block:namespace:id,properties:{}; prepares main-inventory material",
     "world.interact": "position:{x,y,z} integers OR entity_id,hand:main/off(defaultmain); one targeted click,1 action; feed/shear/milk use selected item",
     "container.open": "position:{x,y,z} integers OR entity_id,hand:main/off; must open a new menu",
@@ -91,7 +91,7 @@ def compact_result(result):
     data = result.get("result", {})
     if isinstance(data, dict):
         if isinstance(facts, dict):
-            for proof in ("interaction", "inventory_swap", "transfer"):
+            for proof in ("interaction", "inventory_swap", "transfer", "mining"):
                 if facts.get(proof) == data:
                     facts.pop(proof)  # Keep the identical proof once, alongside its counter.
         if result.get("operation") == "inventory.inspect" and isinstance(data.get("menu"), dict):
@@ -216,7 +216,7 @@ def goal_progress(snapshot, history, initial_actor=None):
         interactions = facts.get("interactions", 0)
         if type(interactions) is int and interactions > 0:
             progress["confirmed_interactions"] = progress.get("confirmed_interactions", 0) + interactions
-        for key in ("inventory_swaps", "equips"):
+        for key in ("inventory_swaps", "equips", "mined_blocks"):
             value = facts.get(key, 0)
             if type(value) is int and value > 0:
                 progress["confirmed_" + key] = progress.get("confirmed_" + key, 0) + value
@@ -318,6 +318,13 @@ def validate_decision(value, allowed):
 def validate_item_parameters(action, parameters):
     from uuid import UUID
     import re
+    if action == "block.break":
+        position = parameters.get("position")
+        if not isinstance(position, dict) or any(type(position.get(axis)) is not int for axis in ("x", "y", "z")):
+            raise ValueError("block.break: position must contain integer x/y/z")
+        for key in ("auto_tool", "require_tool"):
+            if type(parameters.get(key, True)) is not bool:
+                raise ValueError("block.break: " + key + " must be boolean")
     if action in ("world.interact", "container.open"):
         if ("entity_id" in parameters) == ("position" in parameters):
             raise ValueError(action + ": choose exactly one position or entity_id")

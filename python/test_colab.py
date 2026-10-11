@@ -985,6 +985,9 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def test_vllm_preview_uses_openai_api_without_submitting_game_action(self):
         await self.integration()
 
+    async def test_vllm_mining_flags_cross_notebook_relay_and_bridge_unchanged(self):
+        await self.integration(execute=True, decision={"action": "block.break", "parameters": {"position": {"x": 0, "y": 56, "z": 2}, "auto_tool": True, "require_tool": True}, "reason": "mine the observed block"})
+
     async def test_vllm_named_equipment_crosses_notebook_relay_and_bridge_unchanged(self):
         await self.integration(execute=True, decision={"action": "inventory.equip", "parameters": {"from_slot": 12, "equipment_slot": "head"}, "reason": "equip helmet"})
 
@@ -1082,6 +1085,30 @@ class InventoryDecisionTest(unittest.TestCase):
         body['messages'][0]['content'] = json.dumps(fitted)
         self.assertTrue(namespace['shrink_observation'](body))
         self.assertEqual(len(json.loads(body['messages'][0]['content'])['observation']['blocks']), 4)
+
+    def test_mining_parameters_are_checked_identically_without_rewriting(self):
+        good = {"position": {"x": 0, "y": 56, "z": 2}, "auto_tool": True, "require_tool": True}
+        for validate in self.validators:
+            original = deepcopy(good)
+            validate('block.break', good)
+            self.assertEqual(good, original)
+            for parameters in ({}, {"position": {"x": .5, "y": 56, "z": 2}}, {"position": {"x": True, "y": 56, "z": 2}},
+                               {**good, "auto_tool": 1}, {**good, "require_tool": "true"}):
+                with self.subTest(parameters=parameters), self.assertRaises(ValueError):
+                    validate('block.break', parameters)
+
+    def test_mining_progress_counts_server_facts_even_in_partial_terminal_tasks(self):
+        fact = {"task_id": "mined", "state": "cancelled", "confirmed_changes": {"mined_blocks": 1}}
+        history = [{"result": fact}, {"result": fact}, {"result": {"task_id": "missing", "state": "succeeded", "confirmed_changes": {"mined_blocks": True}}}]
+        self.assertEqual(controller.goal_progress(snapshot(), history)['confirmed_mined_blocks'], 1)
+
+    def test_mining_proof_is_compacted_once_without_claiming_collected_items(self):
+        proof = {"source": "integrated_server_block_break", "position": {"x": 0, "y": 56, "z": 2}, "drops": "not_confirmed"}
+        full = {"result": proof, "confirmed_changes": {"mined_blocks": 1, "mining": proof}}
+        compact = controller.compact_result(full)
+        self.assertEqual(compact['result'], proof)
+        self.assertEqual(compact['confirmed_changes'], {"mined_blocks": 1})
+        self.assertIn('mining', full['confirmed_changes'])
 
     def test_named_equipment_and_whole_stack_swaps_keep_observed_slot_numbers(self):
         cases = [('inventory.equip', {'from_slot': 12, 'equipment_slot': 'head', 'menu_id': 0, 'menu_revision': 42}),
