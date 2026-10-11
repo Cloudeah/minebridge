@@ -22,7 +22,7 @@ ACTION_HELP = {
     "move.crouch": "ticks:1..200(default20); crouch in place, auto-release",
     "look.at": "target:{x,y,z} OR entity_id",
     "look.turn": "delta_yaw:-180..180,delta_pitch:-90..90(default0); +yaw right,+pitch down",
-    "combat.attack": "entity_id,chase:bool; melee, no players",
+    "combat.attack": "entity_id,hits:1..64 optional(default defeat),chase:bool(defaultfalse),max_chase_distance:1..32(default16) from start,stop_health:0..1024(default4); selected main hand,no players; waits for each server hit",
     "combat.ranged": "entity_id,wait_ticks:10..100,max_distance:1..32; main bow:2 actions,charge_ticks:20..60; crossbow:3 actions unloaded/1 loaded,plain arrow only,omit charge_ticks; one shot,hit confirmed separately",
     "item.use": "hand:main/off,duration_ticks:1..1200(default40),target:{x,y,z} optional aim; held item only",
     "item.drop": "count:1..64(default1),expected_item:namespace:id optional; selected main hand",
@@ -180,6 +180,10 @@ def compact_snapshot(snapshot, block_limit=64, entity_limit=24, compact_menu=Fal
 def available_actions(capabilities):
     """Restrict model choices to actions supported by the bridge and its owner."""
     allowed = set(capabilities.get("actions", ())) & ACTION_HELP.keys()
+    features = capabilities.get("action_features", {})
+    melee = features.get("combat.attack", []) if isinstance(features, dict) else []
+    if not isinstance(melee, list) or "confirmed_melee_v1" not in melee:
+        allowed.discard("combat.attack")
     owner_actions = capabilities.get("profile", {}).get("allowed_actions", [])
     if owner_actions:
         allowed &= set(owner_actions)
@@ -318,6 +322,23 @@ def validate_decision(value, allowed):
 def validate_item_parameters(action, parameters):
     from uuid import UUID
     import re
+    if action == "combat.attack":
+        entity_id = parameters.get("entity_id")
+        if not isinstance(entity_id, str) or str(UUID(entity_id)).lower() != entity_id.lower():
+            raise ValueError("combat.attack: entity_id must be a canonical observed UUID")
+        if "hits" in parameters and (type(parameters["hits"]) is not int or not 1 <= parameters["hits"] <= 64):
+            raise ValueError("combat.attack: hits must be an integer 1..64; omit to defeat")
+        for flag in ("chase", "sprint", "crouch"):
+            if type(parameters.get(flag, False)) is not bool:
+                raise ValueError("combat.attack: " + flag + " must be boolean")
+        if parameters.get("sprint", False) and parameters.get("crouch", False):
+            raise ValueError("combat.attack: sprint and crouch cannot be combined")
+        for key, default, minimum, maximum in (("max_chase_distance", 16, 1, 32), ("stop_health", 4, 0, 1024)):
+            value = parameters.get(key, default)
+            if type(value) not in (int, float) or not minimum <= value <= maximum:
+                raise ValueError("combat.attack: " + key + " outside supported range")
+        if parameters.get("hand", "main") != "main" or any(key in parameters for key in ("count", "shots")):
+            raise ValueError("combat.attack: selected main hand; use hits for a bounded goal")
     if action == "block.break":
         position = parameters.get("position")
         if not isinstance(position, dict) or any(type(position.get(axis)) is not int for axis in ("x", "y", "z")):

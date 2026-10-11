@@ -12,9 +12,11 @@ class BridgeEngineTest {
     @TempDir Path directory;
     FakeWorld world;OwnerPolicy owner;BridgeEngine engine;Peer peer;
     static final class FakeWorld implements WorldAccess {
+        Map<String,Set<String>> features=new HashMap<>();
         long tick;int steps,releases,queries;double health=20;boolean done,confirmationOnly;String dim="minecraft:overworld";JsonArray confirmedBlockUpdates=new JsonArray();JsonObject finalConfirmed=object();
         public String actorId(){return "player";} public String worldId(){return "world";} public String dimension(){return dim;} public long tick(){return tick;}
         public Set<String> capabilities(){return Set.of("move.to","block.break","inventory.inspect");}
+        public Set<String> actionFeatures(String action){return features.getOrDefault(action,Set.of());}
         public JsonObject query(String operation,JsonObject parameters){queries++;return object("inventory",List.of());}
         public JsonObject snapshot(int radius,boolean telemetry){return object("actor",object("health",health),"blocks",List.of(),"entities",List.of());}
         public Step step(Task t){if(confirmationOnly && t.actions>0)return done?Step.success(object("steps",steps)):Step.waiting(object("steps",steps));steps++;t.actions++;t.confirmed.addProperty("steps",steps);if(!confirmedBlockUpdates.isEmpty())t.confirmed.add("block_updates",confirmedBlockUpdates.deepCopy());return done?Step.success(object("steps",steps)):Step.waiting(object("steps",steps));}
@@ -48,6 +50,11 @@ class BridgeEngineTest {
     @Test void emptyOwnerAllowlistPreservesAllSupportedCapabilities(){
         auth();JsonArray actions=send("session.capabilities","caps",object()).getAsJsonArray("actions");
         assertEquals(Set.of("move.to","block.break","inventory.inspect"),new HashSet<>(actions.asList().stream().map(JsonElement::getAsString).toList()));
+    }
+    @Test void actionFeaturesAreAdvertisedOnlyForSupportedOwnerAllowedActions(){
+        world.features.put("block.break",Set.of("test_feature"));world.features.put("fly.to",Set.of("unsupported"));auth();
+        var features=engine.capabilities().getAsJsonObject("action_features");assertEquals(Set.of("block.break"),features.keySet());assertEquals("test_feature",features.getAsJsonArray("block.break").get(0).getAsString());
+        owner.allowedActions.add("move.to");assertTrue(engine.capabilities().getAsJsonObject("action_features").isEmpty());
     }
     @Test void ownerAllowlistAlsoAppliesToAdvertisedQueries(){
         owner.allowedActions.add("move.to");auth();

@@ -55,6 +55,7 @@ final class MinecraftWorld implements WorldAccess {
     private final CombatLedger combat;
     private final InteractionLedger interactions;
     private final MiningLedger mining;
+    private final Map<String,MeleeSequence> melees=new HashMap<>();
     private record MiningTool(int selected,ItemStack stack) {}
     private final Map<String,MiningTool> miningTools=new HashMap<>();
     // Only server-side join/tick callbacks access this bounded set.
@@ -87,7 +88,7 @@ final class MinecraftWorld implements WorldAccess {
     @Override public long tick(){if(mc.level!=null)lastTick=mc.level.getGameTime();return lastTick;}
     @Override public boolean visionAvailable(){return mc.hasSingleplayerServer() && mc.getMainRenderTarget().getColorTexture() instanceof com.mojang.blaze3d.opengl.GlTexture && mc.getMainRenderTarget().getDepthTexture() instanceof com.mojang.blaze3d.opengl.GlTexture;}
     @Override public List<String> movementModes(){return mc.hasSingleplayerServer()?List.of("walk","sprint","jump","crouch"):List.of();}
-    @Override public void taskFinished(Task t){mining.end(t.id);miningTools.remove(t.id);confirmations.remove(t.id);inventoryChanges.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);crossbows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);interactions.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
+    @Override public void taskFinished(Task t){melees.remove(t.id);mining.end(t.id);miningTools.remove(t.id);confirmations.remove(t.id);inventoryChanges.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);crossbows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);interactions.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
     @Override public void collectConfirmed(Task t) {
         updateCombatReceipt(t,combat.finish(t.id));
         updateInteractionReceipt(t,interactions.finish(t.id));updateMiningReceipt(t,mining.finish(t.id));
@@ -204,6 +205,7 @@ final class MinecraftWorld implements WorldAccess {
         return Set.of("move.to","move.follow","move.jump","move.relative","move.crouch","route.plan","look.at","look.turn","combat.attack","combat.ranged","item.use","item.drop","item.pickup","world.interact","block.break","block.place",
                 "inventory.inspect","inventory.select","inventory.select_item","inventory.transfer","inventory.equip","inventory.swap","container.open","container.close","craft.plan","craft.execute","build.plan","build.execute");
     }
+    @Override public Set<String> actionFeatures(String action){return action.equals("combat.attack") && mc.hasSingleplayerServer()?Set.of("confirmed_melee_v1"):Set.of();}
     @Override public void validate(String action,JsonObject p) {
         switch(action) {
             case "move.to"->{point(child(p,"target"));MovementCommands.validateTravel(p);}
@@ -212,7 +214,7 @@ final class MinecraftWorld implements WorldAccess {
             case "move.crouch"->MovementCommands.crouchTicks(p);
             case "look.turn"->MovementCommands.turn(p,0,0);
             case "move.follow"->{UUID.fromString(string(p,"entity_id"));FollowSequence.validate(p);}
-            case "combat.attack"->UUID.fromString(string(p,"entity_id"));
+            case "combat.attack"->MeleeSequence.validate(p);
             case "combat.ranged"->{
                 UUID.fromString(string(p,"entity_id"));integer(p,"charge_ticks",20,20,60);integer(p,"wait_ticks",40,10,100);
                 double range=number(p,"max_distance",24);if(range<1 || range>32)throw new BridgeException("invalid_request","max_distance must be 1..32");
@@ -317,7 +319,7 @@ final class MinecraftWorld implements WorldAccess {
         if(down)held.add(k);else held.remove(k);
     }
     @Override public void releaseControls(){
-        combat.suspendMelee();
+        combat.suspendMelee();melees.values().forEach(MeleeSequence::released);
         interactions.suspend();mining.suspend();
         crossbows.values().forEach(CrossbowSequence::released);
         boolean cancelBow=bowDrawing || mc.player!=null && held.contains(mc.options.keyUse) && mc.player.getUseItem().is(Items.BOW) && mc.player.getUsedItemHand()==InteractionHand.MAIN_HAND;
@@ -374,7 +376,9 @@ final class MinecraftWorld implements WorldAccess {
                 Map<String,Integer> counts=new HashMap<>();for(int i=0;i<actor.getInventory().getContainerSize();i++){ItemStack s=actor.getInventory().getItem(i);if(!s.isEmpty())counts.merge(itemId(s),s.getCount(),Integer::sum);}view.add("inventory_counts",GSON.toJsonTree(counts));
                 JsonArray inventorySlots=new JsonArray();for(int i=0;i<36;i++)inventorySlots.add(heldStack(actor.getInventory().getItem(i)));view.add("inventory_slots",inventorySlots);
                 if(pos!=null){if(!level.hasChunkAt(pos))throw new BridgeException("chunk_unavailable","Confirmation chunk is no longer loaded",true);BlockState state=level.getBlockState(pos);view.add("block",blockSample(state));view.addProperty("block_empty",state.isAir());if(miningTool!=null)view.addProperty("mining_correct_tool",!state.requiresCorrectToolForDrops() || state.canHarvestBlock(level,pos,actor));}
-                if(entity!=null){Entity e=level.getEntity(UUID.fromString(entity));view.add("entity",e==null?JsonNull.INSTANCE:object("alive",e.isAlive(),"health",e instanceof LivingEntity l?l.getHealth():-1,"position",vector(e.position())));}
+                if(entity!=null){Entity e=level.getEntity(UUID.fromString(entity));view.add("entity",e==null?JsonNull.INSTANCE:object("alive",e.isAlive(),"health",e instanceof LivingEntity l?l.getHealth():-1,"position",vector(e.position())));
+                    if(task.action.equals("combat.attack") && e!=null){view.addProperty("melee_in_range",actor.isWithinEntityInteractionRange(e,0));view.addProperty("melee_visible",actor.hasLineOfSight(e));view.addProperty("attack_strength",actor.getAttackStrengthScale(0));}
+                }
                 return view;
             });confirmations.put(task.id,pending);return null;
         }
@@ -577,25 +581,50 @@ final class MinecraftWorld implements WorldAccess {
         return update.done()?Step.success(update.progress()):Step.waiting(update.progress());
     }
     private Step attack(Task t) {
-        String id=string(t.parameters,"entity_id");
+        String id=UUID.fromString(string(t.parameters,"entity_id")).toString();
         CombatLedger.Snapshot receipt=combat.peek(t.id);updateCombatReceipt(t,receipt);
-        if(receipt!=null && receipt.defeated())return Step.success(object("outcome","defeated","target",id,"source","integrated_server_damage_event"));
-        JsonObject view=serverView(t,null,id);
-        if(view!=null && !view.get("entity").isJsonNull() && !child(view,"entity").get("alive").getAsBoolean())return Step.failure("target_lost","Target died without a confirmed lethal hit from this task",object("outcome","target_dead","target",id));
-        if(t.actions>=t.maxActions) {
-            if(tick()-number(t.context,"last_attack",-100)>20)return Step.failure("action_limit","Attack budget exhausted",object("target",id));
-            return Step.waiting(object("stage","confirming_last_attack","target",id));
-        }
-        Entity target=entity(t.parameters);checkArea(target.position());
+        int hits=receipt==null?0:receipt.hits();
+        MeleeSequence sequence=melees.computeIfAbsent(t.id,key->new MeleeSequence(MeleeSequence.requestedHits(t.parameters)));
+        var update=sequence.observe(tick(),hits,receipt!=null && receipt.defeated());
+        JsonObject progress=object("stage",update.outcome(),"target",id,"confirmed_hits",hits);
+        if(t.parameters.has("hits"))progress.addProperty("requested_hits",MeleeSequence.requestedHits(t.parameters));
+        if(receipt!=null && hits>0){progress.addProperty("remaining_health",receipt.remainingHealth());progress.addProperty("source","integrated_server_damage_event");}
+        hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);hold(mc.options.keySprint,false);hold(mc.options.keyShift,false);
+        if(update.done()){progress.addProperty("outcome",update.outcome());return Step.success(progress);}
+        if(update.error()!=null)return Step.failure(update.error(),"The previous melee request will not be repeated; inspect the target before a new task",progress);
+        if(!update.ready())return Step.waiting(progress);
+        if(t.actions>=t.maxActions)return Step.failure("action_limit","Attack/movement budget exhausted",progress);
+        if(mc.screen!=null || mc.player.containerMenu!=mc.player.inventoryMenu)throw new BridgeException("interface_open","Close interfaces before combat");
+        if(!mc.player.containerMenu.getCarried().isEmpty())throw new BridgeException("cursor_occupied","Clear cursor before combat");
+        if(mc.player.isUsingItem())throw new BridgeException("busy","Stop item use before combat");
+        JsonObject view=serverView(t,null,id);if(view==null)return Step.waiting(progress);
+        if(view.get("entity").isJsonNull() || !bool(child(view,"entity"),"alive",false))return Step.failure("target_lost","Target died or vanished without a confirmed lethal hit from this task",progress);
+        if(number(view,"health",0)<=number(t.parameters,"stop_health",4))return Step.failure("critical_health","Server actor reached stop health",progress);
+        if(number(view,"menu_id",-1)!=0 || bool(view,"using_item",false) || number(child(view,"cursor"),"count",0)!=0)throw new BridgeException("busy","Server inventory or item use is not ready for combat");
+        Entity target=entity(object("entity_id",id));checkArea(target.position());checkArea(mc.player.position());
         if(target instanceof net.minecraft.world.entity.player.Player)throw new BridgeException("permission_denied","Player combat is disabled");
-        if(!(target instanceof LivingEntity))throw new BridgeException("unsupported_capability","Combat requires a living target");
-        if(mc.player.distanceTo(target)>mc.player.entityInteractionRange()) {if(!bool(t.parameters,"chase",false))throw new BridgeException("out_of_reach","Target out of attack range",true);return move(t,target.position(),Math.max(0.7,mc.player.entityInteractionRange()-0.5),true);}
-        hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);look(target.getBoundingBox().getCenter());
-        if(mc.player.getAttackStrengthScale(0)>=1 && tick()-number(t.context,"last_attack",-100)>5) {if(view==null)return Step.waiting(object("waiting","server_attack_ready"));
-            ActionBudget.require(t,1);long serverTick=view.get("tick").getAsLong();
-            if(combat.peek(t.id)==null)combat.begin(t.id,id,"melee",serverTick);
-            if(!combat.expectMelee(t.id,serverTick))return Step.waiting(object("stage","confirming_combat"));mc.gameMode.attack(mc.player,target);mc.player.swing(InteractionHand.MAIN_HAND);t.actions++;t.context.addProperty("last_attack",tick());t.confirmed.addProperty("attack_requests",integer(t.confirmed,"attack_requests",0,0,100000)+1);}
-        return Step.waiting(object("stage","combat","target",id,"server",view));
+        if(!(target instanceof LivingEntity) || !target.isAlive())throw new BridgeException("unsupported_capability","Combat requires a living target");
+        if(!bool(view,"melee_visible",false))throw new BridgeException("target_lost","Server cannot see the target");
+        if(bool(t.parameters,"chase",false)) {
+            if(!t.context.has("chase_origin"))t.context.add("chase_origin",view.get("position").deepCopy());
+            Vec3 origin=point(child(t.context,"chase_origin"));double limit=number(t.parameters,"max_chase_distance",16);
+            if(!MeleeSequence.withinChase(origin.distanceTo(point(child(view,"position"))),origin.distanceTo(point(child(child(view,"entity"),"position"))),limit))return Step.failure("chase_limit","Actor or target left the allowed distance from the starting position",progress);
+        }
+        if(!mc.player.isWithinEntityInteractionRange(target,0) || !bool(view,"melee_in_range",false)) {
+            if(!bool(t.parameters,"chase",false))throw new BridgeException("out_of_reach","Target out of attack range",true);
+            Step movement=move(t,target.position(),Math.max(0.7,mc.player.entityInteractionRange()-0.5),true);
+            if(movement.error()!=null)return movement;
+            progress.addProperty("stage","chasing");progress.add("movement",movement.result());return Step.waiting(progress);
+        }
+        look(target.getBoundingBox().getCenter());
+        if(mc.player.getAttackStrengthScale(0)<1 || number(view,"attack_strength",0)<1){progress.addProperty("stage","cooldown");return Step.waiting(progress);}
+        if(!view.get("main_hand").equals(heldStack(mc.player.getMainHandItem())))return Step.waiting(object("stage","synchronizing_weapon","target",id));
+        ActionBudget.require(t,1);long serverTick=view.get("tick").getAsLong();
+        if(receipt==null)combat.begin(t.id,id,"melee",serverTick);
+        if(!combat.expectMelee(t.id,serverTick))return Step.failure("combat_unconfirmed","No unique melee receipt can be opened",progress);
+        sequence.sent(tick(),hits);mc.gameMode.attack(mc.player,target);mc.player.swing(InteractionHand.MAIN_HAND);t.actions++;
+        t.context.addProperty("last_attack",tick());t.confirmed.addProperty("attack_requests",integer(t.confirmed,"attack_requests",0,0,100000)+1);
+        progress.addProperty("stage","confirming_hit");return Step.waiting(progress);
     }
     private Step ranged(Task t) {
         String id=string(t.parameters,"entity_id");

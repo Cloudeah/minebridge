@@ -162,6 +162,17 @@ class DecisionTest(unittest.TestCase):
         capabilities["profile"]["allowed_actions"] = ["combat.attack"]
         self.assertEqual(controller.available_actions(capabilities), [])
 
+    def test_legacy_melee_is_not_offered_as_a_bounded_attack(self):
+        caps = {"actions": ["combat.attack", "look.at"]}
+        self.assertEqual(controller.available_actions(caps), ["look.at"])
+        caps['action_features'] = {"combat.attack": ["confirmed_melee_v1"]}
+        self.assertEqual(controller.available_actions(caps), ["combat.attack", "look.at"])
+        caps['profile'] = {"allowed_actions": ["look.at"]}
+        self.assertEqual(controller.available_actions(caps), ["look.at"])
+        for features in (None, [], {"combat.attack": "confirmed_melee_v1"}, {"combat.attack": []}):
+            caps.pop('profile', None);caps['action_features'] = features
+            self.assertEqual(controller.available_actions(caps), ["look.at"])
+
     def test_owner_epoch_is_checked_and_passed_to_mod_without_requiring_stable_world_revision(self):
         observed = {**snapshot(), "control_epoch": 7}
         current = {**observed, "revision": 99, "game_tick": 999}
@@ -883,6 +894,8 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def integration(self, execute=False, vision=False, model_error=False, decision=DECISION, task_ticks=200, max_actions=4096, owner_restrictions=False):
         submitted = []
         capabilities = {"actions": [decision["action"]], "actor_id": "test-actor", "armed": True}
+        if decision["action"] == "combat.attack":
+            capabilities["action_features"] = {"combat.attack": ["confirmed_melee_v1"]}
         if owner_restrictions:
             capabilities["actions"].append("combat.attack")
             capabilities["profile"] = {"allowed_actions": [decision["action"]]}
@@ -988,6 +1001,9 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def test_vllm_mining_flags_cross_notebook_relay_and_bridge_unchanged(self):
         await self.integration(execute=True, decision={"action": "block.break", "parameters": {"position": {"x": 0, "y": 56, "z": 2}, "auto_tool": True, "require_tool": True}, "reason": "mine the observed block"})
 
+    async def test_vllm_bounded_melee_crosses_notebook_relay_and_bridge_unchanged(self):
+        await self.integration(execute=True, decision={"action": "combat.attack", "parameters": {"entity_id": "418f10e9-bc78-4d9c-bb26-6a9cfa352b69", "hits": 1, "chase": True, "max_chase_distance": 12, "stop_health": 6}, "reason": "approach and hit once"})
+
     async def test_vllm_named_equipment_crosses_notebook_relay_and_bridge_unchanged(self):
         await self.integration(execute=True, decision={"action": "inventory.equip", "parameters": {"from_slot": 12, "equipment_slot": "head"}, "reason": "equip helmet"})
 
@@ -1085,6 +1101,25 @@ class InventoryDecisionTest(unittest.TestCase):
         body['messages'][0]['content'] = json.dumps(fitted)
         self.assertTrue(namespace['shrink_observation'](body))
         self.assertEqual(len(json.loads(body['messages'][0]['content'])['observation']['blocks']), 4)
+
+    def test_melee_policies_are_identical_and_preserve_explicit_hit_count(self):
+        target = "418f10e9-bc78-4d9c-bb26-6a9cfa352b69"
+        good = {"entity_id": target, "hits": 1, "chase": True, "max_chase_distance": 12, "stop_health": 6}
+        invalid = [{}, {"entity_id": "unknown"}, {"entity_id": target.replace("-", "")}]
+        invalid += [{**good, key: value} for key, values in (
+            ("hits", [0, 65, True, 1.5, "1"]), ("chase", [1]), ("sprint", ["true"]), ("crouch", [1]),
+            ("max_chase_distance", [0, 33, True, float('nan')]), ("stop_health", [-1, 1025, True, float('inf')]),
+            ("hand", ["off"]), ("count", [1]), ("shots", [1])
+        ) for value in values]
+        invalid += [{**good, "sprint": True, "crouch": True}]
+        for validate in self.validators:
+            original = deepcopy(good)
+            validate('combat.attack', good)
+            validate('combat.attack', {"entity_id": target})
+            self.assertEqual(good, original)
+            for parameters in invalid:
+                with self.subTest(parameters=parameters), self.assertRaises(ValueError):
+                    validate('combat.attack', parameters)
 
     def test_mining_parameters_are_checked_identically_without_rewriting(self):
         good = {"position": {"x": 0, "y": 56, "z": 2}, "auto_tool": True, "require_tool": True}

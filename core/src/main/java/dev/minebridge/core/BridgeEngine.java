@@ -377,7 +377,8 @@ public final class BridgeEngine {
     public JsonObject capabilities() {
         Set<String> actions=new TreeSet<>(world.capabilities());
         if(!policy.allowedActions.isEmpty())actions.retainAll(policy.allowedActions);
-        return object("actions",actions,"queries",availableQueries(),"vision",world.visionAvailable(),"formats",List.of("MBV1/png/float32-le"),"actor_id",world.actorId(),"profile",policy.publicProfile(),"armed",armed,
+        JsonObject features=object();for(String action:actions){Set<String> supported=world.actionFeatures(action);if(!supported.isEmpty())features.add(action,GSON.toJsonTree(new TreeSet<>(supported)));}
+        return object("actions",actions,"action_features",features,"queries",availableQueries(),"vision",world.visionAvailable(),"formats",List.of("MBV1/png/float32-le"),"actor_id",world.actorId(),"profile",policy.publicProfile(),"armed",armed,
                 "deduplication_window_ms",DEDUP_MS,"deduplication_capacity",4096,"event_history",512,"max_tasks",256,"vision_max_fps",5,"vision_max_resolution",List.of(640,360),"movement_modes",world.movementModes(),
                 "observation_profiles",ObservationProfiles.NAMES,"decision_guards",List.of("control_epoch","model_goal_id"),"model_control",true);
     }

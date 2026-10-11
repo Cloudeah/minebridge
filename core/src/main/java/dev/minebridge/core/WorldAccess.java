@@ -11,6 +11,7 @@ public interface WorldAccess {
     String dimension();
     long tick();
     Set<String> capabilities();
+    default Set<String> actionFeatures(String action) { return Set.of(); }
     JsonObject snapshot(int radius, boolean telemetry);
     default void validate(String action,JsonObject parameters) {}
     Step step(Task task);
