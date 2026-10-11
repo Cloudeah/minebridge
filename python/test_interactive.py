@@ -24,12 +24,16 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
     async def test_follow_decisions_cross_notebook_relay_and_guarded_tasks_without_rewriting(self):
         await self.integration(follow=True)
 
-    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False, ranged=False, follow=False):
+    async def test_crossbow_decision_omits_bow_charge_ticks_through_guarded_submission(self):
+        await self.integration(ranged=True, crossbow=True)
+
+    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False, ranged=False, follow=False, crossbow=False):
         submitted, observed_profiles, reports, queries = [], [], [], []
         terminal = asyncio.Event()
         holder = {}
         model = FakeVllm()
         bow_decision = {"action": "combat.ranged", "parameters": {"entity_id": "418f10e9-bc78-4d9c-bb26-6a9cfa352b69", "charge_ticks": 20}, "reason": "shoot once"}
+        if crossbow:bow_decision["parameters"].pop("charge_ticks")
         if ranged:
             model.content = json.dumps(bow_decision)
         follow_decision = {"action": "move.follow", "parameters": {"entity_id": bow_decision["parameters"]["entity_id"], "ticks": 100, "distance": 3}, "reason": "follow five seconds"}
@@ -70,7 +74,8 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
         def observation():
             state = {**snapshot(), "control_epoch": 7}
             if ranged or follow:
-                state["actor"]["main_hand"] = {"type": "minecraft:bow", "count": 1, "damage": 0}
+                state["actor"]["main_hand"] = {"type": "minecraft:crossbow" if crossbow else "minecraft:bow", "count": 1, "damage": 0}
+                if crossbow:state["actor"]["main_hand"]["crossbow"] = {"charged": False, "projectiles": []}
                 state["entities"] = [{"entity_id": bow_decision["parameters"]["entity_id"], "type": "minecraft:pig", "position": {"x": 0, "y": 64, "z": 8}, "visible": True}]
             return state
 

@@ -55,9 +55,10 @@
   "screen.minebridge.progress.transfer_count": "перенесено: %s",
   "screen.minebridge.progress.selected_slot": "слот: %s",
   "screen.minebridge.no_confirmations": "пока нет",
-  "screen.minebridge.action.combat.ranged": "Выстрел из лука",
-  "screen.minebridge.progress.shots": "стрел выпущено: %s",
+  "screen.minebridge.action.combat.ranged": "Одиночный выстрел",
+  "screen.minebridge.progress.shots": "выстрелов: %s",
   "screen.minebridge.progress.hits": "попаданий: %s",
   "screen.minebridge.progress.damage": "урон: %s",
-  "screen.minebridge.progress.follow_ticks": "сопровождение: %s тиков"
+  "screen.minebridge.progress.follow_ticks": "сопровождение: %s тиков",
+  "screen.minebridge.progress.crossbow_loads": "заряжено: %s"
 }

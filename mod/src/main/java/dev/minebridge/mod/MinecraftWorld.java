@@ -4,6 +4,7 @@ import com.google.gson.*;
 import dev.minebridge.core.*;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.*;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.stats.Stats;
@@ -14,6 +15,8 @@ import net.minecraft.world.entity.projectile.arrow.AbstractArrow;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.world.inventory.*;
 import net.minecraft.world.item.*;
+import net.minecraft.world.item.component.ChargedProjectiles;
+import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.Property;
@@ -37,6 +40,7 @@ final class MinecraftWorld implements WorldAccess {
     private final Map<String,JumpSequence> jumps=new HashMap<>();
     private final Map<String,CrouchSequence> crouches=new HashMap<>();
     private final Map<String,FollowSequence> follows=new HashMap<>();
+    private final Map<String,CrossbowSequence> crossbows=new HashMap<>();
     private final Map<String,ItemDropSequence> drops=new HashMap<>();
     private final PickupLedger pickups;
     private final CombatLedger combat;
@@ -69,7 +73,7 @@ final class MinecraftWorld implements WorldAccess {
     @Override public long tick(){if(mc.level!=null)lastTick=mc.level.getGameTime();return lastTick;}
     @Override public boolean visionAvailable(){return mc.hasSingleplayerServer() && mc.getMainRenderTarget().getColorTexture() instanceof com.mojang.blaze3d.opengl.GlTexture && mc.getMainRenderTarget().getDepthTexture() instanceof com.mojang.blaze3d.opengl.GlTexture;}
     @Override public List<String> movementModes(){return mc.hasSingleplayerServer()?List.of("walk","sprint","jump","crouch"):List.of();}
-    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
+    @Override public void taskFinished(Task t){confirmations.remove(t.id);routes.remove(t.id);jumps.remove(t.id);crouches.remove(t.id);follows.remove(t.id);crossbows.remove(t.id);drops.remove(t.id);crafts.remove(t.id);builds.remove(t.id);buildChecks.remove(t.id);combat.end(t.id);if(t.action.equals("item.pickup"))pickups.discard(string(t.parameters,"entity_id"));}
     @Override public void collectConfirmed(Task t) {
         updateCombatReceipt(t,combat.finish(t.id));
     }
@@ -97,7 +101,7 @@ final class MinecraftWorld implements WorldAccess {
         return switch(t.action){
             case "move.follow"->follows.containsKey(t.id);
             case "item.use"->t.context.has("use_sent");
-            case "combat.ranged"->t.context.has("bow_started");
+            case "combat.ranged"->t.context.has("bow_started") || crossbows.containsKey(t.id);
             case "combat.attack"->t.context.has("last_attack");
             case "item.drop"->drops.containsKey(t.id) && drops.get(t.id).awaitingConfirmation();
             case "item.pickup"->t.context.has("pickup_started");
@@ -165,6 +169,7 @@ final class MinecraftWorld implements WorldAccess {
                 double range=number(p,"max_distance",24);if(range<1 || range>32)throw new BridgeException("invalid_request","max_distance must be 1..32");
                 if(!string(p,"hand","main").equals("main"))throw new BridgeException("invalid_request","Bow combat supports the main hand only");
                 if(p.has("shots") || p.has("count") || p.has("chase"))throw new BridgeException("invalid_request","combat.ranged fires one arrow without chasing");
+                if(mc.player.getMainHandItem().is(Items.CROSSBOW) && p.has("charge_ticks"))throw new BridgeException("invalid_request","charge_ticks applies to bows; crossbows use vanilla loading time");
             }
             case "move.jump"->JumpSequence.count(p);
             case "block.break", "block.place"->{block(child(p,"position"));if(action.equals("block.place"))Identifier.parse(string(p,"block"));}
@@ -185,7 +190,11 @@ final class MinecraftWorld implements WorldAccess {
     static String itemId(ItemStack s){return s.isEmpty()?"minecraft:air":BuiltInRegistries.ITEM.getKey(s.getItem()).toString();}
     static String blockId(BlockState s){return BuiltInRegistries.BLOCK.getKey(s.getBlock()).toString();}
     static JsonObject stack(ItemStack s){return object("type",itemId(s),"count",s.getCount(),"damage",s.getDamageValue(),"max_stack_size",s.getMaxStackSize(),"name",s.getHoverName().getString(),"components","Only public name, damage and stack limit are exposed; other components are unavailable");}
-    static JsonObject heldStack(ItemStack s){return object("type",itemId(s),"count",s.getCount(),"damage",s.getDamageValue());}
+    static JsonObject heldStack(ItemStack s){JsonObject result=object("type",itemId(s),"count",s.getCount(),"damage",s.getDamageValue());if(s.is(Items.CROSSBOW))result.add("crossbow",crossbowState(s));return result;}
+    private static JsonObject crossbowState(ItemStack stack) {
+        var projectiles=stack.getOrDefault(DataComponents.CHARGED_PROJECTILES,ChargedProjectiles.EMPTY).itemCopies();
+        return object("charged",!projectiles.isEmpty(),"projectiles",projectiles.stream().map(s->object("type",itemId(s),"count",s.getCount())).toList());
+    }
     private static <T extends Comparable<T>> String propertyValue(Property<T> p,BlockState state){return p.getName(state.getValue(p));}
     static JsonObject properties(BlockState state){JsonObject o=object();for(Property<?> p:state.getProperties())o.addProperty(p.getName(),propertyValue(p,state));return o;}
     private String slotRole(Slot slot) {
@@ -234,6 +243,7 @@ final class MinecraftWorld implements WorldAccess {
     }
     @Override public void releaseControls(){
         combat.suspendMelee();
+        crossbows.values().forEach(CrossbowSequence::released);
         boolean cancelBow=bowDrawing || mc.player!=null && held.contains(mc.options.keyUse) && mc.player.getUseItem().is(Items.BOW) && mc.player.getUsedItemHand()==InteractionHand.MAIN_HAND;
         for(var k:Set.copyOf(held))hold(k,false);held.clear();if(mc.gameMode!=null)mc.gameMode.stopDestroyBlock();
         if(cancelBow && mc.player!=null) {
@@ -268,6 +278,11 @@ final class MinecraftWorld implements WorldAccess {
                 view.addProperty("yaw",actor.getYRot());view.addProperty("pitch",actor.getXRot());
                 view.addProperty("selected_slot",actor.getInventory().getSelectedSlot());
                 view.add("main_hand",heldStack(actor.getMainHandItem()));view.add("off_hand",heldStack(actor.getOffhandItem()));
+                if(actor.getMainHandItem().is(Items.CROSSBOW)) {
+                    view.addProperty("crossbow_projectile_count",EnchantmentHelper.processProjectileCount(level,actor.getMainHandItem(),actor,1));
+                    view.addProperty("crossbow_charge_ticks",CrossbowItem.getChargeDuration(actor.getMainHandItem(),actor));
+                    view.add("crossbow_ammo",heldStack(actor.getProjectile(actor.getMainHandItem())));
+                }
                 view.addProperty("food",actor.getFoodData().getFoodLevel());view.addProperty("using_item",actor.isUsingItem());
                 view.addProperty("use_hand",actor.isUsingItem()?(actor.getUsedItemHand()==InteractionHand.MAIN_HAND?"main":"off"):"none");
                 view.addProperty("use_ticks",actor.getTicksUsingItem());
@@ -513,8 +528,10 @@ final class MinecraftWorld implements WorldAccess {
         if(target instanceof net.minecraft.world.entity.player.Player)throw new BridgeException("permission_denied","Player combat is disabled");
         if(!(target instanceof LivingEntity) || !target.isAlive())throw new BridgeException("target_lost","A visible living target is required");
         if(mc.player.distanceTo(target)>number(t.parameters,"max_distance",24))throw new BridgeException("out_of_reach","Bow target is outside max_distance",true);
-        if(!mc.player.getMainHandItem().is(Items.BOW))throw new BridgeException("missing_weapon","Select minecraft:bow in the main hand first");
+        if(!mc.player.getMainHandItem().is(Items.BOW) && !mc.player.getMainHandItem().is(Items.CROSSBOW))throw new BridgeException("missing_weapon","Select minecraft:bow or minecraft:crossbow in the main hand first");
         if(mc.player.isInWater() || mc.player.isInLava())throw new BridgeException("ranged_unavailable","Bow aiming from water or lava is unsupported");
+        if(mc.player.getMainHandItem().is(Items.CROSSBOW))return crossbow(t,target);
+        if(crossbows.containsKey(t.id))throw new BridgeException("draw_interrupted","The ranged weapon changed during loading");
         if(!t.context.has("bow_started")) {
             ActionBudget.require(t,2);
             if(mc.player.isUsingItem())throw new BridgeException("item_busy","Finish the current item use first");
@@ -522,7 +539,7 @@ final class MinecraftWorld implements WorldAccess {
         }
         JsonObject view=serverView(t,null,id);
         if(!t.context.has("bow_started") && view==null)return Step.waiting(object("waiting","server_bow_ready"));
-        hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);hold(mc.options.keySprint,false);aimBow(target);
+        hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);hold(mc.options.keySprint,false);aimBow(target,3.0);
         if(!t.context.has("bow_started")) {
             if(combat.peek(t.id)==null)combat.begin(t.id,id,"bow",view.get("tick").getAsLong());
             mc.gameMode.useItem(mc.player,InteractionHand.MAIN_HAND);t.actions++;t.context.addProperty("bow_started",tick());
@@ -542,15 +559,55 @@ final class MinecraftWorld implements WorldAccess {
         t.actions++;t.context.addProperty("bow_released",tick());
         return Step.waiting(object("stage","waiting_for_shot","target",id));
     }
-    private void aimBow(Entity target) {
+    private Step crossbow(Task t,Entity target) {
+        if(t.context.has("bow_started"))throw new BridgeException("draw_interrupted","The ranged weapon changed during drawing");
+        if(t.parameters.has("charge_ticks"))throw new BridgeException("invalid_request","charge_ticks applies to bows; crossbows use vanilla loading time");
+        CrossbowSequence sequence=crossbows.computeIfAbsent(t.id,key->new CrossbowSequence());
+        JsonObject view=serverView(t,null,string(t.parameters,"entity_id"));
+        CrossbowSequence.Sample sample=null;
+        if(view!=null) {
+            if(!string(child(view,"main_hand"),"type").equals("minecraft:crossbow"))throw new BridgeException("draw_interrupted","Server selected weapon changed");
+            JsonObject state=child(child(view,"main_hand"),"crossbow");JsonArray projectiles=state.getAsJsonArray("projectiles");
+            boolean plain=projectiles.size()==1 && string(projectiles.get(0).getAsJsonObject(),"type").equals("minecraft:arrow") && integer(projectiles.get(0).getAsJsonObject(),"count",0,0,64)==1;
+            sample=new CrossbowSequence.Sample(view.get("tick").getAsLong(),bool(view,"using_item",false),bool(state,"charged",false),projectiles.size(),plain);
+        }
+        var decision=sequence.observe(sample,mc.player.isUsingItem(),CrossbowItem.isCharged(mc.player.getMainHandItem()));
+        if(decision.confirmedLoads()>0)t.confirmed.addProperty("crossbow_loads",decision.confirmedLoads());
+        if(decision.error()!=null)throw new BridgeException(decision.error(),"Crossbow loading cannot continue; start a new task after checking the weapon/ammunition");
+        if(decision.command()==CrossbowSequence.Command.wait)return Step.waiting(object("stage",decision.stage(),"weapon","minecraft:crossbow","target",string(t.parameters,"entity_id")));
+        if(decision.command()==CrossbowSequence.Command.draw) {
+            ActionBudget.require(t,3);
+            if(integer(view,"crossbow_projectile_count",1,0,64)!=1)throw new BridgeException("unsupported_ammo","Multishot crossbows are unsupported");
+            String ammo=string(child(view,"crossbow_ammo"),"type");
+            if(ammo.equals("minecraft:air"))throw new BridgeException("missing_ammo","No crossbow arrow is available");
+            if(!ammo.equals("minecraft:arrow"))throw new BridgeException("unsupported_ammo","Crossbows support one ordinary arrow; fireworks and other ammunition are unsupported");
+            if(integer(view,"crossbow_charge_ticks",25,0,12000)>100)throw new BridgeException("unsupported_capability","Crossbow charging time is unsupported");
+        } else ActionBudget.require(t,1);
+        hold(mc.options.keyUp,false);hold(mc.options.keyJump,false);hold(mc.options.keySprint,false);aimBow(target,3.15);
+        long serverTick=view.get("tick").getAsLong();
+        if(decision.command()==CrossbowSequence.Command.draw) {
+            mc.gameMode.useItem(mc.player,InteractionHand.MAIN_HAND);hold(mc.options.keyUse,true);
+        } else if(decision.command()==CrossbowSequence.Command.release) {
+            hold(mc.options.keyUse,false);mc.gameMode.releaseUsingItem(mc.player);
+        } else {
+            JsonObject local=crossbowState(mc.player.getMainHandItem());JsonArray arrows=local.getAsJsonArray("projectiles");
+            if(arrows.size()!=1 || !string(arrows.get(0).getAsJsonObject(),"type").equals("minecraft:arrow"))throw new BridgeException("unsupported_ammo","Client crossbow does not contain one ordinary arrow");
+            if(combat.peek(t.id)==null)combat.begin(t.id,string(t.parameters,"entity_id"),"bow",serverTick);
+            if(!combat.expectShot(t.id,serverTick))throw new BridgeException("shot_unconfirmed","No unique shot receipt can be opened");
+            mc.gameMode.useItem(mc.player,InteractionHand.MAIN_HAND);t.context.addProperty("bow_released",tick());
+        }
+        t.actions++;sequence.sent(decision.command(),serverTick);
+        return Step.waiting(object("stage",decision.command().name(),"weapon","minecraft:crossbow","target",string(t.parameters,"entity_id")));
+    }
+    private void aimBow(Entity target,double speed) {
         Vec3 eye=mc.player.getEyePosition(),point=target.getBoundingBox().getCenter();
-        double flight=Math.max(1,eye.distanceTo(point)/3.0);
+        double flight=Math.max(1,eye.distanceTo(point)/speed);
         Vec3 velocity=target.getDeltaMovement();if(velocity.lengthSqr()<=1)point=point.add(velocity.scale(flight));
         Vec3 d=point.subtract(eye);double horizontal=Math.sqrt(d.x*d.x+d.z*d.z);
         if(horizontal<0.1){look(point);return;}
         // Low ballistic arc for a fully drawn vanilla bow. Actual hit receipts remain
         // authoritative: drag, spread and moving targets can still produce a miss.
-        double gravity=0.05,speedSquared=9,discriminant=speedSquared*speedSquared-gravity*(gravity*horizontal*horizontal+2*d.y*speedSquared);
+        double gravity=0.05,speedSquared=speed*speed,discriminant=speedSquared*speedSquared-gravity*(gravity*horizontal*horizontal+2*d.y*speedSquared);
         if(discriminant<0)throw new BridgeException("out_of_reach","No supported bow trajectory");
         double rise=(speedSquared-Math.sqrt(discriminant))/gravity;
         look(eye.add(d.x,rise,d.z));

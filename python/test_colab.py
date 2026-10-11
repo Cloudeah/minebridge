@@ -662,6 +662,14 @@ class VllmAdapterTest(unittest.TestCase):
         self.assertEqual(progress["confirmed_damage"], 3.5)
         self.assertEqual(progress["completed_steps"], 1)
 
+    def test_crossbow_load_receipt_is_separate_from_a_shot_and_not_counted_twice(self):
+        loaded = {"result": {"task_id": "loaded", "state": "failed", "confirmed_changes": {"crossbow_loads": 1}}}
+        fired = {"result": {"task_id": "fired", "state": "succeeded", "confirmed_changes": {"shots": 1}}}
+        invalid = {"result": {"task_id": "invalid", "confirmed_changes": {"crossbow_loads": True}}}
+        progress = controller.goal_progress(snapshot(), [loaded, loaded, fired, invalid])
+        self.assertEqual(progress["confirmed_crossbow_loads"], 1)
+        self.assertEqual(progress["confirmed_shots"], 1)
+
     def test_follow_parameters_are_identical_in_controller_and_notebook(self):
         target = "418f10e9-bc78-4d9c-bb26-6a9cfa352b69"
         schema = controller.model_payload("follow", snapshot(), ["move.follow"], [], compact=True)["format"]

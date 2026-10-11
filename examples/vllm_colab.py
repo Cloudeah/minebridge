@@ -23,7 +23,7 @@ ACTION_HELP = {
     "look.at": "target:{x,y,z} OR entity_id",
     "look.turn": "delta_yaw:-180..180,delta_pitch:-90..90(default0); +yaw right,+pitch down",
     "combat.attack": "entity_id,chase:bool; melee, no players",
-    "combat.ranged": "entity_id,charge_ticks:20..60(default20),wait_ticks:10..100,max_distance:1..32; one main-hand vanilla bow shot, needs 2 actions; hit confirmed separately",
+    "combat.ranged": "entity_id,wait_ticks:10..100,max_distance:1..32; main bow:2 actions,charge_ticks:20..60; crossbow:3 actions unloaded/1 loaded,plain arrow only,omit charge_ticks; one shot,hit confirmed separately",
     "item.use": "hand:main/off,duration_ticks:1..1200(default40),target:{x,y,z} optional aim; held item only",
     "item.drop": "count:1..64(default1),expected_item:namespace:id optional; selected main hand",
     "item.pickup": "entity_id of observed minecraft:item; approach and collect whole stack; partial count possible",
@@ -172,6 +172,9 @@ def goal_progress(snapshot, history, initial_actor=None):
         followed = facts.get("follow_ticks", 0)
         if type(followed) is int and followed > 0:
             progress["confirmed_follow_ticks"] = progress.get("confirmed_follow_ticks", 0) + followed
+        loads = facts.get("crossbow_loads", 0)
+        if type(loads) is int and loads > 0:
+            progress["confirmed_crossbow_loads"] = progress.get("confirmed_crossbow_loads", 0) + loads
         for key in ("shots", "hits", "damage"):
             value = facts.get(key, 0)
             if type(value) in (int, float) and value > 0:
