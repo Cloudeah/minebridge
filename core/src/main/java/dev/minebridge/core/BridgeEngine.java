@@ -66,7 +66,20 @@ public final class BridgeEngine {
     public boolean armed() { return armed; }
     public void ownerArm() { controlEpoch++;armed=true; stopped=false; event("control.armed",object()); }
     public void ownerStop() { controlEpoch++;armed=false; stopped=true;model.cancel("Остановлено владельцем.");stopAll("owner_stop"); event("control.stopped",object("source","owner")); }
-    public JsonObject modelStatus(){JsonObject status=model.status();status.addProperty("controller_connected",controller!=null);status.addProperty("armed",armed);return status;}
+    public JsonObject modelStatus(){
+        JsonObject status=model.status();status.addProperty("controller_connected",controller!=null);status.addProperty("armed",armed);
+        String goalId=status.has("goal_id")?status.get("goal_id").getAsString():null;
+        Task current=active!=null&&!active.terminal()&&matchesCurrentGoal(active,goalId)?active:null;
+        if(current==null)current=tasks.values().stream().filter(t->!t.terminal()&&matchesCurrentGoal(t,goalId)).reduce((a,b)->b).orElse(null);
+        Task recent=tasks.values().stream().filter(Task::terminal).filter(t->matchesCurrentGoal(t,goalId)).reduce((a,b)->b).orElse(null);
+        if(current!=null)status.add("active_task",taskSummary(current));
+        if(recent!=null)status.add("recent_task",taskSummary(recent));
+        return status;
+    }
+    private static boolean matchesCurrentGoal(Task task,String goalId) {
+        if(!task.context.has("model_goal_id"))return true;
+        return goalId!=null&&goalId.equals(task.context.get("model_goal_id").getAsString());
+    }
     public void ownerModelStart(String goal,int steps,boolean vision) {
         requireArmed();if(vision && !world.visionAvailable())throw new BridgeException("unsupported_capability","Зрение недоступно.");
         if(tasks.values().stream().anyMatch(t->!t.terminal()))throw new BridgeException("busy","Сначала останови текущие задачи клавишей F9.");
@@ -178,8 +191,9 @@ public final class BridgeEngine {
             case "observe.snapshot" -> {String profile=ObservationProfiles.validate(string(d,"profile","full"));refresh(); yield ObservationProfiles.apply(snapshot(),profile); }
             case "observe.subscribe" -> {String profile=ObservationProfiles.validate(string(d,"profile","full"));subscriptionTicks=integer(d,"interval_ticks",10,4,1200);subscriptionProfile=profile;eventSubscription=bool(d,"events",true); yield object("interval_ticks",subscriptionTicks,"events",eventSubscription,"profile",profile); }
             case "observe.unsubscribe" -> { subscriptionTicks=0; eventSubscription=false; yield object("status","unsubscribed"); }
-            case "map.query", "memory.query" -> memory.query(d,world.dimension(),world.tick());
+            case "map.query", "memory.query", "map.nearest" -> {requireQueryCapability(type);yield type.equals("map.nearest")?memory.nearest(d,world.dimension(),world.tick()):memory.query(d,world.dimension(),world.tick());}
             case "memory.annotate" -> memory.annotate(d,world.dimension());
+            case "model.query" -> modelQuery(d);
             case "task.submit" -> { requireActor(message); yield submit(string(d,"action"),child(d,"parameters"),d); }
             case "task.status" -> task(d).json();
             case "task.list" -> object("tasks",tasks.values().stream().map(Task::json).toList());
@@ -211,6 +225,80 @@ public final class BridgeEngine {
         if(!policy.allowedActions.isEmpty() && !policy.allowedActions.contains(action))
             throw new BridgeException("permission_denied","Action disabled by owner");
     }
+    private Set<String> supportedQueries() {
+        Set<String> supported=new TreeSet<>(Set.of("map.query","map.nearest","memory.query"));
+        for(String operation:List.of("route.plan","craft.plan","build.plan","inventory.inspect"))
+            if(world.capabilities().contains(operation))supported.add(operation);
+        return supported;
+    }
+    private Set<String> availableQueries() {
+        Set<String> available=new TreeSet<>(supportedQueries());
+        if(!policy.allowedActions.isEmpty())available.retainAll(policy.allowedActions);
+        return available;
+    }
+    private void requireQueryCapability(String operation) {
+        if(!supportedQueries().contains(operation))throw new BridgeException("unsupported_capability",operation);
+        if(!policy.allowedActions.isEmpty()&&!policy.allowedActions.contains(operation))
+            throw new BridgeException("permission_denied","Query disabled by owner");
+    }
+    private JsonObject modelQuery(JsonObject data) {
+        requireArmed();
+        if(!data.has("expected_control_epoch"))throw new BridgeException("invalid_request","expected_control_epoch is required");
+        requireControlEpoch(data);
+        if(data.has("model_goal_id"))model.requireActive(string(data,"model_goal_id"));
+        String operation=string(data,"operation");
+        if(!availableQueries().contains(operation)) {
+            if(supportedQueries().contains(operation))throw new BridgeException("permission_denied","Query disabled by owner");
+            throw new BridgeException("unsupported_capability","Query is not advertised: "+operation);
+        }
+        JsonObject arguments=child(data,"arguments");
+        return switch(operation) {
+            case "map.query", "memory.query" -> memory.query(arguments,world.dimension(),world.tick());
+            case "map.nearest" -> memory.nearest(arguments,world.dimension(),world.tick());
+            default -> world.query(operation,arguments);
+        };
+    }
+    private JsonObject taskSummary(Task task) {
+        JsonObject result=summarizeResult(task.result),confirmed=summarizeConfirmed(task.confirmed);
+        JsonObject summary=object("task_id",task.id,"action",task.action,"state",task.state.name(),"actions",task.actions,
+                "max_actions",task.maxActions,"result",result,"confirmed_changes",confirmed);
+        if(task.context.has("model_goal_id"))summary.add("model_goal_id",task.context.get("model_goal_id").deepCopy());
+        return summary;
+    }
+    private static JsonObject summarizeResult(JsonObject source) {
+        JsonObject summary=new JsonObject();
+        for(String field:List.of("stage","waiting","confirmed_blocks","total")) {
+            if(source!=null&&source.has(field)&&source.get(field).isJsonPrimitive())summary.add(field,source.get(field).deepCopy());
+        }
+        return summary;
+    }
+    private static JsonObject summarizeConfirmed(JsonObject source) {
+        JsonObject summary=new JsonObject();
+        addNonNegativeCounter(summary,"jumps",source,"jumps");
+        addNonNegativeCounter(summary,"blocks",source,"blocks");
+        addNonNegativeCounter(summary,"crafts_confirmed",source,"crafts_confirmed");
+        addNonNegativeCounter(summary,"selected_slot",source,"selected_slot");
+        addNestedCounter(summary,"drop_count",source,"drop","count");
+        addNestedCounter(summary,"pickup_count",source,"pickup","count");
+        addNestedCounter(summary,"transfer_count",source,"transfer","transferred");
+        if(source!=null&&source.has("selected_item")&&source.get("selected_item").isJsonObject())
+            addNonNegativeCounter(summary,"selected_slot",source.getAsJsonObject("selected_item"),"selected_slot");
+        if(source!=null&&source.has("block_updates")&&source.get("block_updates").isJsonArray())
+            putCounter(summary,"blocks",Math.max(summary.has("blocks")?summary.get("blocks").getAsInt():0,source.getAsJsonArray("block_updates").size()));
+        return summary;
+    }
+    private static void addNestedCounter(JsonObject target,String key,JsonObject source,String objectKey,String countKey) {
+        if(source!=null&&source.has(objectKey)&&source.get(objectKey).isJsonObject())
+            addNonNegativeCounter(target,key,source.getAsJsonObject(objectKey),countKey);
+    }
+    private static void addNonNegativeCounter(JsonObject target,String key,JsonObject source,String sourceKey) {
+        if(source==null||!source.has(sourceKey)||!source.get(sourceKey).isJsonPrimitive()||!source.getAsJsonPrimitive(sourceKey).isNumber())return;
+        try {int value=source.get(sourceKey).getAsInt();if(value>=0)putCounter(target,key,value);}
+        catch(RuntimeException ignored) { /* Ignore malformed or unconfirmed counters in the GUI summary. */ }
+    }
+    private static void putCounter(JsonObject target,String key,int value) {
+        if(value>=0)target.addProperty(key,value);
+    }
     private JsonObject submit(String action,JsonObject parameters,JsonObject options) {
         requireArmed();requireControlEpoch(options);
         if(options.has("model_goal_id"))model.requireActive(string(options,"model_goal_id"));
@@ -221,6 +309,7 @@ public final class BridgeEngine {
             if(tasks.size()>=256)throw new BridgeException("limit_exceeded","Task limit reached");
         }
         Task t=new Task(action,parameters,integer(options,"priority",0,-100,100),world.tick()+integer(options,"timeout_ticks",1200,1,12000),integer(options,"max_actions",10000,1,100000));
+        if(options.has("model_goal_id"))t.context.addProperty("model_goal_id",string(options,"model_goal_id"));
         if(options.has("depends_on")) {
             if(!options.get("depends_on").isJsonArray()||options.getAsJsonArray("depends_on").size()>32)throw new BridgeException("invalid_request","depends_on must contain at most 32 task IDs");
             List<String> dependencies=new ArrayList<>();
@@ -252,15 +341,32 @@ public final class BridgeEngine {
     private void finish(Task t,Task.State state,String error,String detail,JsonObject result) {
         if(t.terminal()) return;
         t.error=error;t.detail=detail;t.result=result;
+        rememberConfirmedBlocks(t);
         if(t==active) {world.releaseControls();active=null;}
         transition(t,state);
         world.taskFinished(t);
+    }
+    private void rememberConfirmedBlocks(Task task) {
+        if(!task.confirmed.has("block_updates")||!task.confirmed.get("block_updates").isJsonArray())return;
+        for(JsonElement element:task.confirmed.getAsJsonArray("block_updates")) {
+            if(element==null||!element.isJsonObject())continue;
+            JsonObject update=element.getAsJsonObject();Long tick=confirmationTick(update);
+            if(tick==null) {event("memory.error",object("code","invalid_block_confirmation"));continue;}
+            JsonObject block=update.deepCopy();block.remove("tick");
+            try {memory.confirmBlock(block,tick,task.action,task.id);}
+            catch(RuntimeException e) {event("memory.error",object("code","invalid_block_confirmation"));}
+        }
+    }
+    private static Long confirmationTick(JsonObject update) {
+        if(!update.has("tick")||!update.get("tick").isJsonPrimitive()||!update.getAsJsonPrimitive("tick").isNumber())return null;
+        try {return new java.math.BigDecimal(update.get("tick").getAsString()).longValueExact();}
+        catch(NumberFormatException|ArithmeticException e) {return null;}
     }
     private void stopAll(String reason) { world.releaseControls();for(Task t:tasks.values()) if(!t.terminal()) finish(t,Task.State.cancelled,reason,"Control stopped",t.result);active=null; }
     public JsonObject capabilities() {
         Set<String> actions=new TreeSet<>(world.capabilities());
         if(!policy.allowedActions.isEmpty())actions.retainAll(policy.allowedActions);
-        return object("actions",actions,"vision",world.visionAvailable(),"formats",List.of("MBV1/png/float32-le"),"actor_id",world.actorId(),"profile",policy.publicProfile(),"armed",armed,
+        return object("actions",actions,"queries",availableQueries(),"vision",world.visionAvailable(),"formats",List.of("MBV1/png/float32-le"),"actor_id",world.actorId(),"profile",policy.publicProfile(),"armed",armed,
                 "deduplication_window_ms",DEDUP_MS,"deduplication_capacity",4096,"event_history",512,"max_tasks",256,"vision_max_fps",5,"vision_max_resolution",List.of(640,360),"movement_modes",world.movementModes(),
                 "observation_profiles",ObservationProfiles.NAMES,"decision_guards",List.of("control_epoch","model_goal_id"),"model_control",true);
     }

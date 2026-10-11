@@ -16,10 +16,15 @@ final class ModelScreen extends Screen {
     private EditBox goal,steps;
     private Checkbox vision;
     private Button start;
-    private String draft="",stepDraft="1",error="";
+    private String draft="",stepDraft="8",error="";
     private boolean visionDraft;
     private int left,top,panelWidth;
-    ModelScreen(BridgeEngine engine,KeyMapping armKey,KeyMapping stopKey,KeyMapping panelKey){super(Component.translatable("screen.minebridge.title"));this.engine=engine;this.armKey=armKey;this.stopKey=stopKey;this.panelKey=panelKey;}
+    ModelScreen(BridgeEngine engine,KeyMapping armKey,KeyMapping stopKey,KeyMapping panelKey){super(Component.translatable("screen.minebridge.title"));this.engine=engine;this.armKey=armKey;this.stopKey=stopKey;this.panelKey=panelKey;
+        JsonObject status=engine.modelStatus();
+        if(status.has("goal"))draft=status.get("goal").getAsString();
+        if(status.has("steps"))stepDraft=status.get("steps").getAsString();
+        if(status.has("vision"))visionDraft=status.get("vision").getAsBoolean();
+    }
     @Override protected void init() {
         panelWidth=Math.min(400,width-24);left=(width-panelWidth)/2;top=Math.max(8,(height-232)/2);
         goal=addRenderableWidget(new EditBox(font,left,top+38,panelWidth,20,Component.translatable("screen.minebridge.goal")));
@@ -61,7 +66,17 @@ final class ModelScreen extends Screen {
         graphics.text(font,Component.translatable(status.get("controller_connected").getAsBoolean()?"screen.minebridge.connected":"screen.minebridge.disconnected"),left,top+152,0xffdddddd);
         graphics.text(font,Component.translatable("screen.minebridge.state",Component.translatable("screen.minebridge.state."+status.get("state").getAsString()),status.get("step").getAsInt()),left,top+166,0xffdddddd);
         String detail=error.isEmpty()?status.get("detail").getAsString():error;
+        JsonObject task=status.has("active_task")?status.getAsJsonObject("active_task"):status.has("recent_task")?status.getAsJsonObject("recent_task"):null;
         int y=top+181;
+        if(task!=null) {
+            graphics.text(font,Component.translatable("screen.minebridge.task",Component.translatable("screen.minebridge.action."+task.get("action").getAsString()),task.get("actions").getAsInt(),task.get("max_actions").getAsInt()),left,y,0xffdddddd);y+=12;
+            JsonObject changes=task.getAsJsonObject("confirmed_changes");
+            java.util.List<String> parts=new java.util.ArrayList<>();
+            if(changes!=null)for(String key:java.util.List.of("jumps","blocks","crafts_confirmed","drop_count","pickup_count","transfer_count","selected_slot"))
+                if(changes.has(key))parts.add(Component.translatable("screen.minebridge.progress."+key,changes.get(key).getAsInt()).getString());
+            String progress=parts.isEmpty()?Component.translatable("screen.minebridge.no_confirmations").getString():String.join(", ",parts);
+            graphics.text(font,font.plainSubstrByWidth(Component.translatable("screen.minebridge.confirmed",progress).getString(),panelWidth),left,y,0xffaaddaa);y+=12;
+        }
         for(var line:font.split(Component.literal(detail),panelWidth)) {
             if(y>top+218)break;
             graphics.text(font,line,left,y,error.isEmpty()?0xffcccccc:0xffff7777);y+=10;

@@ -18,8 +18,8 @@ from test_colab import ROOT, DECISION, EXPRESSION_REPLY, FakeVllm, controller, n
 
 
 class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
-    async def integration(self, vision=False, cancel_first=False, malformed_first=False):
-        submitted, observed_profiles, reports = [], [], []
+    async def integration(self, vision=False, cancel_first=False, malformed_first=False, query_first=False):
+        submitted, observed_profiles, reports, queries = [], [], [], []
         terminal = asyncio.Event()
         holder = {}
         model = FakeVllm()
@@ -28,6 +28,10 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                 model.content = EXPRESSION_REPLY if len(model.payloads) == 1 else json.dumps(DECISION)
 
             model.before_reply = reply
+        if query_first:
+            def reply_with_query():
+                model.content = json.dumps({"action": "query", "parameters": {"operation": "craft.plan", "arguments": {"item": "minecraft:stick", "count": 4}}, "reason": "check recipe"}) if len(model.payloads) % 2 else json.dumps(DECISION)
+            model.before_reply = reply_with_query
         reached_model, release_model = threading.Event(), threading.Event()
         release_model.set()
         if cancel_first:
@@ -41,12 +45,15 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
             model.before_reply = delay_first_reply
 
         def goal(identifier):
-            return {"goal_id": identifier, "goal": "look east", "steps": 1, "vision": vision,
+            return {"goal_id": identifier, "goal": "look east", "steps": 2 if query_first else 1, "vision": vision,
                     "state": "queued", "step": 0}
 
         status = goal("first")
         capabilities = {"actions": ["look.at"], "actor_id": "test-actor", "armed": True,
                         "model_control": True, "observation_profiles": ["full", "compact"]}
+
+        if query_first:
+            capabilities["queries"] = ["craft.plan"]
 
         def observation():
             return {**snapshot(), "control_epoch": 7}
@@ -84,6 +91,12 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                             status.update(goal("second"))
                         else:
                             terminal.set()
+                elif operation == "model.query":
+                    self.assertEqual(data["model_goal_id"], status["goal_id"])
+                    self.assertEqual(data["expected_control_epoch"], 7)
+                    self.assertEqual(data["operation"], "craft.plan")
+                    queries.append(dict(data))
+                    value = {"executable": False, "missing": {"minecraft:oak_log": 1}, "stages": []}
                 elif operation == "task.submit":
                     self.assertEqual(status["state"], "executing")
                     self.assertEqual(data["model_goal_id"], status["goal_id"])
@@ -143,7 +156,7 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                             "USE_STRUCTURED_OUTPUTS": False, "model_session": model_session,
                             "RELAY_URL": f"http://127.0.0.1:{holder['relay'].port}", "relay_session": session}
                         decide = notebook_function(namespace, "vllm_tpu_colab.ipynb")
-                        worker = asyncio.create_task(asyncio.to_thread(decide, 2, stop_on_wait=False))
+                        worker = asyncio.create_task(asyncio.to_thread(decide, 4 if query_first else 2, stop_on_wait=False))
                         if cancel_first:
                             self.assertTrue(await asyncio.to_thread(reached_model.wait, 3))
                             status["state"] = "cancelled"
@@ -161,12 +174,18 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
                         task.cancel()
                         with self.assertRaises(asyncio.CancelledError):
                             await task
-            self.assertEqual(len(model.payloads), 3 if malformed_first else 2)
+            self.assertEqual(len(model.payloads), 4 if query_first else 3 if malformed_first else 2)
             for payload in model.payloads:
                 user_content = payload["messages"][1]["content"]
                 user_content = user_content[-1]["text"] if isinstance(user_content, list) else user_content
                 self.assertEqual(json.loads(user_content)["task_limits"], {"timeout_ticks": 600, "max_actions": 17})
             self.assertEqual([item["model_goal_id"] for item in submitted], ["second"] if cancel_first else ["first", "second"])
+            if query_first:
+                self.assertEqual(len(queries), 2)
+                for payload in model.payloads[1::2]:
+                    prior = json.loads(payload["messages"][1]["content"])["recent_results"][0]
+                    self.assertEqual(prior["state"], "queried")
+                    self.assertEqual(prior["result"]["missing"], {"minecraft:oak_log": 1})
             self.assertIn("compact", observed_profiles)
             if vision:
                 image = model.payloads[0]["messages"][1]["content"][0]["image_url"]["url"]
@@ -182,6 +201,9 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
             session.close()
             model_session.close()
             model.close()
+
+    async def test_planning_query_reaches_notebook_then_one_guarded_game_task_per_goal(self):
+        await self.integration(query_first=True)
 
     async def test_two_owner_goals_share_controller_and_notebook_session(self):
         await self.integration()

@@ -469,6 +469,37 @@ class VllmAdapterTest(unittest.TestCase):
         self.session.close()
         self.model.close()
 
+    def test_large_inventory_is_reduced_before_generation_without_changing_goal_totals(self):
+        state = snapshot()
+        state["inventory"] = [{"slot": i, "type": "minecraft:stone", "count": 64} for i in range(36)]
+        self.payload = controller.model_payload("look east", state, ["look.at"], [], compact=True)
+        original = self.session.post
+        def counted_post(url, **kwargs):
+            if url.endswith("/tokenize"):
+                data = json.loads(kwargs["json"]["messages"][1]["content"])
+                self.model.count = 1900 if len(data["observation"]["inventory"]) > 4 else 1000
+            return original(url, **kwargs)
+        with patch.object(self.session, "post", side_effect=counted_post):
+            self.assertEqual(self.namespace["infer_decision"](self.payload), DECISION)
+        self.assertEqual(len(self.model.payloads), 1)
+        data = json.loads(self.model.payloads[0]["messages"][1]["content"])
+        self.assertEqual(data["goal"], "look east")
+        self.assertEqual(data["goal_progress"], json.loads(self.payload["messages"][1]["content"])["goal_progress"])
+        self.assertTrue(data["observation"]["inventory_truncated"])
+        self.assertGreater(data["observation"]["inventory_omitted"], 0)
+        self.assertLessEqual(len(data["observation"]["inventory"]), 4)
+        self.assertEqual(len(state["inventory"]), 36)
+
+    def test_query_and_semantic_item_selection_use_native_json_schema(self):
+        for decision in [
+            {"action": "query", "parameters": {"operation": "map.nearest", "arguments": {"x": 0, "y": 64, "z": 0, "block": "minecraft:oak_log"}}, "reason": "find wood"},
+            {"action": "inventory.select_item", "parameters": {"item": "minecraft:oak_log", "hotbar_slot": 2}, "reason": "prepare"},
+        ]:
+            with self.subTest(action=decision["action"]):
+                self.model.content = json.dumps(decision)
+                payload = controller.model_payload("prepare wood", snapshot(), [decision["action"]], [], compact=True, queries=["map.nearest"])
+                self.assertEqual(self.namespace["infer_decision"](payload), decision)
+
     def test_oversized_context_is_rejected_before_generation(self):
         self.model.count = 1793
         with self.assertRaisesRegex(ValueError, "Контекст слишком длинный"):

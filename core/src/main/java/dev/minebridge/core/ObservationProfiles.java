@@ -42,9 +42,17 @@ public final class ObservationProfiles {
         JsonArray result=new JsonArray();int empty=0;
         for(JsonElement item:source) {
             JsonObject slot=item.getAsJsonObject();
-            if(number(slot,"count",0)<=0 && empty++>=emptyLimit)continue;
+            if(number(slot,"count",0)<=0) {
+                if(emptyLimit<=0)continue;
+                if(slot.has("role") && !slot.get("role").isJsonNull()) {
+                    String role=slot.get("role").isJsonPrimitive()&&slot.getAsJsonPrimitive("role").isString()
+                            ?slot.get("role").getAsString():"";
+                    if(!Set.of("main","hotbar","container").contains(role))continue;
+                }
+                if(empty++>=emptyLimit)continue;
+            }
             JsonObject concise=object();
-            for(String field:List.of("slot","type","count","player_inventory"))if(slot.has(field))concise.add(field,slot.get(field).deepCopy());
+            for(String field:List.of("slot","type","count","player_inventory","role","inventory_slot"))if(slot.has(field))concise.add(field,slot.get(field).deepCopy());
             result.add(concise);
         }
         return result;

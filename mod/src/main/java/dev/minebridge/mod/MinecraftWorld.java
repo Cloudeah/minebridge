@@ -68,6 +68,13 @@ final class MinecraftWorld implements WorldAccess {
             case "item.drop"->drops.containsKey(t.id) && drops.get(t.id).awaitingConfirmation();
             case "item.pickup"->t.context.has("pickup_started");
             case "inventory.select"->t.context.has("selection_sent");
+            case "inventory.select_item"->t.context.has("material_sent");
+            case "inventory.transfer", "inventory.equip"->t.context.has("transfer_sent");
+            case "block.break"->t.context.has("breaking");
+            case "block.place"->t.context.has("placing") || t.context.has("material_sent");
+            case "world.interact", "container.open"->t.context.has("sent");
+            case "craft.execute"->t.context.has("craft_sent") || crafts.containsKey(t.id) && integer(t.context,"craft_stage",0,0,10000)>=crafts.get(t.id).stages().size();
+            case "build.execute"->t.context.has("placing") || t.context.has("material_sent") || builds.containsKey(t.id) && integer(t.context,"build_index",0,0,4096)>=builds.get(t.id).blocks().size();
             case "container.close"->t.context.has("sent");
             default->false;
         };
@@ -108,7 +115,7 @@ final class MinecraftWorld implements WorldAccess {
     @Override public Set<String> capabilities() {
         if(!mc.hasSingleplayerServer())return Set.of("inventory.inspect");
         return Set.of("move.to","move.follow","move.jump","move.relative","move.crouch","route.plan","look.at","look.turn","combat.attack","item.use","item.drop","item.pickup","world.interact","block.break","block.place",
-                "inventory.inspect","inventory.select","inventory.transfer","inventory.equip","container.open","container.close","craft.plan","craft.execute","build.plan","build.execute");
+                "inventory.inspect","inventory.select","inventory.select_item","inventory.transfer","inventory.equip","container.open","container.close","craft.plan","craft.execute","build.plan","build.execute");
     }
     @Override public void validate(String action,JsonObject p) {
         switch(action) {
@@ -122,6 +129,7 @@ final class MinecraftWorld implements WorldAccess {
             case "block.break", "block.place"->{block(child(p,"position"));if(action.equals("block.place"))Identifier.parse(string(p,"block"));}
             case "container.open", "world.interact"->{if(p.has("entity_id"))UUID.fromString(string(p,"entity_id"));else block(child(p,"position"));}
             case "inventory.select"->integer(p,"slot",0,0,8);
+            case "inventory.select_item"->{Identifier.parse(string(p,"item"));if(p.has("hotbar_slot"))integer(p,"hotbar_slot",0,0,8);}
             case "inventory.transfer", "inventory.equip"->{integer(p,"from_slot",0,0,mc.player.containerMenu.slots.size()-1);integer(p,"to_slot",0,0,mc.player.containerMenu.slots.size()-1);if(p.has("count"))integer(p,"count",1,1,64);}
             case "craft.execute"->{Identifier.parse(string(p,"item"));integer(p,"count",1,1,4096);}
             case "build.execute"->{var plan=new BuildPlanner().plan(p);for(var b:plan.blocks())checkArea(new Vec3(b.x()+0.5,b.y()+0.5,b.z()+0.5));}
@@ -139,9 +147,15 @@ final class MinecraftWorld implements WorldAccess {
     static JsonObject heldStack(ItemStack s){return object("type",itemId(s),"count",s.getCount(),"damage",s.getDamageValue());}
     private static <T extends Comparable<T>> String propertyValue(Property<T> p,BlockState state){return p.getName(state.getValue(p));}
     static JsonObject properties(BlockState state){JsonObject o=object();for(Property<?> p:state.getProperties())o.addProperty(p.getName(),propertyValue(p,state));return o;}
+    private String slotRole(Slot slot) {
+        if(slot.container==mc.player.getInventory()) {int index=slot.getContainerSlot();return index<9?"hotbar":index<36?"main":index==40?"offhand":index<40?"armor":"player_special";}
+        if(mc.player.containerMenu instanceof AbstractCraftingMenu crafting) {if(slot==crafting.getResultSlot())return "craft_output";if(crafting.getInputGridSlots().contains(slot))return "craft_grid";}
+        return "container";
+    }
     @Override public JsonObject snapshot(int radius,boolean telemetry) {
         JsonArray inventory=new JsonArray();for(int i=0;i<mc.player.getInventory().getContainerSize();i++){JsonObject s=stack(mc.player.getInventory().getItem(i));s.addProperty("slot",i);inventory.add(s);}
-        JsonArray menu=new JsonArray();for(Slot slot:mc.player.containerMenu.slots){JsonObject s=stack(slot.getItem());s.addProperty("slot",slot.index);s.addProperty("player_inventory",slot.container==mc.player.getInventory());menu.add(s);}
+        JsonArray menu=new JsonArray();for(Slot slot:mc.player.containerMenu.slots){JsonObject s=stack(slot.getItem());s.addProperty("slot",slot.index);s.addProperty("player_inventory",slot.container==mc.player.getInventory());s.addProperty("role",slotRole(slot));
+            if(slot.container==mc.player.getInventory())s.addProperty("inventory_slot",slot.getContainerSlot());menu.add(s);}
         JsonArray entities=new JsonArray();
         for(Entity e:mc.level.getEntities(mc.player,mc.player.getBoundingBox().inflate(radius),e->!e.isInvisibleTo(mc.player))) {
             boolean visible=visible(e);if(!telemetry && !visible)continue;
@@ -191,7 +205,7 @@ final class MinecraftWorld implements WorldAccess {
         if(pending==null) {
             var server=mc.getSingleplayerServer();if(server==null)throw new BridgeException("permission_denied","Actions require an integrated server");
             var dim=mc.level.dimension();UUID player=mc.player.getUUID();
-            String usedItem=string(task.context,"use_item","minecraft:air");
+            String usedItem=string(task.context,"use_item","minecraft:air"),craftedItem=string(task.context,"craft_item","minecraft:air");
             pending=server.submit(()->{
                 var level=server.getLevel(dim);var actor=server.getPlayerList().getPlayer(player);
                 if(level==null || actor==null)throw new BridgeException("disconnected","Actor unavailable");
@@ -204,9 +218,12 @@ final class MinecraftWorld implements WorldAccess {
                 view.addProperty("food",actor.getFoodData().getFoodLevel());view.addProperty("using_item",actor.isUsingItem());
                 view.addProperty("use_hand",actor.isUsingItem()?(actor.getUsedItemHand()==InteractionHand.MAIN_HAND?"main":"off"):"none");
                 view.addProperty("item_uses",actor.getStats().getValue(Stats.ITEM_USED,BuiltInRegistries.ITEM.getValue(Identifier.parse(usedItem))));
+                view.addProperty("items_crafted",actor.getStats().getValue(Stats.ITEM_CRAFTED,BuiltInRegistries.ITEM.getValue(Identifier.parse(craftedItem))));
+                if(actor.containerMenu instanceof AbstractCraftingMenu crafting)view.add("craft_output",heldStack(crafting.getResultSlot().getItem()));
                 JsonArray slots=new JsonArray();for(Slot s:actor.containerMenu.slots){JsonObject item=stack(s.getItem());item.addProperty("slot",s.index);slots.add(item);}view.add("slots",slots);
                 Map<String,Integer> counts=new HashMap<>();for(int i=0;i<actor.getInventory().getContainerSize();i++){ItemStack s=actor.getInventory().getItem(i);if(!s.isEmpty())counts.merge(itemId(s),s.getCount(),Integer::sum);}view.add("inventory_counts",GSON.toJsonTree(counts));
-                if(pos!=null){BlockState state=level.getBlockState(pos);view.add("block",object("type",blockId(state),"properties",properties(state)));}
+                JsonArray inventorySlots=new JsonArray();for(int i=0;i<36;i++)inventorySlots.add(heldStack(actor.getInventory().getItem(i)));view.add("inventory_slots",inventorySlots);
+                if(pos!=null){if(!level.hasChunkAt(pos))throw new BridgeException("chunk_unavailable","Confirmation chunk is no longer loaded",true);BlockState state=level.getBlockState(pos);view.add("block",object("type",blockId(state),"properties",properties(state)));}
                 if(entity!=null){Entity e=level.getEntity(UUID.fromString(entity));view.add("entity",e==null?JsonNull.INSTANCE:object("alive",e.isAlive(),"health",e instanceof LivingEntity l?l.getHealth():-1,"position",vector(e.position())));}
                 return view;
             });confirmations.put(task.id,pending);return null;
@@ -218,7 +235,7 @@ final class MinecraftWorld implements WorldAccess {
         if(!mc.hasSingleplayerServer() || mc.player.isSpectator())throw new BridgeException("permission_denied","Singleplayer controllable actor required");
         if(mc.player.isDeadOrDying())return Step.failure("actor_dead","Actor is dead",object());
         if(mc.player.getHealth()<=number(t.parameters,"stop_health",4)){releaseControls();return Step.failure("critical_health","Actor health reached stop threshold",object("health",mc.player.getHealth()));}
-        if(bool(t.context,"revalidate",false)){t.context.remove("revalidate");routes.remove(t.id);confirmations.remove(t.id);if(drops.containsKey(t.id))drops.get(t.id).resumed(tick());if(t.action.equals("look.turn"))t.context.addProperty("turn_sent",tick());if(t.action.equals("build.execute")){t.context.addProperty("build_index",0);t.context.remove("placing");}}
+        if(bool(t.context,"revalidate",false)){t.context.remove("revalidate");routes.remove(t.id);confirmations.remove(t.id);if(drops.containsKey(t.id))drops.get(t.id).resumed(tick());if(t.action.equals("look.turn"))t.context.addProperty("turn_sent",tick());if(t.action.equals("build.execute"))buildChecks.remove(t.id);}
         if(mc.screen instanceof ModelScreen){
             releaseControls();confirmations.remove(t.id);
             t.context.addProperty("owner_panel_waiting",true);
@@ -239,7 +256,7 @@ final class MinecraftWorld implements WorldAccess {
             case "move.crouch" -> crouch(t);
             case "move.jump" -> jump(t);
             case "look.turn" -> turn(t);
-            case "look.at" -> {Vec3 target=t.parameters.has("entity_id")?entity(t.parameters).getBoundingBox().getCenter():point(child(t.parameters,"target"));look(target);t.actions++;yield Step.success(object("yaw",mc.player.getYRot(),"pitch",mc.player.getXRot()));}
+            case "look.at" -> lookAt(t);
             case "combat.attack" -> attack(t);
             case "block.break" -> breakBlock(t,block(child(t.parameters,"position")));
             case "block.place" -> placeBlock(t,block(child(t.parameters,"position")),string(t.parameters,"block"),t.parameters.has("properties")?child(t.parameters,"properties"):object());
@@ -252,10 +269,11 @@ final class MinecraftWorld implements WorldAccess {
                 int slot=integer(t.parameters,"slot",0,0,8);
                 if(!t.context.has("selection_sent")){mc.player.getInventory().setSelectedSlot(slot);t.actions++;t.context.addProperty("selection_sent",tick());}
                 JsonObject view=serverView(t,null,null);
-                if(view!=null&&view.get("selected_slot").getAsInt()==slot)yield Step.success(object("selected_slot",slot,"source","integrated_server"));
+                if(view!=null&&view.get("selected_slot").getAsInt()==slot){t.confirmed.addProperty("selected_slot",slot);yield Step.success(object("selected_slot",slot,"source","integrated_server"));}
                 if(tick()-number(t.context,"selection_sent",tick())>20)throw new BridgeException("selection_unconfirmed","Server did not confirm hotbar selection");
                 yield Step.waiting(object("waiting","server_selection"));
             }
+            case "inventory.select_item" -> selectItem(t,string(t.parameters,"item"),t.parameters.has("hotbar_slot")?integer(t.parameters,"hotbar_slot",0,0,8):-1);
             case "inventory.transfer", "inventory.equip" -> transfer(t);
             case "craft.execute" -> craft(t);
             case "build.execute" -> build(t);
@@ -297,6 +315,7 @@ final class MinecraftWorld implements WorldAccess {
         // requested point instead of repeatedly steering back to the voxel centre.
         boolean finalCell=idx>=route.size()-1 && next.equals(cell(target));
         Vec3 waypoint=finalCell?target:new Vec3(next.x()+0.5,next.y(),next.z()+0.5);
+        ActionBudget.require(t,1);
         look(waypoint.add(0,mc.player.getEyeHeight(),0));
         hold(mc.options.keyUp,true);hold(mc.options.keyJump,next.y()>mc.player.getY()+0.1);hold(mc.options.keySprint,bool(t.parameters,"sprint",false));hold(mc.options.keyShift,bool(t.parameters,"crouch",false));t.actions++;
         if(!t.context.has("last_position")){t.context.add("last_position",vector(mc.player.position()));t.context.addProperty("last_moved",tick());}
@@ -326,6 +345,13 @@ final class MinecraftWorld implements WorldAccess {
         if(update.error()!=null)return Step.failure(update.error(),"Server did not confirm the requested crouch state",update.progress());
         if(update.done()){t.actions++;return Step.success(update.progress());}
         return Step.waiting(update.progress());
+    }
+    private Step lookAt(Task t) {
+        if(!t.context.has("turn_target")) {
+            Vec3 target=t.parameters.has("entity_id")?entity(t.parameters).getBoundingBox().getCenter():point(child(t.parameters,"target"));look(target);
+            t.context.add("turn_target",object("yaw",mc.player.getYRot(),"pitch",mc.player.getXRot()));t.context.addProperty("turn_sent",tick());
+        }
+        return turn(t);
     }
     private Step turn(Task t) {
         if(!t.context.has("turn_target")){
@@ -375,13 +401,18 @@ final class MinecraftWorld implements WorldAccess {
     }
     private Step breakBlock(Task t,BlockPos p) {
         reach(p);JsonObject view=serverView(t,p,null);
-        if(view!=null && (string(child(view,"block"),"type").equals("minecraft:air") || t.context.has("break_expected")&&string(child(view,"block"),"type").equals(string(t.context,"break_expected")))){t.confirmed.add("broken",position(p));return Step.success(object("position",position(p),"state",view.get("block")));}
+        if(view!=null && (string(child(view,"block"),"type").equals("minecraft:air") || t.context.has("break_expected")&&string(child(view,"block"),"type").equals(string(t.context,"break_expected")))){confirmBlock(t,p,view);t.confirmed.add("broken",position(p));return Step.success(object("position",position(p),"state",view.get("block")));}
         BlockState state=mc.level.getBlockState(p);
         if(state.isAir())return Step.waiting(object("waiting","server_confirmation"));
         if(t.context.has("break_original")&&!state.toString().equals(string(t.context,"break_original")))throw new BridgeException("target_changed","Block changed while mining; inspect actual state");
         if(state.getDestroySpeed(mc.level,p)<0)throw new BridgeException("permission_denied","Unbreakable block");
         if(bool(t.parameters,"require_tool",true) && state.requiresCorrectToolForDrops() && !mc.player.getMainHandItem().isCorrectToolForDrops(state))throw new BridgeException("missing_tool","Selected tool cannot harvest block");
         if(!blockVisible(p))throw new BridgeException("target_lost","Block is occluded",true);look(Vec3.atCenterOf(p));
+        if(t.actions>=t.maxActions && t.context.has("breaking")) {
+            if(tick()-number(t.context,"break_last_sent",tick())<=20)return Step.waiting(object("waiting","final_mining_confirmation"));
+            throw new BridgeException("action_limit","Mining action budget exhausted; last packet did not complete the block");
+        }
+        ActionBudget.require(t,1);t.context.addProperty("break_last_sent",tick());
         if(!t.context.has("breaking")){t.context.addProperty("break_original",state.toString());t.context.addProperty("break_expected",blockId(state.getFluidState().createLegacyBlock()));mc.gameMode.startDestroyBlock(p,Direction.UP);t.context.addProperty("breaking",true);}else mc.gameMode.continueDestroyBlock(p,Direction.UP);
         mc.player.swing(InteractionHand.MAIN_HAND);t.actions++;return Step.waiting(object("stage","mining","position",position(p)));
     }
@@ -389,7 +420,7 @@ final class MinecraftWorld implements WorldAccess {
     private boolean matches(JsonObject actual,String type,JsonObject wanted){if(!string(actual,"type").equals(type))return false;JsonObject props=child(actual,"properties");for(var e:wanted.entrySet())if(!props.has(e.getKey())||!props.get(e.getKey()).getAsString().equals(e.getValue().getAsString()))return false;return true;}
     private Step placeBlock(Task t,BlockPos p,String type,JsonObject wanted) {
         reach(p);JsonObject view=serverView(t,p,null);
-        if(view!=null && matches(child(view,"block"),type,wanted)){t.confirmed.add("placed",position(p));return Step.success(object("position",position(p),"state",view.get("block")));}
+        if(view!=null && matches(child(view,"block"),type,wanted)){confirmBlock(t,p,view);t.context.remove("material_sent");t.confirmed.add("placed",position(p));return Step.success(object("position",position(p),"state",view.get("block")));}
         if(matches(mc.level.getBlockState(p),type,wanted))return Step.waiting(object("waiting","server_confirmation_of_existing_block"));
         if(t.context.has("placing")) {
             if(tick()-number(t.context,"placing",tick())>20)throw new BridgeException("placement_failed","Server did not confirm requested block properties");
@@ -400,7 +431,8 @@ final class MinecraftWorld implements WorldAccess {
         BlockState desired=((BlockItem)material).getBlock().defaultBlockState();
         if(!blockId(desired).equals(type))throw new BridgeException("unsupported_capability","This block needs a distinct placement item or mechanic");
         for(var property:wanted.entrySet()){Property<?> definition=desired.getBlock().getStateDefinition().getProperty(property.getKey());if(definition==null||definition.getValue(property.getValue().getAsString()).isEmpty())throw new BridgeException("invalid_request","Invalid block property: "+property.getKey());}
-        selectMaterial(type,t);
+        Step prepared=selectItem(t,type,-1,view);
+        if(!prepared.done() || prepared.error()!=null)return prepared;
         BlockHitResult hit=null;
         for(Direction face:Direction.values()) {
             if(wanted.has("axis") && !face.getAxis().getName().equals(wanted.get("axis").getAsString()))continue;
@@ -413,9 +445,51 @@ final class MinecraftWorld implements WorldAccess {
         if(hit==null)throw new BridgeException("missing_support","No visible support face available",true);
         look(hit.getLocation());
         if(wanted.has("facing")){String face=wanted.get("facing").getAsString();switch(face){case "north"->mc.player.setYRot(0);case "south"->mc.player.setYRot(180);case "east"->mc.player.setYRot(90);case "west"->mc.player.setYRot(-90);default->{}}}
+        ActionBudget.require(t,1);
         mc.gameMode.useItemOn(mc.player,InteractionHand.MAIN_HAND,hit);t.context.addProperty("placing",tick());t.actions++;return Step.waiting(object("stage","placing","position",position(p)));
     }
-    private void selectMaterial(String type,Task t){for(int i=0;i<9;i++)if(itemId(mc.player.getInventory().getItem(i)).equals(type)){mc.player.getInventory().setSelectedSlot(i);return;}throw new BridgeException("missing_materials","Required block must be in the hotbar: "+type);}
+    private void confirmBlock(Task t,BlockPos p,JsonObject view) {
+        JsonArray updates=t.confirmed.has("block_updates")?t.confirmed.getAsJsonArray("block_updates"):new JsonArray();
+        JsonObject actual=child(view,"block").deepCopy();actual.addProperty("dimension",dimension());
+        actual.addProperty("x",p.getX());actual.addProperty("y",p.getY());actual.addProperty("z",p.getZ());actual.addProperty("tick",view.get("tick").getAsLong());
+        // A blueprint may revisit a cell; keep only its last verified state.
+        for(int i=updates.size()-1;i>=0;i--){JsonObject old=updates.get(i).getAsJsonObject();if(old.get("x").equals(actual.get("x"))&&old.get("y").equals(actual.get("y"))&&old.get("z").equals(actual.get("z")))updates.remove(i);}
+        updates.add(actual);t.confirmed.add("block_updates",updates);
+    }
+    private Step selectItem(Task t,String type,int requestedSlot) {return selectItem(t,type,requestedSlot,null);}
+    private Step selectItem(Task t,String type,int requestedSlot,JsonObject observed) {
+        if(!t.context.has("material_sent")) {
+            int source=-1,target=requestedSlot;
+            for(int i=0;i<9;i++)if(itemId(mc.player.getInventory().getItem(i)).equals(type) && (requestedSlot<0 || i==requestedSlot)){source=i;target=i;break;}
+            if(source<0)for(int i=0;i<36;i++)if(itemId(mc.player.getInventory().getItem(i)).equals(type)){source=i;break;}
+            if(source<0)throw new BridgeException("missing_materials","Item is unavailable in the main inventory: "+type);
+            if(target<0){for(int i=0;i<9;i++)if(mc.player.getInventory().getItem(i).isEmpty()){target=i;break;}if(target<0)target=mc.player.getInventory().getSelectedSlot();}
+            boolean swap=source!=target;boolean select=mc.player.getInventory().getSelectedSlot()!=target;
+            if(swap || select)ActionBudget.require(t,(swap?1:0)+(select?1:0));
+            if(swap && mc.player.containerMenu!=mc.player.inventoryMenu)throw new BridgeException("interface_open","Close the container before preparing a hotbar item");
+            if(swap && !mc.player.containerMenu.getCarried().isEmpty())throw new BridgeException("cursor_occupied","Clear cursor before preparing an item");
+            t.context.addProperty("material_slot",target);t.context.addProperty("material_source",source);t.context.addProperty("material_menu",mc.player.containerMenu.containerId);
+            t.context.add("material_expected",heldStack(mc.player.getInventory().getItem(source)));t.context.add("material_displaced",heldStack(mc.player.getInventory().getItem(target)));
+            if(swap){Slot from=null;for(Slot slot:mc.player.containerMenu.slots)if(slot.container==mc.player.getInventory() && slot.getContainerSlot()==source){from=slot;break;}
+                if(from==null || !from.mayPickup(mc.player))throw new BridgeException("permission_denied","Inventory slot cannot be moved");
+                click(from.index,target,ContainerInput.SWAP);t.actions++;
+            }
+            if(select){mc.player.getInventory().setSelectedSlot(target);t.actions++;}
+            t.context.addProperty("material_sent",tick());
+            return Step.waiting(object("stage","preparing_item","item",type,"hotbar_slot",target));
+        }
+        int target=t.context.get("material_slot").getAsInt(),source=t.context.get("material_source").getAsInt();
+        JsonObject view=observed!=null?observed:serverView(t,null,null);if(view==null)return Step.waiting(object("waiting","server_item_selection"));
+        if(view.get("menu_id").getAsInt()!=t.context.get("material_menu").getAsInt())throw new BridgeException("interface_closed","Menu changed during item preparation");
+        JsonArray inventory=view.getAsJsonArray("inventory_slots");
+        boolean swapped=source==target || inventory.get(source).equals(t.context.get("material_displaced"));
+        if(swapped && inventory.get(target).equals(t.context.get("material_expected")) && view.get("selected_slot").getAsInt()==target && child(view,"cursor").get("count").getAsInt()==0){
+            JsonObject receipt=object("item",type,"selected_slot",target,"source_slot",source,"source","integrated_server","stack",inventory.get(target));
+            t.confirmed.add("selected_item",receipt);return Step.success(receipt);
+        }
+        if(tick()-number(t.context,"material_sent",tick())>20)throw new BridgeException("selection_unconfirmed","Server did not confirm both inventory slots and selection");
+        return Step.waiting(object("waiting","server_item_selection"));
+    }
     private Step interact(Task t) {
         if(!t.context.has("sent")) {
             if(t.parameters.has("position")){BlockPos before=block(child(t.parameters,"position"));t.context.add("block_before",object("type",blockId(mc.level.getBlockState(before)),"properties",properties(mc.level.getBlockState(before))));}
@@ -546,8 +620,11 @@ final class MinecraftWorld implements WorldAccess {
             if(!dst.isEmpty()&&!ItemStack.isSameItemSameComponents(src,dst))throw new BridgeException("inventory_full","Destination contains another item");
             if(target.getMaxStackSize(src)-dst.getCount()<count)throw new BridgeException("inventory_full","Destination has insufficient capacity");
             t.context.addProperty("source_before",src.getCount());t.context.addProperty("target_before",dst.getCount());t.context.addProperty("item",itemId(src));t.context.addProperty("count",count);t.context.addProperty("transfer_menu",menu.containerId);
-            click(from,0,ContainerInput.PICKUP);for(int i=0;i<count;i++)click(to,1,ContainerInput.PICKUP);click(from,0,ContainerInput.PICKUP);
-            t.actions+=count+2;t.context.addProperty("transfer_sent",tick());
+            int clicks=ActionBudget.transferClicks(src.getCount(),count);ActionBudget.require(t,clicks);
+            click(from,0,ContainerInput.PICKUP);
+            if(count==t.context.get("source_before").getAsInt())click(to,0,ContainerInput.PICKUP);
+            else {for(int i=0;i<count;i++)click(to,1,ContainerInput.PICKUP);click(from,0,ContainerInput.PICKUP);}
+            t.actions+=clicks;t.context.addProperty("transfer_sent",tick());
         }
         JsonObject v=serverView(t,null,null);
         if(v==null)return Step.waiting(object("waiting","server_transfer"));
@@ -576,7 +653,8 @@ final class MinecraftWorld implements WorldAccess {
         if(t.context.has("craft_sent")) {
             JsonObject v=serverView(t,null,null);if(v==null)return Step.waiting(object("waiting","server_craft"));
             JsonObject amounts=child(v,"inventory_counts");int actual=amounts.has(step.item())?amounts.get(step.item()).getAsInt():0;
-            if(actual>=t.context.get("craft_before").getAsInt()+recipe.recipe().count()) {
+            if(!string(t.context,"craft_item").equals(step.item()))throw new BridgeException("stale_revision","Craft stage changed while awaiting output");
+            if(actual>=t.context.get("craft_before").getAsInt()+recipe.recipe().count() && v.get("items_crafted").getAsInt()>=t.context.get("craft_stats_before").getAsInt()+recipe.recipe().count()) {
                 t.confirmed.addProperty("crafts_confirmed",integer(t.confirmed,"crafts_confirmed",0,0,100000)+1);
                 t.context.remove("craft_sent");t.context.addProperty("craft_cell",0);iteration++;
                 if(iteration>=step.crafts()){stage++;iteration=0;}t.context.addProperty("craft_stage",stage);t.context.addProperty("craft_iteration",iteration);
@@ -586,7 +664,7 @@ final class MinecraftWorld implements WorldAccess {
         }
         int cell=integer(t.context,"craft_cell",0,0,9);
         if(cell==0 && !t.context.has("grid_cleared")) {
-            for(Slot grid:menu.getInputGridSlots())if(grid.hasItem()){click(grid.index,0,ContainerInput.QUICK_MOVE);t.actions++;return Step.waiting(object("stage","clearing_grid"));}
+            for(Slot grid:menu.getInputGridSlots())if(grid.hasItem()){ActionBudget.require(t,1);click(grid.index,0,ContainerInput.QUICK_MOVE);t.actions++;return Step.waiting(object("stage","clearing_grid"));}
             t.context.addProperty("grid_cleared",true);
         }
         while(cell<recipe.grid().size() && recipe.grid().get(cell).isEmpty())cell++;
@@ -598,14 +676,18 @@ final class MinecraftWorld implements WorldAccess {
             if(source==null)throw new BridgeException("missing_materials","Ingredient is unavailable: "+alternatives);
             int index=(cell/recipe.width())*menu.getGridWidth()+(cell%recipe.width());Slot target=menu.getInputGridSlots().get(index);
             if(target.hasItem())throw new BridgeException("stale_revision","Craft grid changed");
-            click(source.index,0,ContainerInput.PICKUP);click(target.index,1,ContainerInput.PICKUP);click(source.index,0,ContainerInput.PICKUP);t.actions+=3;
+            ActionBudget.require(t,3);click(source.index,0,ContainerInput.PICKUP);click(target.index,1,ContainerInput.PICKUP);click(source.index,0,ContainerInput.PICKUP);t.actions+=3;
             t.context.addProperty("craft_cell",cell+1);return Step.waiting(object("stage","filling_grid","cell",cell));
         }
         ItemStack result=menu.getResultSlot().getItem();
         if(!itemId(result).equals(step.item()))return Step.waiting(object("waiting","recipe_result"));
         boolean room=mc.player.getInventory().getFreeSlot()!=-1 || mc.player.getInventory().getSlotWithRemainingSpace(result)!=-1;
         if(!room)throw new BridgeException("inventory_full","No room for crafting output");
-        t.context.addProperty("craft_before",counts().getOrDefault(step.item(),0));click(menu.getResultSlot().index,0,ContainerInput.QUICK_MOVE);t.actions++;t.context.addProperty("craft_sent",tick());t.context.remove("grid_cleared");
+        ActionBudget.require(t,1);t.context.addProperty("craft_item",step.item());
+        JsonObject baseline=serverView(t,null,null);if(baseline==null)return Step.waiting(object("waiting","server_recipe"));
+        if(!baseline.has("craft_output") || !string(child(baseline,"craft_output"),"type").equals(step.item()))return Step.waiting(object("waiting","server_recipe"));
+        t.context.addProperty("craft_stats_before",baseline.get("items_crafted").getAsInt());
+        t.context.addProperty("craft_before",integer(child(baseline,"inventory_counts"),step.item(),0,0,Integer.MAX_VALUE));click(menu.getResultSlot().index,0,ContainerInput.QUICK_MOVE);t.actions++;t.context.addProperty("craft_sent",tick());t.context.remove("grid_cleared");
         return Step.waiting(object("stage","crafting","recipe",step.recipe()));
     }
     private Step build(Task t) {
@@ -614,7 +696,7 @@ final class MinecraftWorld implements WorldAccess {
         int index=integer(t.context,"build_index",0,0,4096);
         if(index>=plan.blocks().size()){
             CompletableFuture<Integer> check=buildChecks.get(t.id);
-            if(check==null){var dimension=mc.level.dimension();check=mc.getSingleplayerServer().submit(()->{var level=mc.getSingleplayerServer().getLevel(dimension);for(int i=0;i<plan.blocks().size();i++){var b=plan.blocks().get(i);if(!matches(level.getBlockState(new BlockPos(b.x(),b.y(),b.z())),b.type(),b.properties()))return i;}return -1;});buildChecks.put(t.id,check);return Step.waiting(object("stage","final_verification"));}
+            if(check==null){var dimension=mc.level.dimension();check=mc.getSingleplayerServer().submit(()->{var level=mc.getSingleplayerServer().getLevel(dimension);for(int i=0;i<plan.blocks().size();i++){var b=plan.blocks().get(i);if(!level.hasChunkAt(new BlockPos(b.x(),b.y(),b.z())) || !matches(level.getBlockState(new BlockPos(b.x(),b.y(),b.z())),b.type(),b.properties()))return i;}return -1;});buildChecks.put(t.id,check);return Step.waiting(object("stage","final_verification"));}
             if(!check.isDone())return Step.waiting(object("stage","final_verification"));
             buildChecks.remove(t.id);int wrong=check.join();
             if(wrong>=0){t.context.addProperty("build_index",wrong);return Step.waiting(object("stage","revalidating_changed_block","index",wrong));}
@@ -660,7 +742,22 @@ final class MinecraftWorld implements WorldAccess {
     }
     @Override public JsonObject query(String operation,JsonObject d) {
         return switch(operation) {
-            case "inventory.inspect" -> object("inventory",snapshot(1,false).get("inventory"),"menu",snapshot(1,false).get("context"));
+            case "inventory.inspect" -> {
+                JsonObject observed=snapshot(1,false);
+                if(d.has("item")){String item=string(d,"item");Identifier.parse(item);JsonArray inventory=new JsonArray(),menu=new JsonArray();
+                    for(JsonElement slot:observed.getAsJsonArray("inventory"))if(string(slot.getAsJsonObject(),"type").equals(item))inventory.add(slot);
+                    JsonArray empty=new JsonArray();
+                    for(JsonElement slot:child(observed,"context").getAsJsonArray("menu_slots")) {
+                        JsonObject entry=slot.getAsJsonObject();
+                        if(string(entry,"type").equals(item))menu.add(slot);
+                        else if(integer(entry,"count",0,0,Integer.MAX_VALUE)==0 && Set.of("main","hotbar","container").contains(string(entry,"role")) && empty.size()<4)empty.add(slot);
+                    }
+                    for(JsonElement slot:empty)menu.add(slot);
+                    observed.add("inventory",inventory);child(observed,"context").add("menu_slots",menu);
+                    child(observed,"context").addProperty("item_filter",item);child(observed,"context").addProperty("omitted_nonmatching_items",true);
+                }
+                yield object("inventory",observed.get("inventory"),"menu",observed.get("context"));
+            }
             case "route.plan" -> object("path",path(point(child(d,"target"))),"modes",List.of("walk","jump"),"unknown_cells","excluded");
             case "craft.plan" -> GSON.toJsonTree(craftPlan(d)).getAsJsonObject();
             case "build.plan" -> {

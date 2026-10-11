@@ -35,7 +35,8 @@ WebSocket `/bridge`, управляющие сообщения JSON. Снача�
 | task.submit | action, parameters, priority: -100..100, timeout_ticks: 1..12000, max_actions: 1..100000, depends_on: [task_id], опционально expected_control_epoch и model_goal_id |
 | task.status / pause / resume / cancel | task_id |
 | task.list / control.stop | {} |
-| map.query / memory.query | x,y,z, radius: 1..64, limit: 1..2048, опционально block |
+| map.query / memory.query | x,y,z (конечные числа); block: точный namespace:id или blocks: до 16 точных ID; radius: 1..64, limit: 1..128, опционально max_age_ticks: 0..120000 |
+| model.query | operation, arguments, expected_control_epoch, опционально model_goal_id |
 | memory.annotate | text, опционально position |
 | vision.capture / subscribe | width: 64..640, height: 64..360, interval_ticks: 4..1200, опционально crop и observation_profile: full / compact |
 | vision.unsubscribe | {} |
@@ -43,7 +44,9 @@ WebSocket `/bridge`, управляющие сообщения JSON. Снача�
 | model.claim | goal_id — принять цель, созданную владельцем в окне F7 |
 | model.report | goal_id, state: thinking / executing / completed / waiting / failed, step, detail |
 
-Мод 0.4.0 сохраняет протокол 1.0. Capabilities объявляет `observation_profiles`, `decision_guards` и `model_control`. `actions` отражает доступные адаптеру действия с учётом `allowedActions` владельца. На внешнем multiplayer-сервере управляемых действий нет. Профиль `full` по умолчанию сохраняет прежний снимок. `compact` возвращает шесть ближайших наблюдённых блоков, четыре ближайшие сущности, занятые слоты инвентаря и занятые слоты меню с первыми четырьмя пустыми; номера слотов, UUID, свойства блоков и menu revision сохраняются. В `actor` указываются `main_hand` и `off_hand`; наблюдаемая предметная сущность `minecraft:item` включает `entity.item` с `type`, `count` и `damage`. Пропущенные данные остаются неизвестными.
+Мод 0.5.0 сохраняет протокол 1.0. Capabilities объявляет `observation_profiles`, `decision_guards`, `model_control` и `queries`. `actions` отражает доступные адаптеру действия с учётом `allowedActions` владельца; `queries` перечисляет доступные операции чтения/планирования. На внешнем multiplayer-сервере управляемых действий нет. Профиль `full` по умолчанию сохраняет прежний снимок. `compact` возвращает шесть ближайших наблюдённых блоков, четыре ближайшие сущности, занятые слоты инвентаря и занятые слоты меню с первыми четырьмя пригодными пустыми слотами main/hotbar/container; номера слотов, UUID, свойства блоков и menu revision сохраняются. В `actor` указываются `main_hand` и `off_hand`; наблюдаемая предметная сущность `minecraft:item` включает `entity.item` с `type`, `count` и `damage`. Пропущенные данные остаются неизвестными.
+
+`model.query` требует разрешения F8 и актуального `expected_control_epoch`; прямые запросы чтения требуют аутентификации и разрешённой операции, но не F8. `model.query` передаёт `{operation, arguments, expected_control_epoch, model_goal_id}`. Поддержанные операции: `map.nearest`, `map.query`, `memory.query`, `craft.plan`, `build.plan`, `route.plan`, `inventory.inspect` (для последней опционален `item`). Модель может выбрать `action: query`; запрос расходует один шаг решения модели, но не меняет игровой мир. Сначала запрашивайте `craft.plan` или `build.plan`, затем отправляйте отдельную задачу на исполнение. Существующие SDK read endpoints `map.query` и `memory.query` также остаются доступны напрямую.
 
 Снимок содержит `control_epoch`. Контроллер сохраняет его до обращения к модели и передаёт как `task.submit.data.expected_control_epoch`. Мод проверяет значение при принятии задачи; ручной ввод, остановка, повторное разрешение управления или разрыв сессии делают старое решение недействительным (`stale_control`). Обычные игровые тики не меняют этот счётчик. Старые клиенты могут продолжать отправлять задачи без этого поля.
 
@@ -79,11 +82,20 @@ WebSocket `/bridge`, управляющие сообщения JSON. Снача�
 | block.break | position, require_tool: true |
 | block.place | position, block: namespace:id, properties: {} |
 | inventory.select | slot: 0..8 |
+| inventory.select_item | item: namespace:id, опционально hotbar_slot: 0..8 |
 | inventory.transfer / equip | from_slot, to_slot, count: 1..64, menu_id, menu_revision |
 | craft.execute | item, count: 1..4096 |
 | build.execute | origin, rotation: 0/90/180/270, blocks, replace: false |
 
-route.plan / craft.plan / build.plan / inventory.inspect — непосредственные запросы без задач. route.plan принимает target; остальные планы — параметры соответствующего execute. Непустой `allowedActions` проверяется также для этих запросов; пустой список разрешает всё поддержанное адаптером. Слоты относятся к текущему меню, не к индексам инвентаря игрока: используйте context.menu_slots/menu_id/menu_revision. Экипировка — перенос в разрешённый armor/offhand слот. Занятый курсор/недостаточная ёмкость отклоняют перенос.
+`map.nearest`, `map.query` и `memory.query` принимают конечные `x`, `y`, `z`, `block` с одним точным ID либо `blocks` со списком до 16 точных ID, `radius: 1..64`, `limit: 1..128` и опциональный `max_age_ticks: 0..120000`. Запись помечается `observed` только если текущий тик совпадает с `last_seen_tick`; иначе она `remembered`. Неизвестное остаётся неизвестным и не является фактом. Подтверждённый `block.break` или `block.place` обновляет запись памяти фактическим состоянием блока.
+
+`route.plan`, `craft.plan`, `build.plan` и `inventory.inspect` доступны через `model.query`; прежние SDK read endpoints `map.query` и `memory.query` сохранены. Для планирования через модель используйте заявленные `capabilities.queries`. `inventory.inspect` в `model.query` может ограничиваться `item`.
+
+`inventory.select_item` ищет предмет в main inventory (`0..35`) и выбирает его в hotbar через штатный SWAP; `hotbar_slot` опционально задаёт целевой слот `0..8`. Успех подтверждается проверкой обеих ячеек и выбранного слота. Если для SWAP требуется закрытый контейнер, открытый контейнер приводит к отказу до изменения слотов. `block.place` и `build.execute` сами подготавливают необходимые материалы из инвентаря таким же способом; материал не обязан заранее находиться в hotbar.
+
+`context.menu_slots` содержит `role`: `main`, `hotbar`, `armor`, `offhand`, `player_special`, `craft_grid`, `craft_output` или `container`. Для слотов игрока `inventory_slot` задаёт индекс в его инвентаре; команды transfer/equip всё равно принимают общий индекс `slot`. Компактный снимок выбирает пустые назначения `main`/`hotbar`/`container`; запрос `inventory.inspect` с `item` возвращает подходящие занятые ячейки и до четырёх обычных пустых назначений. Остальные предметы при фильтрации остаются неизвестными.
+
+Операции с меню выполняются атомарными группами кликов: остаток бюджета проверяется до того, как курсор будет затронут. Перенос всей стопки требует двух кликов. Слоты относятся к текущему меню, не к индексам инвентаря игрока: используйте `context.menu_slots/menu_id/menu_revision`. Экипировка — перенос в разрешённый armor/offhand слот. Занятый курсор или недостаточная ёмкость отклоняют перенос.
 
 XYZ — мировые координаты в блоках в текущем измерении. Блоки и чертежи целочисленные. Маршрут ограничен 96 блоками и 8192 ячейками; жидкости, опасности, неподдержанные коллизии и неизвестные чанки исключаются.
 

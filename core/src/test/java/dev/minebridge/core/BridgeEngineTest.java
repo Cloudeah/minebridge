@@ -12,12 +12,12 @@ class BridgeEngineTest {
     @TempDir Path directory;
     FakeWorld world;OwnerPolicy owner;BridgeEngine engine;Peer peer;
     static final class FakeWorld implements WorldAccess {
-        long tick;int steps,releases,queries;double health=20;boolean done,confirmationOnly;String dim="minecraft:overworld";
+        long tick;int steps,releases,queries;double health=20;boolean done,confirmationOnly;String dim="minecraft:overworld";JsonArray confirmedBlockUpdates=new JsonArray();
         public String actorId(){return "player";} public String worldId(){return "world";} public String dimension(){return dim;} public long tick(){return tick;}
         public Set<String> capabilities(){return Set.of("move.to","block.break","inventory.inspect");}
         public JsonObject query(String operation,JsonObject parameters){queries++;return object("inventory",List.of());}
         public JsonObject snapshot(int radius,boolean telemetry){return object("actor",object("health",health),"blocks",List.of(),"entities",List.of());}
-        public Step step(Task t){if(confirmationOnly && t.actions>0)return done?Step.success(object("steps",steps)):Step.waiting(object("steps",steps));steps++;t.actions++;t.confirmed.addProperty("steps",steps);return done?Step.success(object("steps",steps)):Step.waiting(object("steps",steps));}
+        public Step step(Task t){if(confirmationOnly && t.actions>0)return done?Step.success(object("steps",steps)):Step.waiting(object("steps",steps));steps++;t.actions++;t.confirmed.addProperty("steps",steps);if(!confirmedBlockUpdates.isEmpty())t.confirmed.add("block_updates",confirmedBlockUpdates.deepCopy());return done?Step.success(object("steps",steps)):Step.waiting(object("steps",steps));}
         public boolean awaitingConfirmation(Task t){return confirmationOnly && t.actions>0;}
         public void releaseControls(){releases++;}
     }
@@ -86,4 +86,39 @@ class BridgeEngineTest {
     @Test void modelGoalsRequireOwnerPermissionAndCannotBeCreatedOverNetwork(){assertThrows(BridgeException.class,()->engine.ownerModelStart("goal",1,false));assertEquals("permission_denied",send("model.status","noauth",object()).get("code").getAsString());auth();assertEquals("unsupported_capability",send("model.start","remote",object("goal","goal")).get("code").getAsString());}
     @Test void ownerStopRejectsGoalTasksAndLateReports(){auth();engine.ownerModelStart("goal",1,false);String goal=engine.modelStatus().get("goal_id").getAsString();send("model.claim","claim",object("goal_id",goal));engine.ownerStop();engine.ownerArm();assertEquals("cancelled",engine.modelStatus().get("state").getAsString());assertEquals("stale_goal",send("task.submit","late",object("action","move.to","parameters",object(),"model_goal_id",goal)).get("code").getAsString());assertEquals("stale_goal",send("model.report","late-report",object("goal_id",goal,"state","completed")).get("code").getAsString());assertEquals(0,world.steps);}
     @Test void aNewOwnerGoalStillDetectsManualInputInTheSameGameTick(){auth();engine.manualInput();engine.ownerModelStart("goal",1,false);engine.manualInput();assertEquals("cancelled",engine.modelStatus().get("state").getAsString());}
+    @Test void queryCapabilitiesAreSeparateAndOwnerFiltered(){
+        auth();JsonArray queries=engine.capabilities().getAsJsonArray("queries");assertTrue(queries.toString().contains("map.query"));assertTrue(queries.toString().contains("map.nearest"));assertTrue(queries.toString().contains("memory.query"));assertTrue(queries.toString().contains("inventory.inspect"));assertFalse(queries.toString().contains("memory.annotate"));
+        owner.allowedActions.clear();owner.allowedActions.add("memory.query");queries=engine.capabilities().getAsJsonArray("queries");assertEquals(List.of("memory.query"),queries.asList().stream().map(JsonElement::getAsString).toList());
+    }
+    @Test void directMemoryQueriesWorkWithoutArmingButRespectTheOperationAllowlist(){
+        owner.allowedActions.add("memory.query");send("session.authenticate","auth",object("token",owner.token));assertFalse(engine.armed());
+        JsonObject result=send("memory.query","read",object("x",0,"y",0,"z",0));assertEquals("world",result.get("world_id").getAsString());
+        owner.allowedActions.clear();owner.allowedActions.add("map.nearest");
+        assertEquals("permission_denied",send("memory.query","blocked",object("x",0,"y",0,"z",0)).get("code").getAsString());
+    }
+    @Test void modelQueryRequiresArmingEpochCapabilityAndExactOperationPermission(){
+        auth();long epoch=engine.snapshot().get("control_epoch").getAsLong();JsonObject args=object();
+        JsonObject result=send("model.query","allowed",object("operation","inventory.inspect","arguments",args,"expected_control_epoch",epoch));assertTrue(result.has("inventory"));assertEquals(1,world.queries);
+        assertEquals("unsupported_capability",send("model.query","not-advertised",object("operation","memory.annotate","arguments",args,"expected_control_epoch",engine.snapshot().get("control_epoch").getAsLong())).get("code").getAsString());
+        owner.allowedActions.clear();owner.allowedActions.add("model.query");
+        assertEquals("permission_denied",send("model.query","wrong-allowlist",object("operation","memory.query","arguments",object("x",0,"y",0,"z",0),"expected_control_epoch",engine.snapshot().get("control_epoch").getAsLong())).get("code").getAsString());
+    }
+    @Test void modelQueryChecksControlEpochAndOptionalActiveGoal(){
+        auth();long epoch=engine.snapshot().get("control_epoch").getAsLong();engine.manualInput();
+        assertEquals("stale_control",send("model.query","stale",object("operation","memory.query","arguments",object("x",0,"y",0,"z",0),"expected_control_epoch",epoch)).get("code").getAsString());
+        engine.ownerStop();long fresh=engine.snapshot().get("control_epoch").getAsLong();assertEquals("permission_denied",send("model.query","unarmed",object("operation","memory.query","arguments",object("x",0,"y",0,"z",0),"expected_control_epoch",fresh)).get("code").getAsString());
+        engine.ownerArm();long rearmed=engine.snapshot().get("control_epoch").getAsLong();
+        assertEquals("stale_goal",send("model.query","stale-goal",object("operation","memory.query","arguments",object("x",0,"y",0,"z",0),"expected_control_epoch",rearmed,"model_goal_id","old-goal")).get("code").getAsString());
+    }
+    @Test void modelStatusSummarizesTasksAndTerminalBlockUpdatesUpdateMemory() throws Exception {
+        auth();engine.ownerModelStart("inspect and break",2,false);String goal=engine.modelStatus().get("goal_id").getAsString();send("model.claim","claim",object("goal_id",goal));
+        world.confirmedBlockUpdates.add(object("dimension",world.dimension(),"x",3,"y",4,"z",5,"type","minecraft:air","properties",object(),"tick",44));
+        String task=send("task.submit","partial",object("action","block.break","parameters",object("target",object("x",3,"y",4,"z",5)),"model_goal_id",goal)).get("task_id").getAsString();
+        JsonObject active=engine.modelStatus().getAsJsonObject("active_task");assertEquals(task,active.get("task_id").getAsString());assertEquals(goal,active.get("model_goal_id").getAsString());
+        assertFalse(active.getAsJsonObject("confirmed_changes").has("block_updates"));assertEquals(1,active.getAsJsonObject("confirmed_changes").get("blocks").getAsInt());
+        send("task.cancel","cancel-partial",object("task_id",task));JsonObject status=engine.modelStatus();JsonObject recent=status.getAsJsonObject("recent_task");
+        assertEquals("cancelled",recent.get("state").getAsString());assertFalse(recent.getAsJsonObject("confirmed_changes").has("block_updates"));assertEquals(1,recent.getAsJsonObject("confirmed_changes").get("blocks").getAsInt());
+        JsonObject fact=send("memory.query","air-check",object("x",3,"y",4,"z",5)).getAsJsonArray("blocks").get(0).getAsJsonObject();
+        assertEquals("minecraft:air",fact.get("type").getAsString());assertEquals("block.break",fact.get("confirmed_action").getAsString());assertEquals(44,fact.get("last_seen_tick").getAsLong());
+    }
 }
