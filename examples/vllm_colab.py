@@ -316,7 +316,7 @@ def model_payload(goal, snapshot, allowed, history, png=None, compact=False, tas
         + (" Queries: " + json.dumps(query_help, separators=(",", ":")) if "query" in allowed else "")
     )
     if snapshot.get("actor_mode") == "companion":
-        system += " Companion: context.owner=human; range 64 blocks. item.use=consumables; no ranged/PNG. Check context.defence/last_task."
+        system += " Companion: context.owner=human; range 64 blocks. item.use=consumables; no PNG. Check context.defence/last_task."
     observation = compact_snapshot(snapshot, 6, 4, True) if compact else compact_snapshot(snapshot)
     if compact:
         # Guard requests use the original snapshot; the model already has its actor's state.

@@ -26,6 +26,16 @@ public final class MineBridge {
     NeoForge.EVENT_BUS.addListener(companion::tick);
     NeoForge.EVENT_BUS.addListener(companion::commands);
     NeoForge.EVENT_BUS.addListener(
+        (net.neoforged.neoforge.event.entity.EntityJoinLevelEvent e) -> {
+          var w = companion.world();
+          if (w != null) w.arrowSpawn(e);
+        });
+    NeoForge.EVENT_BUS.addListener(
+        (net.neoforged.neoforge.event.tick.EntityTickEvent.Pre e) -> {
+          var w = companion.world();
+          if (w != null) w.projectileTick(e.getEntity());
+        });
+    NeoForge.EVENT_BUS.addListener(
         (net.neoforged.neoforge.event.entity.living.LivingDamageEvent.Post e) -> {
           var w = companion.world();
           if (w != null) w.damage(e);

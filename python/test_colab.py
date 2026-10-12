@@ -1093,6 +1093,34 @@ class ControllerIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
 
 class InventoryDecisionTest(unittest.TestCase):
+    def test_context_can_omit_optional_cells_but_keeps_last_entity_and_equipment(self):
+        notebook = json.loads((ROOT / 'examples/vllm_tpu_colab.ipynb').read_text())
+        source = next(''.join(c['source']) for c in notebook['cells']
+                      if 'def shrink_observation(' in ''.join(c['source']))
+        function = next(n for n in ast.parse(source).body
+                        if isinstance(n, ast.FunctionDef) and n.name == 'shrink_observation')
+        namespace = {"json": json}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), '<optional context>', 'exec'), namespace)
+        gear = {"slot": 5, "inventory_slot": 39, "role": "armor", "type": "minecraft:air", "count": 0}
+        entity = {"entity_id": "target", "kind": "living", "type": "minecraft:pig"}
+        data = {"goal": "shoot once", "goal_progress": {"confirmed_shots": 1},
+                "recent_results": [{"shots": 1}], "observation": {
+                    "blocks": [{"x": 3}], "inventory": [{"slot": 0, "type": "minecraft:stone", "count": 64}],
+                    "menu_slots": [gear, {"slot": 9, "role": "main", "count": 64}], "entities": [entity]}}
+        body = {"messages": [{"role": "user", "content": json.dumps(data)}]}
+        for _ in range(6):
+            if not namespace['shrink_observation'](body):
+                break
+        else:
+            self.fail("Optional context compaction did not converge")
+        fitted = json.loads(body['messages'][0]['content'])
+        self.assertEqual(fitted['observation']['blocks'], [])
+        self.assertEqual(fitted['observation']['inventory'], [])
+        self.assertEqual(fitted['observation']['menu_slots'], [gear])
+        self.assertEqual(fitted['observation']['entities'], [entity])
+        for key in ('goal', 'goal_progress', 'recent_results'):
+            self.assertEqual(fitted[key], data[key])
+
     def test_full_inventory_keeps_equipment_through_controller_and_notebook_compaction(self):
         state = snapshot()
         inventory_gear = [{"slot": 36, "type": "minecraft:diamond_boots", "count": 1},
@@ -1165,6 +1193,11 @@ class InventoryDecisionTest(unittest.TestCase):
         body = {"messages": [{"role": "user", "content": json.dumps(data)}]}
         self.assertTrue(namespace['shrink_observation'](body))
         reduced = json.loads(body['messages'][0]['content'])
+        self.assertEqual(reduced['recent_results'], recent)
+        self.assertEqual(reduced['goal_progress'], data['goal_progress'])
+        self.assertTrue(namespace['shrink_observation'](body))
+        reduced = json.loads(body['messages'][0]['content'])
+        self.assertEqual(reduced['observation']['blocks'], [])
         self.assertEqual(reduced['recent_results'], recent)
         self.assertEqual(reduced['goal_progress'], data['goal_progress'])
         self.assertFalse(namespace['shrink_observation'](body))

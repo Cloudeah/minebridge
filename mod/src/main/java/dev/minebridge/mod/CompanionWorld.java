@@ -17,6 +17,7 @@ import net.minecraft.world.*;
 import net.minecraft.world.entity.*;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.projectile.arrow.AbstractArrow;
 import net.minecraft.world.inventory.*;
 import net.minecraft.world.item.*;
 import net.minecraft.world.item.context.*;
@@ -44,6 +45,9 @@ final class CompanionWorld implements WorldAccess {
   private final Map<String, JumpSequence> jumps = new HashMap<>();
   private final Map<String, FollowSequence> follows = new HashMap<>();
   private final Map<String, MeleeSequence> melee = new HashMap<>();
+  private final Map<String, CrossbowSequence> crossbows = new HashMap<>();
+  private final Map<String, ItemStack> rangedWeapons = new HashMap<>();
+  private final Set<String> freshArrows = new LinkedHashSet<>();
   private final Map<String, ItemStack> materials = new HashMap<>();
   private final Map<String, JsonArray> placeEvents = new HashMap<>();
   private final Map<String, Boolean> canceledPlaces = new HashMap<>();
@@ -129,6 +133,7 @@ final class CompanionWorld implements WorldAccess {
         "item.drop",
         "item.pickup",
         "combat.attack",
+        "combat.ranged",
         "block.break",
         "block.place",
         "world.interact",
@@ -143,6 +148,7 @@ final class CompanionWorld implements WorldAccess {
   public Set<String> actionFeatures(String action) {
     return switch (action) {
       case "combat.attack" -> Set.of("confirmed_melee_v1", "local_defence_v1");
+      case "combat.ranged" -> Set.of("confirmed_ranged_v1");
       case "inventory.equip" -> Set.of("local_equipment_v1");
       case "move.follow" -> Set.of("local_regroup_v1");
       case "craft.execute" -> Set.of("craft_station_v1");
@@ -351,9 +357,9 @@ final class CompanionWorld implements WorldAccess {
             "selected_slot",
             player.getInventory().getSelectedSlot(),
             "main_hand",
-            stack(player.getMainHandItem()),
+            HeldItem.describe(player.getMainHandItem()),
             "off_hand",
-            stack(player.getOffhandItem()),
+            HeldItem.describe(player.getOffhandItem()),
             "using_item",
             player.isUsingItem(),
             "on_ground",
@@ -637,6 +643,8 @@ final class CompanionWorld implements WorldAccess {
       }
       case "look.turn" -> MovementCommands.turn(p, 0, 0);
       case "combat.attack" -> MeleeSequence.validate(p);
+      case "combat.ranged" ->
+          RangedCommands.validate(p, player.getMainHandItem().is(Items.CROSSBOW));
       case "block.break", "block.place" -> {
         block(child(p, "position"));
         if (action.equals("block.place")) Identifier.parse(string(p, "block"));
@@ -778,6 +786,7 @@ final class CompanionWorld implements WorldAccess {
       case "item.drop" -> drop(task);
       case "item.pickup" -> pickup(task);
       case "combat.attack" -> attack(task);
+      case "combat.ranged" -> ranged(task);
       case "block.break" -> mine(task);
       case "block.place" ->
           place(
@@ -1190,10 +1199,208 @@ final class CompanionWorld implements WorldAccess {
         dimension(),
         event.getEntity().getUUID().toString(),
         direct.getUUID().toString(),
-        false,
+        direct instanceof AbstractArrow,
         event.getHealthDamage(),
         event.getEntity().getHealth(),
         tick());
+  }
+
+  void arrowSpawn(net.neoforged.neoforge.event.entity.EntityJoinLevelEvent event) {
+    if (event.getLevel().isClientSide()
+        || event.loadedFromDisk()
+        || !(event.getEntity() instanceof AbstractArrow arrow)
+        || arrow.getOwner() != player) return;
+    freshArrows.add(arrow.getUUID().toString());
+    while (freshArrows.size() > 128) freshArrows.remove(freshArrows.iterator().next());
+  }
+
+  void projectileTick(Entity entity) {
+    if (entity.level().isClientSide()
+        || entity.tickCount != 1
+        || !(entity instanceof AbstractArrow arrow)
+        || arrow.getOwner() != player
+        || !freshArrows.remove(entity.getUUID().toString())) return;
+    combat.recordShot(
+        actorId(),
+        entity.level().dimension().identifier().toString(),
+        entity.getUUID().toString(),
+        entity.level().getGameTime());
+  }
+
+  private Step ranged(Task t) {
+    String id = string(t.parameters, "entity_id");
+    if (t.context.has("bow_released")) {
+      var receipt = combat.peek(t.id);
+      collectCombat(t);
+      if (receipt != null && receipt.hits() > 0)
+        return Step.success(
+            object(
+                "outcome",
+                receipt.defeated() ? "defeated" : "hit",
+                "target",
+                id,
+                "projectile_id",
+                receipt.projectileId(),
+                "source",
+                "integrated_server_damage_event"));
+      if (tick() - number(t.context, "bow_released", tick())
+          >= integer(t.parameters, "wait_ticks", 40, 10, 100))
+        return Step.failure(
+            receipt != null && receipt.shots() > 0 ? "hit_unconfirmed" : "shot_unconfirmed",
+            "No damage to the requested target was confirmed; this task will not shoot again",
+            object("stage", "waiting_for_hit", "target", id));
+      return Step.waiting(object("stage", "waiting_for_hit", "target", id));
+    }
+    if (player.containerMenu != player.inventoryMenu
+        || !player.containerMenu.getCarried().isEmpty())
+      throw new BridgeException(
+          "interface_open", "Close the container and clear the cursor before drawing");
+    Entity target = entity(t.parameters);
+    area(target.position());
+    if (target instanceof Player)
+      throw new BridgeException("permission_denied", "Companion never attacks players");
+    if (!(target instanceof LivingEntity) || !target.isAlive())
+      throw new BridgeException("target_lost", "A visible living target is required");
+    if (player.distanceTo(target) > number(t.parameters, "max_distance", 24))
+      throw new BridgeException("out_of_reach", "Ranged target is outside max_distance");
+    if (!player.getMainHandItem().is(Items.BOW) && !player.getMainHandItem().is(Items.CROSSBOW))
+      throw new BridgeException(
+          "missing_weapon", "Select minecraft:bow or minecraft:crossbow first");
+    if (player.isInWater() || player.isInLava())
+      throw new BridgeException("ranged_unavailable", "Shooting from water or lava is unsupported");
+    if (rangedWeapons.containsKey(t.id)) {
+      var expected = rangedWeapons.get(t.id).copy();
+      var actual = player.getMainHandItem().copy();
+      expected.remove(DataComponents.CHARGED_PROJECTILES);
+      actual.remove(DataComponents.CHARGED_PROJECTILES);
+      if (!ItemStack.matches(expected, actual)
+          || player.getInventory().getSelectedSlot()
+              != integer(t.context, "ranged_slot", -1, -1, 8))
+        throw new BridgeException(
+            "draw_interrupted", "Selected ranged weapon or its components changed");
+    }
+    player.stopInputs();
+    if (player.getMainHandItem().is(Items.CROSSBOW)) return crossbow(t, target);
+    if (crossbows.containsKey(t.id))
+      throw new BridgeException("draw_interrupted", "The weapon changed during crossbow loading");
+    if (!t.context.has("bow_started")) {
+      ActionBudget.require(t, 2);
+      if (player.isUsingItem())
+        throw new BridgeException("item_busy", "Finish current item use first");
+      if (player.getProjectile(player.getMainHandItem()).isEmpty())
+        throw new BridgeException("missing_ammo", "No usable arrow is available");
+      aimBow(target, 3.0);
+      rememberWeapon(t);
+      combat.begin(t.id, id, "bow", tick());
+      player.gameMode.useItem(
+          player, player.level(), player.getMainHandItem(), InteractionHand.MAIN_HAND);
+      t.actions++;
+      t.context.addProperty("bow_started", tick());
+      if (!player.isUsingItem())
+        throw new BridgeException("use_no_effect", "Bow drawing did not begin");
+      return Step.waiting(object("stage", "drawing_bow", "target", id));
+    }
+    if (!player.isUsingItem() || !player.getUseItem().is(Items.BOW))
+      throw new BridgeException(
+          "draw_interrupted", "Bow drawing was interrupted; start a new task");
+    aimBow(target, 3.0);
+    int charged = player.getTicksUsingItem(),
+        required = integer(t.parameters, "charge_ticks", 20, 20, 60);
+    if (charged < required)
+      return Step.waiting(
+          object("stage", "drawing_bow", "charge_ticks", charged, "required_ticks", required));
+    ActionBudget.require(t, 1);
+    if (!combat.expectShot(t.id, tick()))
+      throw new BridgeException("shot_unconfirmed", "No unique shot receipt");
+    player.releaseUsingItem();
+    t.actions++;
+    t.context.addProperty("bow_released", tick());
+    return Step.waiting(object("stage", "waiting_for_shot", "target", id));
+  }
+
+  private void rememberWeapon(Task t) {
+    rangedWeapons.put(t.id, player.getMainHandItem().copy());
+    t.context.addProperty("ranged_slot", player.getInventory().getSelectedSlot());
+  }
+
+  private Step crossbow(Task t, Entity target) {
+    if (t.context.has("bow_started"))
+      throw new BridgeException("draw_interrupted", "The weapon changed during bow drawing");
+    if (t.parameters.has("charge_ticks"))
+      throw new BridgeException("invalid_request", "charge_ticks applies to bows only");
+    var sequence = crossbows.computeIfAbsent(t.id, key -> new CrossbowSequence());
+    JsonObject state = HeldItem.crossbow(player.getMainHandItem());
+    JsonArray projectiles = state.getAsJsonArray("projectiles");
+    boolean plain =
+        projectiles.size() == 1
+            && string(projectiles.get(0).getAsJsonObject(), "type").equals("minecraft:arrow")
+            && integer(projectiles.get(0).getAsJsonObject(), "count", 0, 0, 64) == 1;
+    var decision =
+        sequence.observe(
+            new CrossbowSequence.Sample(
+                tick(),
+                player.isUsingItem(),
+                bool(state, "charged", false),
+                projectiles.size(),
+                plain),
+            player.isUsingItem(),
+            CrossbowItem.isCharged(player.getMainHandItem()));
+    if (decision.confirmedLoads() > 0)
+      t.confirmed.addProperty("crossbow_loads", decision.confirmedLoads());
+    if (decision.error() != null)
+      throw new BridgeException(
+          decision.error(), "Crossbow loading cannot continue; inspect weapon and ammunition");
+    if (decision.command() == CrossbowSequence.Command.wait)
+      return Step.waiting(object("stage", decision.stage(), "weapon", "minecraft:crossbow"));
+    if (decision.command() == CrossbowSequence.Command.draw) {
+      ActionBudget.require(t, 3);
+      if (net.minecraft.world.item.enchantment.EnchantmentHelper.processProjectileCount(
+              player.level(), player.getMainHandItem(), player, 1)
+          != 1)
+        throw new BridgeException("unsupported_ammo", "Multishot crossbows are unsupported");
+      ItemStack ammo = player.getProjectile(player.getMainHandItem());
+      if (ammo.isEmpty())
+        throw new BridgeException("missing_ammo", "No crossbow arrow is available");
+      if (!ammo.is(Items.ARROW))
+        throw new BridgeException("unsupported_ammo", "Crossbows support one ordinary arrow");
+      if (CrossbowItem.getChargeDuration(player.getMainHandItem(), player) > 100)
+        throw new BridgeException("unsupported_capability", "Unsupported crossbow charge duration");
+      rememberWeapon(t);
+    } else ActionBudget.require(t, 1);
+    aimBow(target, 3.15);
+    if (decision.command() == CrossbowSequence.Command.release) player.releaseUsingItem();
+    else {
+      if (decision.command() == CrossbowSequence.Command.fire) {
+        combat.begin(t.id, string(t.parameters, "entity_id"), "bow", tick());
+        if (!combat.expectShot(t.id, tick()))
+          throw new BridgeException("shot_unconfirmed", "No unique shot receipt");
+        t.context.addProperty("bow_released", tick());
+      }
+      player.gameMode.useItem(
+          player, player.level(), player.getMainHandItem(), InteractionHand.MAIN_HAND);
+    }
+    t.actions++;
+    sequence.sent(decision.command(), tick());
+    return Step.waiting(object("stage", decision.command().name(), "weapon", "minecraft:crossbow"));
+  }
+
+  private void aimBow(Entity target, double speed) {
+    Vec3 eye = player.getEyePosition(), point = target.getBoundingBox().getCenter();
+    double flight = Math.max(1, eye.distanceTo(point) / speed);
+    Vec3 velocity = target.getDeltaMovement();
+    if (velocity.lengthSqr() <= 1) point = point.add(velocity.scale(flight));
+    Vec3 d = point.subtract(eye);
+    double horizontal = Math.hypot(d.x, d.z);
+    if (horizontal < .1) {
+      look(point);
+      return;
+    }
+    double gravity = .05, squared = speed * speed;
+    double discriminant =
+        squared * squared - gravity * (gravity * horizontal * horizontal + 2 * d.y * squared);
+    if (discriminant < 0)
+      throw new BridgeException("out_of_reach", "No supported arrow trajectory");
+    look(eye.add(d.x, (squared - Math.sqrt(discriminant)) / gravity, d.z));
   }
 
   private Step attack(Task t) {
@@ -2062,6 +2269,10 @@ final class CompanionWorld implements WorldAccess {
       case "item.use" -> t.context.has("use_at");
       case "block.break" -> mining.pending(t.id) || t.context.has("mine_stop");
       case "combat.attack" -> melee.containsKey(t.id);
+      case "combat.ranged" ->
+          t.context.has("bow_started")
+              || t.context.has("bow_released")
+              || crossbows.containsKey(t.id);
       default -> false;
     };
   }
@@ -2084,6 +2295,7 @@ final class CompanionWorld implements WorldAccess {
   private void collectCombat(Task t) {
     var receipt = combat.peek(t.id);
     if (receipt != null) {
+      if (t.action.equals("combat.ranged")) t.confirmed.addProperty("shots", receipt.shots());
       t.confirmed.addProperty("hits", receipt.hits());
       t.confirmed.addProperty("damage", receipt.damage());
       t.confirmed.addProperty("defeated", receipt.defeated());
@@ -2096,7 +2308,7 @@ final class CompanionWorld implements WorldAccess {
           pickups.peek(string(t.parameters, "entity_id"), t.context.get("pickup_at").getAsLong());
       if (pickup != null) t.confirmed.addProperty("pickup_count", pickup.collected());
     }
-    if (t.action.equals("combat.attack")) collectCombat(t);
+    if (t.action.equals("combat.attack") || t.action.equals("combat.ranged")) collectCombat(t);
     JsonObject receipt = mining.peek(t.id);
     if (receipt != null) {
       if (!t.confirmed.has("mining"))
@@ -2135,6 +2347,8 @@ final class CompanionWorld implements WorldAccess {
     jumps.remove(t.id);
     follows.remove(t.id);
     melee.remove(t.id);
+    crossbows.remove(t.id);
+    rangedWeapons.remove(t.id);
     mining.end(t.id);
     combat.end(t.id);
     if (current == t) current = null;
@@ -2157,6 +2371,7 @@ final class CompanionWorld implements WorldAccess {
     placement.suspend();
     follows.values().forEach(FollowSequence::released);
     melee.values().forEach(MeleeSequence::released);
+    crossbows.values().forEach(CrossbowSequence::released);
     if (current != null) current.context.remove("walking");
     stopReflex();
   }

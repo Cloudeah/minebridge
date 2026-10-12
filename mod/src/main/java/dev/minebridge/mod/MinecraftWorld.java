@@ -15,7 +15,6 @@ import net.minecraft.world.entity.projectile.arrow.AbstractArrow;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.world.inventory.*;
 import net.minecraft.world.item.*;
-import net.minecraft.world.item.component.ChargedProjectiles;
 import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.state.BlockState;
@@ -239,13 +238,7 @@ final class MinecraftWorld implements WorldAccess {
             case "look.turn"->MovementCommands.turn(p,0,0);
             case "move.follow"->{UUID.fromString(string(p,"entity_id"));FollowSequence.validate(p);}
             case "combat.attack"->MeleeSequence.validate(p);
-            case "combat.ranged"->{
-                UUID.fromString(string(p,"entity_id"));integer(p,"charge_ticks",20,20,60);integer(p,"wait_ticks",40,10,100);
-                double range=number(p,"max_distance",24);if(range<1 || range>32)throw new BridgeException("invalid_request","max_distance must be 1..32");
-                if(!string(p,"hand","main").equals("main"))throw new BridgeException("invalid_request","Bow combat supports the main hand only");
-                if(p.has("shots") || p.has("count") || p.has("chase"))throw new BridgeException("invalid_request","combat.ranged fires one arrow without chasing");
-                if(mc.player.getMainHandItem().is(Items.CROSSBOW) && p.has("charge_ticks"))throw new BridgeException("invalid_request","charge_ticks applies to bows; crossbows use vanilla loading time");
-            }
+            case "combat.ranged"->RangedCommands.validate(p,mc.player.getMainHandItem().is(Items.CROSSBOW));
             case "move.jump"->JumpSequence.count(p);
             case "block.break", "block.place"->{block(child(p,"position"));if(action.equals("block.place"))Identifier.parse(string(p,"block"));else {bool(p,"require_tool",true);bool(p,"auto_tool",true);}}
             case "container.open", "world.interact"->{if(p.has("entity_id")==p.has("position"))throw new BridgeException("invalid_request","Choose position or entity_id");if(p.has("entity_id"))UUID.fromString(string(p,"entity_id"));else block(child(p,"position"));if(!Set.of("main","off").contains(string(p,"hand","main")))throw new BridgeException("invalid_request","hand must be main/off");}
@@ -276,11 +269,8 @@ final class MinecraftWorld implements WorldAccess {
     static String itemId(ItemStack s){return s.isEmpty()?"minecraft:air":BuiltInRegistries.ITEM.getKey(s.getItem()).toString();}
     static String blockId(BlockState s){return BuiltInRegistries.BLOCK.getKey(s.getBlock()).toString();}
     static JsonObject stack(ItemStack s){return object("type",itemId(s),"count",s.getCount(),"damage",s.getDamageValue(),"max_stack_size",s.getMaxStackSize(),"name",s.getHoverName().getString(),"components","Only public name, damage and stack limit are exposed; other components are unavailable");}
-    static JsonObject heldStack(ItemStack s){JsonObject result=object("type",itemId(s),"count",s.getCount(),"damage",s.getDamageValue());if(s.is(Items.CROSSBOW))result.add("crossbow",crossbowState(s));return result;}
-    private static JsonObject crossbowState(ItemStack stack) {
-        var projectiles=stack.getOrDefault(DataComponents.CHARGED_PROJECTILES,ChargedProjectiles.EMPTY).itemCopies();
-        return object("charged",!projectiles.isEmpty(),"projectiles",projectiles.stream().map(s->object("type",itemId(s),"count",s.getCount())).toList());
-    }
+    static JsonObject heldStack(ItemStack s){return HeldItem.describe(s);}
+    private static JsonObject crossbowState(ItemStack stack){return HeldItem.crossbow(stack);}
     private static <T extends Comparable<T>> String propertyValue(Property<T> p,BlockState state){return p.getName(state.getValue(p));}
     static JsonObject properties(BlockState state){JsonObject o=object();for(Property<?> p:state.getProperties())o.addProperty(p.getName(),propertyValue(p,state));return o;}
     private static String equipmentSlot(int inventorySlot){return switch(inventorySlot){case 39->"head";case 38->"chest";case 37->"legs";case 36->"feet";case 40->"offhand";default->"";};}

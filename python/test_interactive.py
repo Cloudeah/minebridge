@@ -21,6 +21,12 @@ class InteractiveControllerTest(unittest.IsolatedAsyncioTestCase):
     async def test_companion_mode_and_owner_context_reach_the_model(self):
         await self.integration(companion=True)
 
+    async def test_companion_bow_crosses_notebook_relay_and_game_tasks(self):
+        await self.integration(companion=True, ranged=True)
+
+    async def test_companion_crossbow_crosses_notebook_relay_and_game_tasks(self):
+        await self.integration(companion=True, ranged=True, crossbow=True)
+
     async def test_survival_reflex_discards_slow_reply_and_accepts_a_new_goal(self):
         await self.integration(companion=True, cancel_first=True, survival_interrupt=True)
     async def test_bow_decisions_cross_notebook_relay_and_guarded_tasks_without_rewriting(self):
